@@ -195,6 +195,15 @@ rm -f "$D5/prompt.md"; ln -s /etc/hostname "$D5/prompt.md"
 assert_rc 1 "$AM" publish "$ID5"
 assert_rc 1 "$AM" show "$ID5"
 
+t "store not creatable: one clear error naming the store and the sandbox hint, exit 1"
+RO="$TMP/ro"; mkdir -p "$RO"; chmod 500 "$RO"
+out="$(cd "$TMP" && AGENT_MAILBOX_DIR="$RO/store" "$AM" new --topic blocked 2>&1)"; rc=$?
+chmod 700 "$RO"
+assert_eq "$rc" 1 "(rc for uncreatable store)"
+assert_eq "$(echo "$out" | grep -c 'cannot create directory')" "0"        # no raw mkdir spam
+assert_grep "cannot create mailbox store $RO/store" <(echo "$out")
+assert_grep "writable_roots" <(echo "$out")
+
 t "help: usage lists every command"
 for c in new publish list status show path claim respond read-response wait archive; do
   assert_grep "\b$c\b" <("$AM" --help 2>&1)

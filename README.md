@@ -26,8 +26,12 @@ States: `draft → published → claimed → answered → archived`.
 
 Links: `~/.local/bin/agent-mailbox`, `~/.claude/skills/codex-mailbox`
 (Claude Code, all projects), `~/.codex/skills/claude-mailbox` (Codex, all
-projects). Restart sessions to load skills. Existing real directories are
-backed up as `*.bak-<timestamp>`, never deleted.
+projects). Also creates the store (0700) and adds it to Codex's sandbox as a
+writable root (`[sandbox_workspace_write] writable_roots` in
+`~/.codex/config.toml`) — without that, Codex's workspace-write sandbox sees
+`$HOME` read-only and `agent-mailbox new` fails. Restart sessions to load
+skills. Replaced real directories are backed up under `backups/` (outside the
+skills trees, so a backup can never be discovered as a duplicate skill).
 
 ## Flow
 

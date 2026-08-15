@@ -144,6 +144,17 @@ json_str() { # escape for JSON
     local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; printf '"%s"' "$s"
 }
 
+ensure_store() {
+    if ! mkdir -p "$STORE" "$EXCH" "$ARCH" 2>/dev/null; then
+        echo "ERROR: cannot create mailbox store $STORE (read-only or no permission)." >&2
+        echo "       Under a Codex workspace-write sandbox the store must be a writable root:" >&2
+        echo "       ~/.codex/config.toml -> [sandbox_workspace_write] writable_roots = [\"$STORE\"]" >&2
+        echo "       (~/tools/agent-mailbox/install.sh adds it; or set AGENT_MAILBOX_DIR to a writable path)." >&2
+        exit 1
+    fi
+    chmod 700 "$STORE" "$EXCH" "$ARCH" 2>/dev/null || true
+}
+
 # ---- commands --------------------------------------------------------------
 cmd_new() {
     local topic="" target="Claude Code" requester="Codex"
@@ -161,7 +172,7 @@ cmd_new() {
     slug="$(printf '%s' "$topic" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60)"
     [ -n "$slug" ] || slug="exchange"
 
-    mkdir -p "$STORE" "$EXCH" "$ARCH"; chmod 700 "$STORE" "$EXCH" "$ARCH"
+    ensure_store
     local base id n=1
     base="$(date -u +%Y-%m-%dT%H%M%SZ)-$slug"; id="$base"
     while :; do
@@ -462,7 +473,7 @@ cmd_archive() {
     [ -e "$ARCH/$id" ] && { unlock; die "archive target already exists: $ARCH/$id"; }
     meta_set "$dir" state archived archived_utc "$(now_utc)" archived_from_state "$state"
     unlock
-    mkdir -p "$ARCH"; chmod 700 "$ARCH"
+    ensure_store
     mv -T "$dir" "$ARCH/$id" || die "failed to move exchange to archive"
     echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
 }
