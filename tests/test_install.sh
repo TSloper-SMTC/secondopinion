@@ -13,6 +13,7 @@ assert_rc() { local want="$1"; shift; "$@" >/dev/null 2>&1; local rc=$?; [ "$rc"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME"
 export PATH="$HOME/.local/bin:$PATH"
+export AGENT_MAILBOX_BACKUP_DIR="$TMP/backups"
 
 t "fresh install creates the three symlinks"
 assert_rc 0 "$ROOT/install.sh"
@@ -29,7 +30,9 @@ rm "$HOME/.codex/skills/claude-mailbox"
 mkdir -p "$HOME/.codex/skills/claude-mailbox"; echo legacy > "$HOME/.codex/skills/claude-mailbox/SKILL.md"
 assert_rc 0 "$ROOT/install.sh"
 assert_link "$HOME/.codex/skills/claude-mailbox" "$ROOT/skills/codex/claude-mailbox"
-ls -d "$HOME/.codex/skills/claude-mailbox.bak-"* >/dev/null 2>&1 && grep -q legacy "$HOME"/.codex/skills/claude-mailbox.bak-*/SKILL.md && ok || fail "legacy dir not backed up"
+ls -d "$AGENT_MAILBOX_BACKUP_DIR/claude-mailbox.bak-"* >/dev/null 2>&1 && grep -q legacy "$AGENT_MAILBOX_BACKUP_DIR"/claude-mailbox.bak-*/SKILL.md && ok || fail "legacy dir not backed up under \$AGENT_MAILBOX_BACKUP_DIR"
+# the backup must NOT remain anywhere under the skills dir (it would be discovered as a duplicate skill)
+[ -z "$(find "$HOME/.codex/skills" -name 'SKILL.md' -path '*bak*' 2>/dev/null)" ] && ok || fail "backup left inside skills dir"
 
 t "--check reports status without changing anything and exits 0 when installed"
 assert_rc 0 "$ROOT/install.sh" --check

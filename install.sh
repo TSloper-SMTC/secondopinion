@@ -5,6 +5,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Backups of replaced real dirs/files go OUTSIDE the skills trees, otherwise a
+# backed-up SKILL.md is discovered as a duplicate skill.
+BACKUP_DIR="${AGENT_MAILBOX_BACKUP_DIR:-$ROOT/backups}"
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
 
@@ -29,7 +32,8 @@ for pair in "${LINKS[@]}"; do
     if [ -L "$dest" ]; then
         rm -f "$dest"
     elif [ -e "$dest" ]; then
-        bak="$dest.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+        mkdir -p "$BACKUP_DIR"
+        bak="$BACKUP_DIR/$(basename "$dest").bak-$(date -u +%Y%m%dT%H%M%SZ)"
         mv -- "$dest" "$bak"
         echo "backed-up $dest -> $bak"
     fi
