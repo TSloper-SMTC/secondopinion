@@ -1,0 +1,491 @@
+#!/bin/bash
+# agent-mailbox — global, concurrent, file-based mailbox for Codex→Claude review exchanges.
+#
+# Store layout (default ~/.agent-mailbox, override with AGENT_MAILBOX_DIR):
+#   exchanges/<ID>/prompt.md     requester writes (draft until `publish`)
+#   exchanges/<ID>/meta          tool-owned state (key=value), authoritative
+#   exchanges/<ID>/claim/        atomic claim by the responder (token + owner)
+#   exchanges/<ID>/response.md   responder's answer, write-once, hash-bound in meta
+#   archive/<ID>/                after the requester consumes the response
+#
+# States: draft -> published -> claimed -> answered -> archived
+set -euo pipefail
+umask 077
+
+VERSION="1.0.0"
+STORE="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
+EXCH="$STORE/exchanges"
+ARCH="$STORE/archive"
+STALE_CLAIM_SECS="${AGENT_MAILBOX_STALE_CLAIM_SECS:-1800}"
+DEFAULT_WAIT_TIMEOUT=600
+POLL_SECS=2
+
+usage() {
+    cat <<EOF
+agent-mailbox $VERSION — global file mailbox for Codex→Claude exchanges
+Store: $STORE   (override: AGENT_MAILBOX_DIR)
+
+Requester (Codex) side:
+  new --topic TOPIC [--target NAME] [--requester NAME]   create a draft exchange, print its ID
+  publish ID              freeze prompt.md (records SHA-256); makes it visible as pending
+  wait ID [--timeout S]   block until a valid response exists (default timeout $DEFAULT_WAIT_TIMEOUT s)
+                          exit 0 answered | 124 timeout | 2 archived | 1 error
+  read-response ID        validate and print the response
+  archive ID [--force]    move a consumed exchange to archive/ (idempotent)
+
+Responder (Claude) side:
+  list [--pending|--answered|--drafts|--all] [--repo PATH|--here] [--json]
+  show ID                 print prompt.md
+  claim ID [--owner NAME] [--takeover]   atomically claim a published exchange, print claim_token
+  respond ID --token TOKEN --file FILE   publish response (write-once); FILE must start
+                          with 'Exchange-ID: ID' and contain a 'Responder:' line
+
+Both:
+  status ID [--json]      tool-owned state plus prompt_ok / response_ok validation
+  path ID                 print the exchange directory
+  help | --help
+
+Environment: AGENT_MAILBOX_DIR, AGENT_MAILBOX_OWNER (default claim owner),
+             AGENT_MAILBOX_STALE_CLAIM_SECS (default 1800; --takeover allowed after this)
+EOF
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+epoch() { date +%s; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+
+valid_id() {
+    local id="$1"
+    [ "${#id}" -le 100 ] || return 1
+    [[ "$id" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z-[a-z0-9][a-z0-9-]*$ ]] || return 1
+    case "$id" in *..*|*/*) return 1;; esac
+    return 0
+}
+
+require_id() { valid_id "${1:-}" || die "invalid exchange id: '${1:-}'"; }
+
+# Resolve exchange dir: active first, then archive. Prints dir; sets IS_ARCHIVED.
+IS_ARCHIVED=0
+exdir() {
+    require_id "$1"
+    if [ -d "$EXCH/$1" ] && [ ! -L "$EXCH/$1" ]; then IS_ARCHIVED=0; echo "$EXCH/$1"; return 0; fi
+    if [ -d "$ARCH/$1" ] && [ ! -L "$ARCH/$1" ]; then IS_ARCHIVED=1; echo "$ARCH/$1"; return 0; fi
+    die "unknown exchange: $1"
+}
+active_dir() {
+    require_id "$1"
+    [ -d "$EXCH/$1" ] && [ ! -L "$EXCH/$1" ] || {
+        [ -d "$ARCH/$1" ] && die "exchange is archived: $1"
+        die "unknown exchange: $1"
+    }
+    echo "$EXCH/$1"
+}
+
+# ---- meta (key=value) ------------------------------------------------------
+meta_get() { # dir key
+    [ -f "$1/meta" ] || return 0
+    awk -v k="$2" -F= '$1==k{sub(/^[^=]*=/,""); print; exit}' "$1/meta"
+}
+meta_set() { # dir key value [key value ...]  (atomic rewrite; caller holds lock)
+    local dir="$1"; shift
+    local tmp="$dir/.meta.tmp.$$"
+    declare -A kv=()
+    local order=()
+    if [ -f "$dir/meta" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            local k="${line%%=*}"
+            kv["$k"]="${line#*=}"; order+=("$k")
+        done < "$dir/meta"
+    fi
+    while [ "$#" -ge 2 ]; do
+        [ -n "${kv[$1]+x}" ] || order+=("$1")
+        kv["$1"]="$2"; shift 2
+    done
+    : > "$tmp"
+    local k
+    for k in "${order[@]}"; do printf '%s=%s\n' "$k" "${kv[$k]}" >> "$tmp"; done
+    mv -f "$tmp" "$dir/meta"
+}
+lock() { exec 9>>"$1/.lock"; flock 9; }
+unlock() { exec 9>&-; }
+
+# ---- validation ------------------------------------------------------------
+prompt_ok() { # dir -> yes|no|n/a
+    local dir="$1" state want
+    state="$(meta_get "$dir" state)"
+    case "$state" in draft|"") echo "n/a"; return;; esac
+    want="$(meta_get "$dir" prompt_sha256)"
+    if regular "$dir/prompt.md" && [ -n "$want" ] && [ "$(sha "$dir/prompt.md")" = "$want" ]; then echo yes; else echo no; fi
+}
+response_ok() { # dir -> yes|no|n/a
+    local dir="$1" state want id
+    state="$(meta_get "$dir" state)"
+    case "$state" in answered|archived) ;; *) echo "n/a"; return;; esac
+    want="$(meta_get "$dir" response_sha256)"; id="$(meta_get "$dir" exchange_id)"
+    if regular "$dir/response.md" && [ -n "$want" ] && [ "$(sha "$dir/response.md")" = "$want" ] \
+       && [ "$(head -n1 "$dir/response.md")" = "Exchange-ID: $id" ]; then echo yes; else echo no; fi
+}
+
+# ---- git helpers -----------------------------------------------------------
+git_common_of() { # path -> realpath of git common dir, or "" if not a repo
+    local top common
+    top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    common="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    ( cd "$1" && realpath -m "$common" )
+}
+human_age() { # seconds
+    local s="$1"
+    if [ "$s" -lt 60 ]; then echo "${s}s"; elif [ "$s" -lt 3600 ]; then echo "$((s/60))m"; elif [ "$s" -lt 86400 ]; then echo "$((s/3600))h"; else echo "$((s/86400))d"; fi
+}
+json_str() { # escape for JSON
+    local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; printf '"%s"' "$s"
+}
+
+# ---- commands --------------------------------------------------------------
+cmd_new() {
+    local topic="" target="Claude Code" requester="Codex"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
+            --target) [ "$#" -ge 2 ] || die "--target requires a value"; target="$2"; shift 2;;
+            --requester) [ "$#" -ge 2 ] || die "--requester requires a value"; requester="$2"; shift 2;;
+            -h|--help) usage; exit 0;;
+            *) die "unknown new option: $1";;
+        esac
+    done
+    [ -n "$topic" ] || die "new requires --topic TOPIC"
+    local slug
+    slug="$(printf '%s' "$topic" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60)"
+    [ -n "$slug" ] || slug="exchange"
+
+    mkdir -p "$STORE" "$EXCH" "$ARCH"; chmod 700 "$STORE" "$EXCH" "$ARCH"
+    local base id n=1
+    base="$(date -u +%Y-%m-%dT%H%M%SZ)-$slug"; id="$base"
+    while :; do
+        if [ -e "$ARCH/$id" ] || ! mkdir "$EXCH/$id" 2>/dev/null; then
+            n=$((n+1)); id="$base-$n"; [ "$n" -le 1000 ] || die "could not reserve an exchange id"; continue
+        fi
+        break
+    done
+    local dir="$EXCH/$id"
+
+    local repo common branch commit dirty
+    repo="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$repo" ]; then
+        common="$(git_common_of "$PWD")"
+        branch="$(git -C "$PWD" branch --show-current 2>/dev/null || true)"; [ -n "$branch" ] || branch="(detached)"
+        commit="$(git -C "$PWD" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        if [ -n "$(git -C "$PWD" status --short 2>/dev/null || true)" ]; then dirty="dirty"; else dirty="clean"; fi
+    else
+        repo="(none)"; common="(none)"; branch="(none)"; commit="(none)"; dirty="(none)"
+    fi
+    local thread="${CODEX_THREAD_ID:-(unset)}" created; created="$(now_utc)"
+
+    cat > "$dir/prompt.md" <<EOF
+Exchange-ID: $id
+Requester: $requester
+Target: $target
+Repo: $repo
+Git-Common-Dir: $common
+Branch: $branch
+Commit: $commit
+Dirty-State: $dirty
+Created-UTC: $created
+Codex-Thread: $thread
+
+Task:
+<!-- Replace this section with the focused request for $target.
+     When the prompt is final, run:  agent-mailbox publish $id  -->
+
+Required reading:
+- The target repository's AGENTS.md / CLAUDE.md (at Repo above) and the startup files they name.
+- Any source files, artifacts, or plans cited by the task above.
+
+Response requirements:
+- Work in the exact checkout named by Repo above; verify Branch/Commit and report drift.
+- Start the response with 'Exchange-ID: $id' and 'Responder: <name>' lines.
+- Label conclusions PROVEN / LIKELY / UNPROVEN / REJECTED where applicable.
+- Ground claims in current source, current artifacts, current git history, or cited docs.
+- State a clear verdict and next action.
+- Publish with:  agent-mailbox claim $id  then  agent-mailbox respond $id --token <claim_token> --file <response.md>
+EOF
+    chmod 600 "$dir/prompt.md"
+    lock "$dir"
+    meta_set "$dir" exchange_id "$id" state draft created_utc "$created" created_epoch "$(epoch)" \
+        requester "$requester" target "$target" repo "$repo" git_common_dir "$common" \
+        branch "$branch" commit "$commit" dirty_state "$dirty" codex_thread "$thread"
+    unlock
+    echo "exchange_id=$id"
+    echo "exchange_dir=$dir"
+    echo "prompt_path=$dir/prompt.md"
+    echo "state=draft"
+    echo "next=edit prompt.md, then: agent-mailbox publish $id"
+}
+
+cmd_publish() {
+    [ "$#" -eq 1 ] || die "usage: publish ID"
+    local dir; dir="$(active_dir "$1")"
+    lock "$dir"
+    local state; state="$(meta_get "$dir" state)"
+    case "$state" in
+        published|claimed|answered) unlock; echo "exchange_id=$1"; echo "state=$state"; echo "prompt_sha256=$(meta_get "$dir" prompt_sha256)"; echo "note=already published"; return 0;;
+        draft) ;;
+        *) unlock; die "cannot publish from state '$state'";;
+    esac
+    regular "$dir/prompt.md" || { unlock; die "prompt.md missing or not a regular file"; }
+    [ "$(head -n1 "$dir/prompt.md")" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
+    local h; h="$(sha "$dir/prompt.md")"
+    chmod 400 "$dir/prompt.md"
+    meta_set "$dir" state published prompt_sha256 "$h" published_utc "$(now_utc)"
+    unlock
+    echo "exchange_id=$1"; echo "state=published"; echo "prompt_sha256=$h"
+}
+
+emit_status() { # dir [json]
+    local dir="$1" json="${2:-}" k v
+    local pok rok cage="" state
+    pok="$(prompt_ok "$dir")"; rok="$(response_ok "$dir")"; state="$(meta_get "$dir" state)"
+    if [ "$state" = "claimed" ]; then cage="$(( $(epoch) - $(meta_get "$dir" claimed_epoch) ))"; fi
+    if [ -n "$json" ]; then
+        printf '{'
+        local first=1
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            k="${line%%=*}"; v="${line#*=}"
+            [ "$first" = 1 ] || printf ','; first=0
+            printf '%s:%s' "$(json_str "$k")" "$(json_str "$v")"
+        done < "$dir/meta"
+        printf ',"exchange_dir":%s,"prompt_ok":%s,"response_ok":%s,"response_present":%s' \
+            "$(json_str "$dir")" "$(json_str "$pok")" "$(json_str "$rok")" "$( [ -e "$dir/response.md" ] && echo '"yes"' || echo '"no"')"
+        [ -n "$cage" ] && printf ',"claim_age_secs":%s' "$cage"
+        printf '}'
+    else
+        cat "$dir/meta"
+        echo "exchange_dir=$dir"
+        echo "prompt_ok=$pok"
+        echo "response_present=$( [ -e "$dir/response.md" ] && echo yes || echo no)"
+        echo "response_ok=$rok"
+        [ -n "$cage" ] && echo "claim_age_secs=$cage"
+    fi
+}
+
+cmd_status() {
+    local id="" json=""
+    while [ "$#" -gt 0 ]; do case "$1" in --json) json=1;; -h|--help) usage; exit 0;; *) id="$1";; esac; shift; done
+    [ -n "$id" ] || die "usage: status ID [--json]"
+    local dir; dir="$(exdir "$id")"
+    emit_status "$dir" "$json"; [ -n "$json" ] && echo
+    return 0
+}
+
+cmd_path() { [ "$#" -eq 1 ] || die "usage: path ID"; exdir "$1"; }
+
+cmd_show() {
+    [ "$#" -eq 1 ] || die "usage: show ID"
+    local dir; dir="$(exdir "$1")"
+    regular "$dir/prompt.md" || die "prompt.md missing or not a regular file"
+    cat "$dir/prompt.md"
+}
+
+cmd_list() {
+    local filter="active" repo_filter="" json="" want_common=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --pending) filter="pending";; --answered) filter="answered";; --drafts) filter="drafts";; --all) filter="all";;
+            --repo) [ "$#" -ge 2 ] || die "--repo requires a path"; repo_filter="$2"; shift;;
+            --here) repo_filter="$PWD";;
+            --json) json=1;;
+            -h|--help) usage; exit 0;;
+            *) die "unknown list option: $1";;
+        esac; shift
+    done
+    if [ -n "$repo_filter" ]; then
+        [ -d "$repo_filter" ] || die "--repo path not found: $repo_filter"
+        want_common="$(git_common_of "$repo_filter")"
+        [ -n "$want_common" ] || die "--repo path is not inside a git repository: $repo_filter"
+    fi
+    local dirs=() d
+    if [ -d "$EXCH" ]; then for d in "$EXCH"/*/; do [ -d "$d" ] && dirs+=("${d%/}"); done; fi
+    if [ "$filter" = "all" ] && [ -d "$ARCH" ]; then for d in "$ARCH"/*/; do [ -d "$d" ] && dirs+=("${d%/}"); done; fi
+    local first=1 now; now="$(epoch)"
+    [ -n "$json" ] && printf '['
+    for d in "${dirs[@]}"; do
+        [ -f "$d/meta" ] || continue
+        local id state common
+        id="$(meta_get "$d" exchange_id)"; state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
+        valid_id "$id" || continue
+        case "$filter" in
+            pending)  case "$state" in published|claimed) ;; *) continue;; esac; [ "$(prompt_ok "$d")" = "yes" ] || continue;;
+            answered) [ "$state" = "answered" ] || continue;;
+            drafts)   [ "$state" = "draft" ] || continue;;
+            active|all) ;;
+        esac
+        if [ -n "$want_common" ]; then [ "$common" = "$want_common" ] || continue; fi
+        local age; age="$(human_age $(( now - $(meta_get "$d" created_epoch) )))"
+        if [ -n "$json" ]; then
+            [ "$first" = 1 ] || printf ','; first=0
+            emit_status "$d" json
+        else
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$state" "$age" "$(meta_get "$d" repo)" "$(meta_get "$d" target)"
+        fi
+    done
+    [ -n "$json" ] && printf ']\n'
+    return 0
+}
+
+cmd_claim() {
+    local id="" owner="${AGENT_MAILBOX_OWNER:-${USER:-user}@$(hostname)}" takeover=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --owner) [ "$#" -ge 2 ] || die "--owner requires a value"; owner="$2"; shift;;
+            --takeover) takeover=1;;
+            -h|--help) usage; exit 0;;
+            *) id="$1";;
+        esac; shift
+    done
+    [ -n "$id" ] || die "usage: claim ID [--owner NAME] [--takeover]"
+    local dir; dir="$(active_dir "$id")"
+    lock "$dir"
+    local state; state="$(meta_get "$dir" state)"
+    case "$state" in
+        published) ;;
+        claimed)
+            local age=$(( $(epoch) - $(meta_get "$dir" claimed_epoch) )) by; by="$(meta_get "$dir" claimed_by)"
+            if [ "$takeover" = 1 ] && [ "$age" -ge "$STALE_CLAIM_SECS" ]; then
+                meta_set "$dir" previous_claimant "$by"
+                rm -rf "$dir/claim"
+            else
+                unlock; die "already claimed by '$by' (${age}s ago); --takeover is allowed after ${STALE_CLAIM_SECS}s"
+            fi;;
+        draft) unlock; die "exchange is not published yet";;
+        *) unlock; die "cannot claim from state '$state'";;
+    esac
+    [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "prompt.md was modified after publish; refusing to claim"; }
+    mkdir "$dir/claim" 2>/dev/null || { unlock; die "claim race lost; retry"; }
+    local token; token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '%s\n' "$token" > "$dir/claim/token"; printf '%s\n' "$owner" > "$dir/claim/owner"
+    chmod 600 "$dir/claim/token" "$dir/claim/owner"
+    meta_set "$dir" state claimed claimed_by "$owner" claimed_utc "$(now_utc)" claimed_epoch "$(epoch)"
+    unlock
+    echo "exchange_id=$id"; echo "state=claimed"; echo "claimed_by=$owner"; echo "claim_token=$token"
+    echo "repo=$(meta_get "$dir" repo)"
+}
+
+cmd_respond() {
+    local id="" token="" file=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --token) [ "$#" -ge 2 ] || die "--token requires a value"; token="$2"; shift;;
+            --file) [ "$#" -ge 2 ] || die "--file requires a value"; file="$2"; shift;;
+            -h|--help) usage; exit 0;;
+            *) id="$1";;
+        esac; shift
+    done
+    [ -n "$id" ] && [ -n "$token" ] && [ -n "$file" ] || die "usage: respond ID --token TOKEN --file FILE"
+    local dir; dir="$(active_dir "$id")"
+    if [ "$file" = "-" ]; then file="$dir/.stdin.$$"; cat > "$file"; fi
+    regular "$file" || die "response file missing or not a regular file: $file"
+    [ "$(head -n1 "$file")" = "Exchange-ID: $id" ] || die "response must start with 'Exchange-ID: $id'"
+    head -n5 "$file" | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header"
+    lock "$dir"
+    local state; state="$(meta_get "$dir" state)"
+    [ "$state" = "claimed" ] || { unlock; die "exchange is not claimed (state=$state); run: agent-mailbox claim $id"; }
+    [ -f "$dir/claim/token" ] && [ "$(cat "$dir/claim/token")" = "$token" ] || { unlock; die "claim token does not match"; }
+    [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "prompt.md was modified after publish; refusing to respond"; }
+    local tmp="$dir/.response.tmp.$$"
+    cp -- "$file" "$tmp"; chmod 600 "$tmp"
+    if ! ln "$tmp" "$dir/response.md" 2>/dev/null; then rm -f "$tmp"; unlock; die "response.md already exists (write-once)"; fi
+    rm -f "$tmp"
+    local responder; responder="$(head -n5 "$dir/response.md" | awk -F': ' '/^Responder: /{print $2; exit}')"
+    meta_set "$dir" state answered answered_utc "$(now_utc)" response_sha256 "$(sha "$dir/response.md")" responder "$responder"
+    unlock
+    echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
+}
+
+cmd_read_response() {
+    [ "$#" -eq 1 ] || die "usage: read-response ID"
+    local dir; dir="$(exdir "$1")"
+    local state; state="$(meta_get "$dir" state)"
+    case "$state" in answered|archived) ;; *) die "no response yet (state=$state)";; esac
+    [ "$(prompt_ok "$dir")" = "yes" ] || die "prompt.md does not match its published hash; response is not trustworthy"
+    [ "$(response_ok "$dir")" = "yes" ] || die "response.md failed validation (hash or Exchange-ID mismatch)"
+    cat "$dir/response.md"
+}
+
+cmd_wait() {
+    local id="" timeout="$DEFAULT_WAIT_TIMEOUT"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --timeout) [ "$#" -ge 2 ] || die "--timeout requires seconds"; timeout="$2"; shift;;
+            -h|--help) echo "usage: wait ID [--timeout S]   (default timeout ${DEFAULT_WAIT_TIMEOUT}s; exit 0 answered, 124 timeout, 2 archived, 1 error)"; exit 0;;
+            *) id="$1";;
+        esac; shift
+    done
+    [ -n "$id" ] || die "usage: wait ID [--timeout S]"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be an integer number of seconds"
+    require_id "$id"
+    local deadline=$(( $(epoch) + timeout )) dir state
+    while :; do
+        if [ -d "$ARCH/$id" ]; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
+        [ -d "$EXCH/$id" ] || die "unknown exchange: $id"
+        dir="$EXCH/$id"; state="$(meta_get "$dir" state)"
+        if [ "$state" = "answered" ]; then
+            if [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
+                echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
+                echo "next=agent-mailbox read-response $id"; return 0
+            fi
+            die "exchange answered but response failed validation; run: agent-mailbox status $id"
+        fi
+        local now; now="$(epoch)"
+        if [ "$now" -ge "$deadline" ]; then echo "exchange_id=$id"; echo "state=$state"; echo "result=timeout"; return 124; fi
+        local remain=$(( deadline - now )); local nap=$POLL_SECS; [ "$remain" -lt "$nap" ] && nap="$remain"
+        sleep "$nap"
+    done
+}
+
+cmd_archive() {
+    local id="" force=0
+    while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; -h|--help) usage; exit 0;; *) id="$1";; esac; shift; done
+    [ -n "$id" ] || die "usage: archive ID [--force]"
+    require_id "$id"
+    if [ ! -d "$EXCH/$id" ]; then
+        [ -d "$ARCH/$id" ] && { echo "exchange_id=$id"; echo "state=archived"; echo "note=already archived"; return 0; }
+        die "unknown exchange: $id"
+    fi
+    local dir="$EXCH/$id"
+    lock "$dir"
+    local state; state="$(meta_get "$dir" state)"
+    if [ "$state" != "answered" ] && [ "$force" != 1 ]; then unlock; die "exchange not answered (state=$state); use --force to archive anyway"; fi
+    [ -e "$ARCH/$id" ] && { unlock; die "archive target already exists: $ARCH/$id"; }
+    meta_set "$dir" state archived archived_utc "$(now_utc)" archived_from_state "$state"
+    unlock
+    mkdir -p "$ARCH"; chmod 700 "$ARCH"
+    mv -T "$dir" "$ARCH/$id" || die "failed to move exchange to archive"
+    echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
+}
+
+main() {
+    [ "$#" -gt 0 ] || { usage; exit 2; }
+    local cmd="$1"; shift
+    case "$cmd" in
+        new) cmd_new "$@";;
+        publish) cmd_publish "$@";;
+        list) cmd_list "$@";;
+        status) cmd_status "$@";;
+        show) cmd_show "$@";;
+        path) cmd_path "$@";;
+        claim) cmd_claim "$@";;
+        respond) cmd_respond "$@";;
+        read-response) cmd_read_response "$@";;
+        wait) cmd_wait "$@";;
+        archive) cmd_archive "$@";;
+        version|--version) echo "agent-mailbox $VERSION";;
+        help|-h|--help) usage;;
+        *) die "unknown command: $cmd (try --help)";;
+    esac
+}
+
+main "$@"
