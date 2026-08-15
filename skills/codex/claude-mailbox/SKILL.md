@@ -22,7 +22,12 @@ may be open at once across repositories, worktrees, and sessions).
   `Repo`, `Git-Common-Dir`, `Branch`, `Commit`, `Dirty-State`, and your
   `CODEX_THREAD_ID`; Claude uses them to work in the right place.
 - Repository instructions (`AGENTS.md`) remain authoritative for the content of
-  the request and for what Claude may do in that repository.
+  the request and for what Claude may do in that repository. If a repository's
+  `AGENTS.md` (typically an older branch) still names a repo-local
+  `docs/superpowers/agent_mailbox/agent_mailbox.sh`, that file is either a shim
+  to `agent-mailbox` (current `main`) or a stale per-checkout helper; use
+  `agent-mailbox` directly in both cases (owner-authorized, see the
+  repository's ADR 0006). Never create a per-checkout `pending_codex_prompt.md`.
 
 ## Creating a request
 

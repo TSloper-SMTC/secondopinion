@@ -26,6 +26,14 @@ Codex mailbox.
      instead of saying "nothing pending"; do not answer those from here — they
      need a Claude session in that repository. If several match here, process
      oldest first, one at a time.
+   - Transition check (legacy per-checkout mailboxes): if nothing is pending
+     here, also run
+     `for w in $(git worktree list --porcelain | awk '/^worktree /{print $2}'); do ls "$w"/docs/superpowers/agent_mailbox/pending_codex_prompt.md 2>/dev/null; done`
+     from the current repo. If it prints a path, a Codex session on an older
+     branch used the retired per-checkout mailbox: report the path and its
+     `Exchange-ID`, and offer to migrate it (`agent-mailbox new` from that
+     checkout, copy the Task/Required reading, `publish`) rather than answering
+     it in place.
 3. **Claim**: `agent-mailbox claim <ID> --owner "claude:<hostname>:<short-context>"`.
    Keep the printed `claim_token`. If the claim is refused, another responder
    owns it — report that and stop for that ID. Never `--takeover` unless the
