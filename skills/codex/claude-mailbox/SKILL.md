@@ -14,10 +14,11 @@ may be open at once across repositories, worktrees, and sessions).
 - `command -v agent-mailbox` must succeed. If not, report that the mailbox tool
   is not installed (`~/tools/agent-mailbox/install.sh`) and stop.
 - If `new` fails with "cannot create mailbox store" / "Read-only file system",
-  your sandbox lacks the store as a writable root; ask the user to run
-  `~/tools/agent-mailbox/install.sh` (it adds `[sandbox_workspace_write]
-  writable_roots` for `~/.agent-mailbox` to `~/.codex/config.toml`) and restart
-  Codex. Do not work around it by writing elsewhere.
+  your sandbox lacks the store as a writable root. Ask the user to run
+  `~/tools/agent-mailbox/install.sh`, follow any printed `ACTION` line (an
+  existing `[sandbox_workspace_write]` table is not edited automatically),
+  confirm `~/tools/agent-mailbox/install.sh --check` prints `installed=yes`,
+  and restart Codex. Do not work around it by writing elsewhere.
 - Run `new` from the checkout the review is about. It records that checkout's
   `Repo`, `Git-Common-Dir`, `Branch`, `Commit`, `Dirty-State`, and your
   `CODEX_THREAD_ID`; Claude uses them to work in the right place.

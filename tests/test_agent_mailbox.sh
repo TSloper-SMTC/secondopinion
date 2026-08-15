@@ -204,6 +204,115 @@ assert_eq "$(echo "$out" | grep -c 'cannot create directory')" "0"        # no r
 assert_grep "cannot create mailbox store $RO/store" <(echo "$out")
 assert_grep "writable_roots" <(echo "$out")
 
+# ---- round-2 regressions (Codex adversarial review 2026-08-15) ----------------
+t "status: exits 0 for every state (draft/published/claimed/answered/archived)"
+IDS="$(new_in "$TMP/repoB" status-rc)"
+assert_rc 0 "$AM" status "$IDS"                                   # draft
+publish_prompt "$IDS" "Task: s"; assert_rc 0 "$AM" status "$IDS"  # published
+TS="$("$AM" claim "$IDS" --owner o | val claim_token)"; assert_rc 0 "$AM" status "$IDS"   # claimed
+write_response "$IDS" "$TMP/rs.md"; "$AM" respond "$IDS" --token "$TS" --file "$TMP/rs.md" >/dev/null
+assert_rc 0 "$AM" status "$IDS"                                   # answered
+"$AM" archive "$IDS" >/dev/null; assert_rc 0 "$AM" status "$IDS"  # archived
+assert_rc 0 "$AM" list; assert_rc 0 "$AM" list --all --json
+
+t "containment: a symlinked exchange dir is never followed (list/status/wait/archive/path)"
+EXT="$TMP/external-exchange"; mkdir -p "$EXT"; printf 'exchange_id=2026-01-01T000000Z-evil\nstate=published\ncreated_epoch=1\nrepo=x\ngit_common_dir=x\ntarget=t\n' > "$EXT/meta"
+ln -s "$EXT" "$AGENT_MAILBOX_DIR/exchanges/2026-01-01T000000Z-evil"
+assert_eq "$("$AM" list --all | grep -c evil)" "0"
+assert_rc 1 "$AM" status 2026-01-01T000000Z-evil
+assert_rc 1 "$AM" path 2026-01-01T000000Z-evil
+assert_rc 1 "$AM" wait 2026-01-01T000000Z-evil --timeout 0
+assert_rc 1 "$AM" archive 2026-01-01T000000Z-evil --force
+assert_eq "$(grep -c 'state=published' "$EXT/meta")" "1"          # external meta untouched
+assert_nofile "$EXT/.lock"
+rm -f "$AGENT_MAILBOX_DIR/exchanges/2026-01-01T000000Z-evil"
+
+t "containment: symlinked .lock / meta / claim inside a real exchange are refused"
+IDL="$(new_in "$TMP/repoB" lockfile)"; DL="$("$AM" path "$IDL")"
+ln -sfn "$TMP/outside-lock" "$DL/.lock"          # replace the real lock with a symlink
+assert_rc 1 "$AM" publish "$IDL"; assert_nofile "$TMP/outside-lock"; rm -f "$DL/.lock"
+"$AM" publish "$IDL" >/dev/null
+mv "$DL/meta" "$TMP/meta-moved"; ln -s "$TMP/meta-moved" "$DL/meta"
+assert_rc 1 "$AM" status "$IDL"; assert_rc 1 "$AM" claim "$IDL" --owner o
+rm -f "$DL/meta"; mv "$TMP/meta-moved" "$DL/meta"
+mkdir -p "$TMP/outside-claim"; ln -s "$TMP/outside-claim" "$DL/claim"
+assert_rc 1 "$AM" claim "$IDL" --owner o; assert_nofile "$TMP/outside-claim/token"; rm -f "$DL/claim"
+
+t "respond: source file swapped after validation cannot change the published bytes (TOCTOU)"
+IDT="$(new_in "$TMP/repoB" toctou)"; publish_prompt "$IDT" "Task: t"; DT="$("$AM" path "$IDT")"
+TT="$("$AM" claim "$IDT" --owner o | val claim_token)"
+write_response "$IDT" "$TMP/race-input.md"
+printf 'Exchange-ID: some-other-id\nResponder: X\n\nSWAPPED\n' > "$TMP/race-swap.md"
+( flock 8; sleep 2 ) 8>>"$DT/.lock" &
+LOCKPID=$!
+sleep 0.3
+"$AM" respond "$IDT" --token "$TT" --file "$TMP/race-input.md" >"$TMP/race.out" 2>&1 &
+RPID=$!
+sleep 0.5; mv -f "$TMP/race-swap.md" "$TMP/race-input.md"
+wait $RPID; RRC=$?; wait $LOCKPID
+assert_eq "$RRC" 0 "(respond rc under swap)"
+assert_not_grep "SWAPPED" "$DT/response.md"
+assert_grep "verdict: PROVEN ok" "$DT/response.md"
+assert_eq "$("$AM" status "$IDT" | val response_ok)" "yes"
+
+t "recovery: orphan claim dir (crash after mkdir) does not block a fresh claim"
+IDO="$(new_in "$TMP/repoB" orphan-claim)"; publish_prompt "$IDO" "Task: o"; DO="$("$AM" path "$IDO")"
+mkdir "$DO/claim"; echo deadtoken > "$DO/claim/token"; echo ghost > "$DO/claim/owner"   # meta still says published
+assert_rc 0 "$AM" claim "$IDO" --owner alive
+assert_eq "$("$AM" status "$IDO" | val claimed_by)" "alive"
+
+t "recovery: response.md linked but meta not finalized (crash before meta) rolls forward on retry"
+IDR="$(new_in "$TMP/repoB" roll-forward)"; publish_prompt "$IDR" "Task: r"; DR="$("$AM" path "$IDR")"
+TR="$("$AM" claim "$IDR" --owner o | val claim_token)"
+write_response "$IDR" "$DR/response.md"; chmod 600 "$DR/response.md"        # simulate: link happened, meta not updated
+assert_rc 0 "$AM" respond "$IDR" --token "$TR" --file "$DR/response.md"
+assert_eq "$("$AM" status "$IDR" | val state)" "answered"
+assert_eq "$("$AM" status "$IDR" | val response_ok)" "yes"
+assert_rc 0 "$AM" read-response "$IDR"
+
+t "recovery: archive interrupted after meta update (dir still active) completes on retry"
+IDA="$(new_in "$TMP/repoB" half-archive)"; publish_prompt "$IDA" "Task: a"; DA="$("$AM" path "$IDA")"
+TA="$("$AM" claim "$IDA" --owner o | val claim_token)"; write_response "$IDA" "$TMP/ra.md"; "$AM" respond "$IDA" --token "$TA" --file "$TMP/ra.md" >/dev/null
+sed -i 's/^state=answered$/state=archived/' "$DA/meta"                       # simulate: meta flipped, mv never happened
+assert_rc 0 "$AM" archive "$IDA"
+assert_nofile "$AGENT_MAILBOX_DIR/exchanges/$IDA"; assert_file "$AGENT_MAILBOX_DIR/archive/$IDA/response.md"
+
+t "metadata: control characters in owner/topic/target are refused; JSON always valid"
+IDM="$(new_in "$TMP/repoB" meta-inject)"; publish_prompt "$IDM" "Task: m"
+assert_rc 1 "$AM" claim "$IDM" --owner $'bad\nclaimed_epoch=oops'
+assert_rc 1 "$AM" claim "$IDM" --owner $'a\rb'
+assert_eq "$("$AM" status "$IDM" | val state)" "published"          # still claimable, meta intact
+assert_rc 1 env -C "$TMP/repoB" "$AM" new --topic $'x\ny' --target $'T\rQ'
+"$AM" claim "$IDM" --owner $'tab\there ok' >/dev/null
+if command -v python3 >/dev/null; then
+  "$AM" status "$IDM" --json | python3 -c 'import json,sys; json.load(sys.stdin)' && ok || fail "status --json invalid with tab in owner"
+  "$AM" list --all --json | python3 -c 'import json,sys; json.load(sys.stdin)' && ok || fail "list --json invalid"
+else ok; ok; fi
+
+t "respond --file -: no temporary copies are left behind (success and failure)"
+IDF="$(new_in "$TMP/repoB" stdin-clean)"; publish_prompt "$IDF" "Task: f"; DF="$("$AM" path "$IDF")"
+TF="$("$AM" claim "$IDF" --owner o | val claim_token)"
+printf 'Exchange-ID: wrong\nResponder: X\n' | "$AM" respond "$IDF" --token "$TF" --file - >/dev/null 2>&1 || true
+assert_eq "$(ls -a "$DF" | grep -c '^\.stdin\.\|^\.response\.tmp')" "0"
+printf 'Exchange-ID: %s\nResponder: Claude Code   \n\nok\n' "$IDF" | "$AM" respond "$IDF" --token "$TF" --file - >/dev/null
+assert_eq "$(ls -a "$DF" | grep -c '^\.stdin\.\|^\.response\.tmp')" "0"
+assert_eq "$("$AM" status "$IDF" | val responder)" "Claude Code"      # trailing spaces trimmed
+
+t "CRLF: a prompt/response with CRLF headers still validates"
+IDC="$(new_in "$TMP/repoB" crlf)"; DC="$("$AM" path "$IDC")"
+sed -i 's/$/\r/' "$DC/prompt.md"
+assert_rc 0 "$AM" publish "$IDC"
+TC="$("$AM" claim "$IDC" --owner o | val claim_token)"
+printf 'Exchange-ID: %s\r\nResponder: R\r\n\r\nbody\r\n' "$IDC" > "$TMP/crlf.md"
+assert_rc 0 "$AM" respond "$IDC" --token "$TC" --file "$TMP/crlf.md"
+assert_rc 0 "$AM" read-response "$IDC"
+
+t "env: HOME unset without AGENT_MAILBOX_DIR gives one clear error, not a bash trace"
+out="$(env -u HOME -u AGENT_MAILBOX_DIR "$AM" list 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc HOME unset)"
+assert_not_grep "unbound variable" <(echo "$out")
+assert_grep "AGENT_MAILBOX_DIR" <(echo "$out")
+
 t "help: usage lists every command"
 for c in new publish list status show path claim respond read-response wait archive; do
   assert_grep "\b$c\b" <("$AM" --help 2>&1)

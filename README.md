@@ -65,8 +65,25 @@ agent-mailbox respond <ID> --token <claim_token> --file response.md   # write-on
   `AGENT_MAILBOX_STALE_CLAIM_SECS` (default 1800) with `--takeover`.
 - `read-response`/`wait` succeed only when Exchange-ID, prompt hash, and
   response hash all validate — never by mtime.
-- Strict ID grammar (no path traversal), symlinks refused, `umask 077`
-  (store `0700`, files `0600`), `wait` always has a finite timeout.
+- Strict ID grammar (no path traversal); a symlinked exchange directory,
+  `.lock`, `meta`, `claim/`, `prompt.md`, or `response.md` is refused by every
+  command; `umask 077` (store `0700`, files `0600`, published prompt `0400`);
+  `wait` always has a finite timeout.
+- Interrupted operations are retry-safe: an orphan `claim/` does not block a
+  fresh claim, a linked-but-unfinalized `response.md` rolls forward on the next
+  `respond`, and an interrupted `archive` completes (or restores state) on
+  retry. `respond` snapshots the candidate file before validating it, so a
+  file swapped underneath cannot change what is published.
+
+## Threat model
+
+The store is private to one user (`0700`/`0600`). Integrity checks (Exchange-ID,
+prompt SHA-256, response SHA-256, write-once response, one-use claim tokens)
+protect against mistakes and races between cooperating agents and sessions.
+They are NOT a defence against a process running as the same UID that edits
+`meta` or reads claim tokens directly — such a process can do anything the tool
+can. Metadata values are rejected if they contain newlines/control characters
+so they cannot corrupt `meta` or the JSON output.
 
 ## Environment
 

@@ -12,7 +12,11 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
+    echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
+    exit 1
+fi
 STORE="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
 EXCH="$STORE/exchanges"
 ARCH="$STORE/archive"
@@ -50,6 +54,7 @@ Environment: AGENT_MAILBOX_DIR, AGENT_MAILBOX_OWNER (default claim owner),
 EOF
 }
 
+RESP_TMP=""
 die() { echo "ERROR: $*" >&2; exit 1; }
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 epoch() { date +%s; }
@@ -66,25 +71,47 @@ valid_id() {
 
 require_id() { valid_id "${1:-}" || die "invalid exchange id: '${1:-}'"; }
 
+# Containment: an exchange directory and every tool-owned component inside it
+# must be real (non-symlink) filesystem objects. A symlinked exchange dir,
+# .lock, meta, or claim/ is refused by every command so nothing outside the
+# store is ever read, written, locked, or moved.
+real_dir() { [ -d "$1" ] && [ ! -L "$1" ]; }
+check_components() { # dir
+    local c
+    for c in .lock meta claim prompt.md response.md; do
+        [ -L "$1/$c" ] && die "refusing symlinked $c in exchange $(basename "$1")"
+    done
+    return 0
+}
+is_active() { real_dir "$EXCH/$1"; }
+is_archived() { real_dir "$ARCH/$1"; }
 # Resolve exchange dir: active first, then archive. Prints dir; sets IS_ARCHIVED.
 IS_ARCHIVED=0
 exdir() {
     require_id "$1"
-    if [ -d "$EXCH/$1" ] && [ ! -L "$EXCH/$1" ]; then IS_ARCHIVED=0; echo "$EXCH/$1"; return 0; fi
-    if [ -d "$ARCH/$1" ] && [ ! -L "$ARCH/$1" ]; then IS_ARCHIVED=1; echo "$ARCH/$1"; return 0; fi
+    if is_active "$1"; then IS_ARCHIVED=0; check_components "$EXCH/$1"; echo "$EXCH/$1"; return 0; fi
+    if is_archived "$1"; then IS_ARCHIVED=1; check_components "$ARCH/$1"; echo "$ARCH/$1"; return 0; fi
+    [ -L "$EXCH/$1" ] || [ -L "$ARCH/$1" ] && die "refusing symlinked exchange directory: $1"
     die "unknown exchange: $1"
 }
 active_dir() {
     require_id "$1"
-    [ -d "$EXCH/$1" ] && [ ! -L "$EXCH/$1" ] || {
-        [ -d "$ARCH/$1" ] && die "exchange is archived: $1"
-        die "unknown exchange: $1"
-    }
-    echo "$EXCH/$1"
+    if is_active "$1"; then check_components "$EXCH/$1"; echo "$EXCH/$1"; return 0; fi
+    [ -L "$EXCH/$1" ] && die "refusing symlinked exchange directory: $1"
+    is_archived "$1" && die "exchange is archived: $1"
+    die "unknown exchange: $1"
 }
+# Values stored in meta / headers: printable, no newlines or control characters (tab allowed).
+safe_value() { # name value
+    case "$2" in *[![:print:][:blank:]]*) die "$1 must not contain control characters or newlines";; esac
+    case "$2" in *$'\n'*|*$'\r'*) die "$1 must not contain newlines";; esac
+    return 0
+}
+trim() { printf '%s' "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//'; }
 
 # ---- meta (key=value) ------------------------------------------------------
 meta_get() { # dir key
+    [ -L "$1/meta" ] && die "refusing symlinked meta in $(basename "$1")"
     [ -f "$1/meta" ] || return 0
     awk -v k="$2" -F= '$1==k{sub(/^[^=]*=/,""); print; exit}' "$1/meta"
 }
@@ -109,7 +136,7 @@ meta_set() { # dir key value [key value ...]  (atomic rewrite; caller holds lock
     for k in "${order[@]}"; do printf '%s=%s\n' "$k" "${kv[$k]}" >> "$tmp"; done
     mv -f "$tmp" "$dir/meta"
 }
-lock() { exec 9>>"$1/.lock"; flock 9; }
+lock() { [ -L "$1/.lock" ] && die "refusing symlinked .lock in $(basename "$1")"; exec 9>>"$1/.lock"; flock 9; }
 unlock() { exec 9>&-; }
 
 # ---- validation ------------------------------------------------------------
@@ -126,7 +153,7 @@ response_ok() { # dir -> yes|no|n/a
     case "$state" in answered|archived) ;; *) echo "n/a"; return;; esac
     want="$(meta_get "$dir" response_sha256)"; id="$(meta_get "$dir" exchange_id)"
     if regular "$dir/response.md" && [ -n "$want" ] && [ "$(sha "$dir/response.md")" = "$want" ] \
-       && [ "$(head -n1 "$dir/response.md")" = "Exchange-ID: $id" ]; then echo yes; else echo no; fi
+       && [ "$(head -n1 "$dir/response.md" | tr -d '\r')" = "Exchange-ID: $id" ]; then echo yes; else echo no; fi
 }
 
 # ---- git helpers -----------------------------------------------------------
@@ -140,8 +167,12 @@ human_age() { # seconds
     local s="$1"
     if [ "$s" -lt 60 ]; then echo "${s}s"; elif [ "$s" -lt 3600 ]; then echo "$((s/60))m"; elif [ "$s" -lt 86400 ]; then echo "$((s/3600))h"; else echo "$((s/86400))d"; fi
 }
-json_str() { # escape for JSON
-    local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; printf '"%s"' "$s"
+json_str() { # escape for JSON (all control characters)
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"; s="${s//$'\b'/\\b}"; s="${s//$'\f'/\\f}"
+    s="$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+    printf '"%s"' "$s"
 }
 
 ensure_store() {
@@ -168,6 +199,7 @@ cmd_new() {
         esac
     done
     [ -n "$topic" ] || die "new requires --topic TOPIC"
+    safe_value "--topic" "$topic"; safe_value "--target" "$target"; safe_value "--requester" "$requester"
     local slug
     slug="$(printf '%s' "$topic" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60)"
     [ -n "$slug" ] || slug="exchange"
@@ -247,7 +279,7 @@ cmd_publish() {
         *) unlock; die "cannot publish from state '$state'";;
     esac
     regular "$dir/prompt.md" || { unlock; die "prompt.md missing or not a regular file"; }
-    [ "$(head -n1 "$dir/prompt.md")" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
+    [ "$(head -n1 "$dir/prompt.md" | tr -d '\r')" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
     local h; h="$(sha "$dir/prompt.md")"
     chmod 400 "$dir/prompt.md"
     meta_set "$dir" state published prompt_sha256 "$h" published_utc "$(now_utc)"
@@ -281,6 +313,7 @@ emit_status() { # dir [json]
         echo "response_ok=$rok"
         [ -n "$cage" ] && echo "claim_age_secs=$cage"
     fi
+    return 0
 }
 
 cmd_status() {
@@ -319,12 +352,12 @@ cmd_list() {
         [ -n "$want_common" ] || die "--repo path is not inside a git repository: $repo_filter"
     fi
     local dirs=() d
-    if [ -d "$EXCH" ]; then for d in "$EXCH"/*/; do [ -d "$d" ] && dirs+=("${d%/}"); done; fi
-    if [ "$filter" = "all" ] && [ -d "$ARCH" ]; then for d in "$ARCH"/*/; do [ -d "$d" ] && dirs+=("${d%/}"); done; fi
+    if [ -d "$EXCH" ]; then for d in "$EXCH"/*/; do real_dir "${d%/}" && dirs+=("${d%/}"); done; fi
+    if [ "$filter" = "all" ] && [ -d "$ARCH" ]; then for d in "$ARCH"/*/; do real_dir "${d%/}" && dirs+=("${d%/}"); done; fi
     local first=1 now; now="$(epoch)"
     [ -n "$json" ] && printf '['
     for d in "${dirs[@]}"; do
-        [ -f "$d/meta" ] || continue
+        [ -f "$d/meta" ] && [ ! -L "$d/meta" ] || continue
         local id state common
         id="$(meta_get "$d" exchange_id)"; state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
         valid_id "$id" || continue
@@ -358,14 +391,21 @@ cmd_claim() {
         esac; shift
     done
     [ -n "$id" ] || die "usage: claim ID [--owner NAME] [--takeover]"
+    safe_value "--owner" "$owner"; owner="$(trim "$owner")"; [ -n "$owner" ] || die "--owner must not be empty"
     local dir; dir="$(active_dir "$id")"
     lock "$dir"
     local state; state="$(meta_get "$dir" state)"
     case "$state" in
-        published) ;;
+        published)
+            # An orphan claim/ (crash after mkdir, before meta) must not block a fresh claim.
+            if [ -e "$dir/claim" ] || [ -L "$dir/claim" ]; then
+                [ -L "$dir/claim" ] && { unlock; die "refusing symlinked claim in $id"; }
+                rm -rf "$dir/claim"
+            fi;;
         claimed)
             local age=$(( $(epoch) - $(meta_get "$dir" claimed_epoch) )) by; by="$(meta_get "$dir" claimed_by)"
             if [ "$takeover" = 1 ] && [ "$age" -ge "$STALE_CLAIM_SECS" ]; then
+                [ -L "$dir/claim" ] && { unlock; die "refusing symlinked claim in $id"; }
                 meta_set "$dir" previous_claimant "$by"
                 rm -rf "$dir/claim"
             else
@@ -377,12 +417,25 @@ cmd_claim() {
     [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "prompt.md was modified after publish; refusing to claim"; }
     mkdir "$dir/claim" 2>/dev/null || { unlock; die "claim race lost; retry"; }
     local token; token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-    printf '%s\n' "$token" > "$dir/claim/token"; printf '%s\n' "$owner" > "$dir/claim/owner"
-    chmod 600 "$dir/claim/token" "$dir/claim/owner"
-    meta_set "$dir" state claimed claimed_by "$owner" claimed_utc "$(now_utc)" claimed_epoch "$(epoch)"
+    if ! { printf '%s\n' "$token" > "$dir/claim/token" && printf '%s\n' "$owner" > "$dir/claim/owner" \
+           && chmod 600 "$dir/claim/token" "$dir/claim/owner" \
+           && meta_set "$dir" state claimed claimed_by "$owner" claimed_utc "$(now_utc)" claimed_epoch "$(epoch)"; }; then
+        rm -rf "$dir/claim"; unlock; die "claim could not be recorded (I/O failure); nothing was claimed"
+    fi
     unlock
     echo "exchange_id=$id"; echo "state=claimed"; echo "claimed_by=$owner"; echo "claim_token=$token"
     echo "repo=$(meta_get "$dir" repo)"
+}
+
+# Validate a candidate response file (already snapshotted): first line, Responder header.
+validate_response_file() { # file id
+    [ "$(head -n1 "$1" | tr -d '\r')" = "Exchange-ID: $2" ] || die "response must start with 'Exchange-ID: $2'"
+    head -n5 "$1" | tr -d '\r' | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header"
+    return 0
+}
+responder_of() { head -n5 "$1" | tr -d '\r' | awk -F': ' '/^Responder: /{print $2; exit}' | sed -E 's/[[:space:]]+$//'; }
+finalize_response() { # dir  (caller holds lock; response.md exists and validated)
+    meta_set "$1" state answered answered_utc "$(now_utc)" response_sha256 "$(sha "$1/response.md")" responder "$(responder_of "$1/response.md")"
 }
 
 cmd_respond() {
@@ -397,21 +450,41 @@ cmd_respond() {
     done
     [ -n "$id" ] && [ -n "$token" ] && [ -n "$file" ] || die "usage: respond ID --token TOKEN --file FILE"
     local dir; dir="$(active_dir "$id")"
-    if [ "$file" = "-" ]; then file="$dir/.stdin.$$"; cat > "$file"; fi
-    regular "$file" || die "response file missing or not a regular file: $file"
-    [ "$(head -n1 "$file")" = "Exchange-ID: $id" ] || die "response must start with 'Exchange-ID: $id'"
-    head -n5 "$file" | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header"
+    # Snapshot the candidate FIRST (private temp inside the exchange), then validate the
+    # snapshot, then link that exact snapshot: the caller's file can change afterwards
+    # without affecting what is published.
+    RESP_TMP="$(mktemp "$dir/.response.tmp.XXXXXX")" || die "cannot create temp file in $dir"
+    trap '[ -n "${RESP_TMP:-}" ] && rm -f "$RESP_TMP"' EXIT
+    local tmp="$RESP_TMP"
+    if [ "$file" = "-" ]; then
+        cat > "$tmp"
+    else
+        regular "$file" || die "response file missing or not a regular file: $file"
+        cat -- "$file" > "$tmp"
+    fi
+    chmod 600 "$tmp"
     lock "$dir"
     local state; state="$(meta_get "$dir" state)"
     [ "$state" = "claimed" ] || { unlock; die "exchange is not claimed (state=$state); run: agent-mailbox claim $id"; }
-    [ -f "$dir/claim/token" ] && [ "$(cat "$dir/claim/token")" = "$token" ] || { unlock; die "claim token does not match"; }
+    [ -f "$dir/claim/token" ] && [ ! -L "$dir/claim/token" ] && [ "$(cat "$dir/claim/token")" = "$token" ] || { unlock; die "claim token does not match"; }
     [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "prompt.md was modified after publish; refusing to respond"; }
-    local tmp="$dir/.response.tmp.$$"
-    cp -- "$file" "$tmp"; chmod 600 "$tmp"
-    if ! ln "$tmp" "$dir/response.md" 2>/dev/null; then rm -f "$tmp"; unlock; die "response.md already exists (write-once)"; fi
-    rm -f "$tmp"
-    local responder; responder="$(head -n5 "$dir/response.md" | awk -F': ' '/^Responder: /{print $2; exit}')"
-    meta_set "$dir" state answered answered_utc "$(now_utc)" response_sha256 "$(sha "$dir/response.md")" responder "$responder"
+    if [ -e "$dir/response.md" ] || [ -L "$dir/response.md" ]; then
+        # A response already exists while state=claimed: a previous respond linked it but did
+        # not finalize meta (interrupted). Roll forward if it validates; never overwrite it.
+        [ -L "$dir/response.md" ] && { unlock; die "refusing symlinked response.md"; }
+        if regular "$dir/response.md" && [ "$(head -n1 "$dir/response.md" | tr -d '\r')" = "Exchange-ID: $id" ] \
+           && head -n5 "$dir/response.md" | tr -d '\r' | grep -q '^Responder: '; then
+            finalize_response "$dir"; unlock
+            echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"; echo "note=recovered existing response (write-once); the new file was ignored"
+            return 0
+        fi
+        unlock; die "response.md already exists but is not a valid response for $id (write-once; manual inspection needed)"
+    fi
+    validate_response_file "$tmp" "$id" || { unlock; exit 1; }
+    if ! ln "$tmp" "$dir/response.md" 2>/dev/null; then unlock; die "response.md already exists (write-once)"; fi
+    if ! finalize_response "$dir"; then
+        unlock; die "response.md was published but meta could not be updated; re-run the same respond to roll forward"
+    fi
     unlock
     echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
 }
@@ -440,9 +513,11 @@ cmd_wait() {
     require_id "$id"
     local deadline=$(( $(epoch) + timeout )) dir state
     while :; do
-        if [ -d "$ARCH/$id" ]; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
-        [ -d "$EXCH/$id" ] || die "unknown exchange: $id"
-        dir="$EXCH/$id"; state="$(meta_get "$dir" state)"
+        [ -L "$EXCH/$id" ] || [ -L "$ARCH/$id" ] && die "refusing symlinked exchange directory: $id"
+        if is_archived "$id"; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
+        is_active "$id" || die "unknown exchange: $id"
+        dir="$EXCH/$id"; check_components "$dir"; state="$(meta_get "$dir" state)"
+        if [ "$state" = "archived" ]; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
         if [ "$state" = "answered" ]; then
             if [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
                 echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
@@ -462,19 +537,27 @@ cmd_archive() {
     while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; -h|--help) usage; exit 0;; *) id="$1";; esac; shift; done
     [ -n "$id" ] || die "usage: archive ID [--force]"
     require_id "$id"
-    if [ ! -d "$EXCH/$id" ]; then
-        [ -d "$ARCH/$id" ] && { echo "exchange_id=$id"; echo "state=archived"; echo "note=already archived"; return 0; }
+    [ -L "$EXCH/$id" ] || [ -L "$ARCH/$id" ] && die "refusing symlinked exchange directory: $id"
+    if ! is_active "$id"; then
+        is_archived "$id" && { echo "exchange_id=$id"; echo "state=archived"; echo "note=already archived"; return 0; }
         die "unknown exchange: $id"
     fi
-    local dir="$EXCH/$id"
+    local dir="$EXCH/$id"; check_components "$dir"
     lock "$dir"
     local state; state="$(meta_get "$dir" state)"
-    if [ "$state" != "answered" ] && [ "$force" != 1 ]; then unlock; die "exchange not answered (state=$state); use --force to archive anyway"; fi
-    [ -e "$ARCH/$id" ] && { unlock; die "archive target already exists: $ARCH/$id"; }
-    meta_set "$dir" state archived archived_utc "$(now_utc)" archived_from_state "$state"
-    unlock
+    if [ "$state" != "archived" ]; then   # state=archived here means a previous archive was interrupted before the move
+        if [ "$state" != "answered" ] && [ "$force" != 1 ]; then unlock; die "exchange not answered (state=$state); use --force to archive anyway"; fi
+        [ -e "$ARCH/$id" ] && { unlock; die "archive target already exists: $ARCH/$id"; }
+        meta_set "$dir" state archived archived_utc "$(now_utc)" archived_from_state "$state"
+    fi
     ensure_store
-    mv -T "$dir" "$ARCH/$id" || die "failed to move exchange to archive"
+    if ! mv -T "$dir" "$ARCH/$id" 2>/dev/null; then
+        # Roll the metadata back so the exchange stays usable and the retry is honest.
+        local prev; prev="$(meta_get "$dir" archived_from_state)"; [ -n "$prev" ] || prev="$state"
+        meta_set "$dir" state "$prev"
+        unlock; die "failed to move exchange to archive; state restored to $prev"
+    fi
+    unlock
     echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
 }
 
