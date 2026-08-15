@@ -1,0 +1,274 @@
+#!/bin/bash
+# agent_mailbox.sh - local file mailbox for Codex/Claude review exchanges.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ]; then
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+fi
+
+MAILBOX_DIR="${AGENT_MAILBOX_DIR:-$REPO_ROOT/docs/superpowers/agent_mailbox}"
+PROMPT_FILE="$MAILBOX_DIR/pending_codex_prompt.md"
+RESPONSE_FILE="$MAILBOX_DIR/pending_claude_response.md"
+ARCHIVE_DIR="$MAILBOX_DIR/archive"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  agent_mailbox.sh new --topic TOPIC [--replace] [--target NAME]
+  agent_mailbox.sh status
+  agent_mailbox.sh read-response
+  agent_mailbox.sh archive --keep
+  agent_mailbox.sh clear --force
+
+Environment:
+  AGENT_MAILBOX_DIR  Override mailbox directory for tests or scratch work.
+
+Pending files:
+  pending_codex_prompt.md
+  pending_claude_response.md
+EOF
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+sanitize_topic() {
+    local topic="$1"
+    local slug
+    slug="$(printf '%s' "$topic" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+    if [ -z "$slug" ]; then
+        slug="exchange"
+    fi
+    printf '%s' "$slug"
+}
+
+field_value() {
+    local file="$1"
+    local field="$2"
+    awk -v field="$field" '
+        index($0, field ":") == 1 {
+            sub("^[^:]+:[[:space:]]*", "", $0)
+            print
+            exit
+        }
+    ' "$file"
+}
+
+prompt_id() {
+    [ -f "$PROMPT_FILE" ] && field_value "$PROMPT_FILE" "Exchange-ID" || true
+}
+
+response_id() {
+    [ -f "$RESPONSE_FILE" ] && field_value "$RESPONSE_FILE" "Exchange-ID" || true
+}
+
+pending_exists() {
+    [ -e "$PROMPT_FILE" ] || [ -e "$RESPONSE_FILE" ]
+}
+
+archive_pending() {
+    pending_exists || return 0
+    mkdir -p "$ARCHIVE_DIR"
+
+    local id
+    id="$(prompt_id)"
+    if [ -z "$id" ]; then
+        id="$(response_id)"
+    fi
+    if [ -z "$id" ]; then
+        id="$(date -u +%Y-%m-%dT%H%M%SZ)-unknown"
+    fi
+
+    if [ -e "$PROMPT_FILE" ]; then
+        local prompt_dst="$ARCHIVE_DIR/$id-prompt.md"
+        [ ! -e "$prompt_dst" ] || die "archive target already exists: $prompt_dst"
+        mv "$PROMPT_FILE" "$prompt_dst"
+        echo "archived_prompt=$prompt_dst"
+    fi
+    if [ -e "$RESPONSE_FILE" ]; then
+        local response_dst="$ARCHIVE_DIR/$id-response.md"
+        [ ! -e "$response_dst" ] || die "archive target already exists: $response_dst"
+        mv "$RESPONSE_FILE" "$response_dst"
+        echo "archived_response=$response_dst"
+    fi
+}
+
+cmd_new() {
+    local topic=""
+    local replace=0
+    local target="Claude Code"
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --topic)
+                [ "$#" -ge 2 ] || die "--topic requires a value"
+                topic="$2"
+                shift 2
+                ;;
+            --replace)
+                replace=1
+                shift
+                ;;
+            --target)
+                [ "$#" -ge 2 ] || die "--target requires a value"
+                target="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown new option: $1"
+                ;;
+        esac
+    done
+
+    [ -n "$topic" ] || die "new requires --topic TOPIC"
+    if pending_exists; then
+        if [ "$replace" -eq 1 ]; then
+            archive_pending >/dev/null
+        else
+            die "pending mailbox files already exist; run archive --keep, clear --force, or new --replace"
+        fi
+    fi
+
+    mkdir -p "$MAILBOX_DIR"
+    local created_utc slug exchange_id branch commit dirty_state
+    created_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    slug="$(sanitize_topic "$topic")"
+    exchange_id="$(date -u +%Y-%m-%dT%H%M%SZ)-$slug"
+    branch="$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || echo unknown)"
+    commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if [ -n "$(git -C "$REPO_ROOT" status --short 2>/dev/null || true)" ]; then
+        dirty_state="dirty"
+    else
+        dirty_state="clean"
+    fi
+
+    cat > "$PROMPT_FILE" <<EOF
+Exchange-ID: $exchange_id
+Requester: Codex
+Target: $target
+Repo: $REPO_ROOT
+Branch: $branch
+Commit: $commit
+Dirty-State: $dirty_state
+Created-UTC: $created_utc
+Response path: $RESPONSE_FILE
+
+Task:
+<!-- Replace this section with the focused request for $target. -->
+
+Required reading:
+- AGENTS.md
+- docs/superpowers/plans/2026-05-12-flrc-macd-simulation-first-architecture-reset.md
+- docs/superpowers/FLRC_MACD_SESSION_LEDGER.md
+- Any source files, artifacts, or plans cited by the task above.
+
+Response requirements:
+- Preserve this exact Exchange-ID: $exchange_id
+- Write the response to: $RESPONSE_FILE
+- Label conclusions PROVEN / LIKELY / UNPROVEN / REJECTED where applicable.
+- Ground claims in current source, current artifacts, current git history, or cited docs.
+- State a clear verdict and next action.
+EOF
+
+    echo "exchange_id=$exchange_id"
+    echo "prompt_path=$PROMPT_FILE"
+    echo "response_path=$RESPONSE_FILE"
+}
+
+cmd_status() {
+    echo "mailbox_dir=$MAILBOX_DIR"
+    if [ -f "$PROMPT_FILE" ]; then
+        local pid
+        pid="$(prompt_id)"
+        echo "prompt=present"
+        echo "prompt_path=$PROMPT_FILE"
+        echo "prompt_exchange_id=$pid"
+    else
+        echo "prompt=missing"
+    fi
+
+    if [ -f "$RESPONSE_FILE" ]; then
+        local rid
+        rid="$(response_id)"
+        echo "response=present"
+        echo "response_path=$RESPONSE_FILE"
+        echo "response_exchange_id=$rid"
+        if [ -f "$PROMPT_FILE" ]; then
+            if [ "$(prompt_id)" = "$rid" ]; then
+                echo "exchange_id_match=yes"
+            else
+                echo "exchange_id_match=no"
+            fi
+            if [ "$(stat -c %Y "$RESPONSE_FILE")" -ge "$(stat -c %Y "$PROMPT_FILE")" ]; then
+                echo "response_newer_or_equal=yes"
+            else
+                echo "response_newer_or_equal=no"
+            fi
+        fi
+    else
+        echo "response=missing"
+    fi
+}
+
+cmd_read_response() {
+    [ -f "$PROMPT_FILE" ] || die "missing pending Codex prompt: $PROMPT_FILE"
+    [ -f "$RESPONSE_FILE" ] || die "missing pending Claude response: $RESPONSE_FILE"
+
+    local pid rid
+    pid="$(prompt_id)"
+    rid="$(response_id)"
+    [ -n "$pid" ] || die "pending Codex prompt has no Exchange-ID"
+    [ -n "$rid" ] || die "pending Claude response has no Exchange-ID"
+    [ "$pid" = "$rid" ] || die "Exchange-ID mismatch: prompt=$pid response=$rid"
+    [ "$(stat -c %Y "$RESPONSE_FILE")" -ge "$(stat -c %Y "$PROMPT_FILE")" ] \
+        || die "pending Claude response is older than the pending Codex prompt"
+
+    echo "exchange_id=$pid"
+    echo "prompt_path=$PROMPT_FILE"
+    echo "response_path=$RESPONSE_FILE"
+    echo "--- response ---"
+    cat "$RESPONSE_FILE"
+}
+
+cmd_archive() {
+    [ "$#" -eq 1 ] && [ "$1" = "--keep" ] || die "archive requires --keep"
+    pending_exists || die "no pending prompt or response to archive"
+    archive_pending
+}
+
+cmd_clear() {
+    [ "$#" -eq 1 ] && [ "$1" = "--force" ] || die "clear requires --force"
+    rm -f "$PROMPT_FILE" "$RESPONSE_FILE"
+    echo "cleared=$MAILBOX_DIR"
+}
+
+main() {
+    [ "$#" -gt 0 ] || {
+        usage
+        exit 2
+    }
+    local cmd="$1"
+    shift
+    case "$cmd" in
+        new) cmd_new "$@" ;;
+        status) [ "$#" -eq 0 ] || die "status takes no arguments"; cmd_status ;;
+        read-response) [ "$#" -eq 0 ] || die "read-response takes no arguments"; cmd_read_response ;;
+        archive) cmd_archive "$@" ;;
+        clear) cmd_clear "$@" ;;
+        -h|--help) usage ;;
+        *) die "unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"
