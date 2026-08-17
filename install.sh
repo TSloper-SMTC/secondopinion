@@ -14,9 +14,15 @@ if [ -z "${HOME:-}" ]; then
 fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$ROOT/bin/agent-mailbox")"
-# Backups of replaced real dirs/files go OUTSIDE the skills trees, otherwise a
-# backed-up SKILL.md is discovered as a duplicate skill.
-BACKUP_DIR="${AGENT_MAILBOX_BACKUP_DIR:-$ROOT/backups}"
+# Backups of replaced real dirs/files go OUTSIDE the skills trees (a backed-up SKILL.md would be
+# discovered as a duplicate skill) and OUTSIDE the plugin source (a plugin install copies the tree).
+BACKUP_DIR="${AGENT_MAILBOX_BACKUP_DIR:-$HOME/.local/state/agent-mailbox/backups}"
+backup_path() { # basename -> a fresh, non-clobbering path under BACKUP_DIR (same-second safe)
+    local base="$BACKUP_DIR/$1.bak-$(date -u +%Y%m%dT%H%M%SZ)" cand n=1
+    cand="$base"
+    while [ -e "$cand" ] || [ -L "$cand" ]; do cand="$base-$n"; n=$((n+1)); done
+    echo "$cand"
+}
 CHECK=0; PLUGIN=0
 case "$#:${1:-}" in
     0:) ;;
@@ -41,6 +47,55 @@ have_claude() { command -v claude >/dev/null 2>&1 && command -v python3 >/dev/nu
 if [ "$PLUGIN" = 1 ] && ! have_claude; then
     echo "ERROR: --plugin needs the 'claude' CLI and python3 on PATH (nothing was installed)." >&2; exit 1
 fi
+
+# ---- Codex sandbox config: semantic membership of the store in
+# [sandbox_workspace_write].writable_roots (comments and multiline arrays handled) ------------
+store_in_sandbox_roots() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$CODEX_CFG" "$STORE_DIR" <<'PY'
+import re, sys
+path, store = sys.argv[1], sys.argv[2]
+def strip_comment(line):
+    out, q = [], False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            out.append(c)
+            if c == "\\" and i + 1 < len(line): out.append(line[i+1]); i += 2; continue
+            if c == '"': q = False
+        else:
+            if c == "#": break
+            out.append(c)
+            if c == '"': q = True
+        i += 1
+    return "".join(out)
+table, buf, roots = None, None, None
+try:
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        line = strip_comment(raw.rstrip("\n"))
+        if buf is not None:
+            buf += " " + line
+            if "]" in line: roots = buf; buf = None
+            continue
+        m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", line)
+        if m: table = m.group(1).strip(); continue
+        if table == "sandbox_workspace_write":
+            m = re.match(r"^\s*writable_roots\s*=\s*(.*)$", line)
+            if m:
+                rest = m.group(1)
+                if "]" in rest: roots = rest
+                else: buf = rest
+    if roots is None: sys.exit(1)
+    vals = [v.encode().decode("unicode_escape") if "\\" in v else v for v in re.findall(r'"((?:[^"\\]|\\.)*)"', roots)]
+    sys.exit(0 if store in vals else 1)
+except Exception:
+    sys.exit(1)
+PY
+    else  # degraded textual check when python3 is unavailable
+        awk '/^\[sandbox_workspace_write\]/{f=1; next} /^\[/{f=0} f' "$CODEX_CFG" | grep -E '^writable_roots *=' | grep -Fq "\"$STORE_DIR\""
+    fi
+}
 
 # ---- plugin state (JSON, never text grep; tri-state: present / absent / error) --------------
 # Running the claude CLI creates ~/.claude.json etc. on a pristine HOME, so it is consulted only
@@ -129,21 +184,23 @@ if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
 fi
 
 # ---- symlinks -----------------------------------------------------------------------------
-# dest -> source
-LINKS=(
-    "$HOME/.local/bin/agent-mailbox|$ROOT/bin/agent-mailbox"
-    "$HOME/.codex/skills/claude-mailbox|$ROOT/skills/codex/claude-mailbox"
-)
+# Parallel arrays (a delimiter inside HOME must not be able to split a tuple).
+DESTS=("$HOME/.local/bin/agent-mailbox" "$HOME/.codex/skills/claude-mailbox")
+SRCS=("$ROOT/bin/agent-mailbox" "$ROOT/skills/codex/claude-mailbox")
 # The Claude skill is a symlink in skill mode; in plugin mode it comes from the plugin.
 # --check accepts either form.
 if [ "$PLUGIN" = 0 ] && ! { [ "$CHECK" = 1 ] && plugin_current; }; then
-    LINKS+=("$CLAUDE_SKILL_LINK|$ROOT/skills/claude/codex-mailbox")
+    DESTS+=("$CLAUDE_SKILL_LINK"); SRCS+=("$ROOT/skills/claude/codex-mailbox")
 fi
+link_ok() { # dest src -> both resolve and to the same target
+    local d s
+    [ -L "$1" ] && d="$(readlink -f -- "$1")" && s="$(readlink -f -- "$2")" && [ -n "$d" ] && [ "$d" = "$s" ]
+}
 
 status=0
-for pair in "${LINKS[@]}"; do
-    dest="${pair%%|*}"; src="${pair#*|}"
-    if [ -L "$dest" ] && [ "$(readlink -f "$dest")" = "$(readlink -f "$src")" ]; then
+for i in "${!DESTS[@]}"; do
+    dest="${DESTS[$i]}"; src="${SRCS[$i]}"
+    if link_ok "$dest" "$src"; then
         echo "ok        $dest -> $src"
         continue
     fi
@@ -154,12 +211,11 @@ for pair in "${LINKS[@]}"; do
     if [ -L "$dest" ]; then
         rm -f "$dest"
     elif [ -e "$dest" ]; then
-        mkdir -p "$BACKUP_DIR"
-        bak="$BACKUP_DIR/$(basename "$dest").bak-$(date -u +%Y%m%dT%H%M%SZ)"
-        mv -- "$dest" "$bak"
+        mkdir -p "$BACKUP_DIR"; bak="$(backup_path "$(basename "$dest")")"
+        mv -T -- "$dest" "$bak"
         echo "backed-up $dest -> $bak"
     fi
-    ln -s "$src" "$dest"
+    ln -s -- "$src" "$dest"
     echo "linked    $dest -> $src"
 done
 
@@ -169,7 +225,7 @@ if [ "$CHECK" != 1 ]; then
     mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
 fi
 if [ -f "$CODEX_CFG" ] && grep -q '^\[sandbox_workspace_write\]' "$CODEX_CFG"; then
-    if awk '/^\[sandbox_workspace_write\]/{f=1; next} /^\[/{f=0} f' "$CODEX_CFG" | grep -E '^writable_roots *=' | grep -Fq "\"$STORE_DIR\""; then
+    if store_in_sandbox_roots; then
         echo "ok        $CODEX_CFG: [sandbox_workspace_write] writable_roots includes $STORE_DIR"
     else
         echo "ACTION    $CODEX_CFG already has a [sandbox_workspace_write] table; add \"$STORE_DIR\" to its writable_roots array by hand (not edited automatically)." >&2
@@ -188,8 +244,8 @@ if [ "$PLUGIN" = 1 ]; then
     if [ -L "$CLAUDE_SKILL_LINK" ]; then
         rm -f "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (user-level skill would duplicate the plugin skill)"
     elif [ -e "$CLAUDE_SKILL_LINK" ]; then
-        mkdir -p "$BACKUP_DIR"; bak="$BACKUP_DIR/codex-mailbox.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-        mv -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
+        mkdir -p "$BACKUP_DIR"; bak="$(backup_path codex-mailbox)"
+        mv -T -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
     fi
     mp="$(marketplace_path)"
     if [ -n "$mp" ] && [ "$mp" != "$ROOT" ]; then

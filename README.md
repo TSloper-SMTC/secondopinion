@@ -57,15 +57,19 @@ symlinks it.
 `install.sh --check` never modifies HOME (it does not even start the `claude`
 CLI on a pristine HOME) and fails on missing, stale, disabled, wrong-version,
 duplicate (a current plugin plus anything at `~/.claude/skills/codex-mailbox`)
-or uninspectable plugin state, and requires the store inside the
-`[sandbox_workspace_write]` table specifically; otherwise it reports which form
-is installed. A non-check installation is what creates the store and Codex
-sandbox entry. Also creates the store (0700) and adds it to Codex's sandbox as a
-writable root (`[sandbox_workspace_write] writable_roots` in
+or uninspectable plugin state; the store must be a real member of
+`[sandbox_workspace_write].writable_roots` (comments ignored, multiline arrays
+understood); otherwise it reports which form is installed.
+
+A non-check installation creates the store (0700) and adds it to Codex's
+sandbox as a writable root (`[sandbox_workspace_write] writable_roots` in
 `~/.codex/config.toml`) — without that, Codex's workspace-write sandbox sees
 `$HOME` read-only and `agent-mailbox new` fails. Restart sessions to load
-skills. Replaced real directories are backed up under `backups/` (outside the
-skills trees, so a backup can never be discovered as a duplicate skill).
+skills. Replaced real files and directories are moved, without clobbering (same-second
+safe), to `$HOME/.local/state/agent-mailbox/backups/` (override with
+`AGENT_MAILBOX_BACKUP_DIR`) — outside the skills trees, so a backup can never
+be discovered as a duplicate skill, and outside the plugin source, so a plugin
+install never copies it.
 
 ## Flow
 
@@ -86,7 +90,7 @@ agent-mailbox show <ID>                     # read first: verify Repo/Branch/Com
 agent-mailbox claim <ID> --owner claude:...  # claim immediately before substantive work -> claim_token
 # ... do the task in the exact Repo path from the header, per that repo's policy ...
 tmp="$(mktemp)"; chmod 600 "$tmp"           # write the response OUTSIDE the target repository
-agent-mailbox respond <ID> --token <claim_token> --file "$tmp"; rm -f "$tmp"   # write-once
+agent-mailbox respond <ID> --token <claim_token> --file "$tmp" && rm -f "$tmp"   # write-once; a failed respond keeps the file for retry
 ```
 
 ## Guarantees
@@ -144,6 +148,8 @@ so they cannot corrupt `meta` or the JSON output.
 ## Environment
 
 `AGENT_MAILBOX_DIR` (store), `AGENT_MAILBOX_OWNER` (default claim owner),
+`AGENT_MAILBOX_BACKUP_DIR` (installer backups; default
+`$HOME/.local/state/agent-mailbox/backups`),
 `AGENT_MAILBOX_STALE_CLAIM_SECS` (non-negative decimal seconds ≤ 4294967295,
 leading zeros allowed, the same rule as `wait --timeout`; malformed or
 out-of-range values are refused so nothing can wrap in shell arithmetic).

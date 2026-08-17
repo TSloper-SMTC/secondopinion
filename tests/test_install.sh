@@ -115,5 +115,38 @@ assert_eq "$rc" 1 "(store only in an unrelated table must not pass)"
 printf '[sandbox_workspace_write]\nwritable_roots = ["/somewhere/else", "%s"]\n' "$TH2/.agent-mailbox" > "$TH2/.codex/config.toml"
 ( cd "$TH2" && env HOME="$TH2" PATH="$TH2/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "store present in the right table (second array member) must pass"
 
+t "a '|' inside HOME does not corrupt the link table (links land at the right paths)"
+PH="$TMP/home|pipe"; mkdir -p "$PH"
+( cd "$PH" && env HOME="$PH" PATH="$PH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" >/dev/null 2>&1 ) && ok || fail "install failed with '|' in HOME"
+assert_link "$PH/.local/bin/agent-mailbox" "$ROOT/bin/agent-mailbox"
+assert_link "$PH/.claude/skills/codex-mailbox" "$ROOT/skills/claude/codex-mailbox"
+[ ! -L "$TMP/home" ] && ok || fail "a stray symlink was created outside HOME (pipe split the tuple)"
+( cd "$PH" && env HOME="$PH" PATH="$PH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check failed with '|' in HOME"
+
+t "backups never clobber each other, even within the same second"
+BH2="$TMP/home-bak"; mkdir -p "$BH2/.local/bin"; BK="$TMP/bak-collide"
+DSTUB="$TMP/datestub"; mkdir -p "$DSTUB"; printf '#!/bin/bash\nif [ "$1" = "-u" ]; then echo 20260101T000000Z; else exec /bin/date "$@"; fi\n' > "$DSTUB/date"; chmod +x "$DSTUB/date"
+echo FIRST-BACKUP > "$BH2/.local/bin/agent-mailbox"
+( cd "$BH2" && env HOME="$BH2" PATH="$DSTUB:$BH2/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$BK" "$ROOT/install.sh" >/dev/null 2>&1 ) && ok || fail "first install failed"
+rm -f "$BH2/.local/bin/agent-mailbox"; echo SECOND-BACKUP > "$BH2/.local/bin/agent-mailbox"
+( cd "$BH2" && env HOME="$BH2" PATH="$DSTUB:$BH2/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$BK" "$ROOT/install.sh" >/dev/null 2>&1 ) && ok || fail "second install failed"
+grep -rl FIRST-BACKUP "$BK" >/dev/null 2>&1 && ok || fail "FIRST-BACKUP was clobbered by a same-second backup"
+grep -rl SECOND-BACKUP "$BK" >/dev/null 2>&1 && ok || fail "SECOND-BACKUP missing"
+
+t "--check parses the writable_roots array semantically: a commented-out path does not count, a multiline array does"
+TH3="$TMP/home-toml2"; mkdir -p "$TH3/.codex" "$TH3/.local/bin" "$TH3/.claude/skills" "$TH3/.codex/skills"
+ln -sfn "$ROOT/bin/agent-mailbox" "$TH3/.local/bin/agent-mailbox"; ln -sfn "$ROOT/skills/claude/codex-mailbox" "$TH3/.claude/skills/codex-mailbox"; ln -sfn "$ROOT/skills/codex/claude-mailbox" "$TH3/.codex/skills/claude-mailbox"
+printf '[sandbox_workspace_write]\nwritable_roots = ["/not-the-store"] # "%s" only in a comment\n' "$TH3/.agent-mailbox" > "$TH3/.codex/config.toml"
+( cd "$TH3" && env HOME="$TH3" PATH="$TH3/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+assert_eq "$rc" 1 "(path only in a comment must not pass)"
+printf '[sandbox_workspace_write]\nwritable_roots = [\n  "/first",\n  "%s",\n]\n' "$TH3/.agent-mailbox" > "$TH3/.codex/config.toml"
+( cd "$TH3" && env HOME="$TH3" PATH="$TH3/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "multiline array containing the store must pass"
+
+t "default backup directory lives outside the plugin source tree"
+DB="$TMP/home-defbak"; mkdir -p "$DB/.local/bin"; echo OLD > "$DB/.local/bin/agent-mailbox"
+( cd "$DB" && env -u AGENT_MAILBOX_BACKUP_DIR HOME="$DB" PATH="$DB/.local/bin:$PATH" "$ROOT/install.sh" >/dev/null 2>&1 ) && ok || fail "install with default backup dir failed"
+[ -z "$(find "$ROOT/backups" -newer "$ROOT/install.sh" -type f 2>/dev/null)" ] && ok || fail "a backup was written inside $ROOT/backups"
+grep -rl OLD "$DB/.local/state/agent-mailbox/backups" >/dev/null 2>&1 && ok || fail "backup not found under \$HOME/.local/state/agent-mailbox/backups"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
