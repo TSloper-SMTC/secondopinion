@@ -1,23 +1,23 @@
 ---
-name: claude-mailbox
-description: Use when the user asks Codex to ask Claude Code for an independent review, create a Claude mailbox prompt, wait for or read a Claude mailbox response, or process agent-mailbox exchanges.
+name: secondopinion-request
+description: Use when the user asks Codex to ask Claude Code for an independent review, create a Claude mailbox prompt, wait for or read a Claude mailbox response, or process secondopinion exchanges.
 ---
 
-# Claude Mailbox (global agent-mailbox)
+# Claude Mailbox (global secondopinion)
 
-File-based Codex→Claude Code exchanges through the global tool `agent-mailbox`
-(store `~/.agent-mailbox`; one directory per exchange; any number of exchanges
+File-based Codex→Claude Code exchanges through the global tool `secondopinion`
+(store `~/.secondopinion`; one directory per exchange; any number of exchanges
 may be open at once across repositories, worktrees, and sessions).
 
 ## Preconditions
 
-- `command -v agent-mailbox` must succeed. If not, report that the mailbox tool
-  is not installed (`~/tools/agent-mailbox/install.sh`) and stop.
+- `command -v secondopinion` must succeed. If not, report that the mailbox tool
+  is not installed (`~/tools/secondopinion/install.sh`) and stop.
 - If `new` fails with "cannot create mailbox store" / "Read-only file system",
   your sandbox lacks the store as a writable root. Ask the user to run
-  `~/tools/agent-mailbox/install.sh`, follow any printed `ACTION` line (an
+  `~/tools/secondopinion/install.sh`, follow any printed `ACTION` line (an
   existing `[sandbox_workspace_write]` table is not edited automatically),
-  confirm `~/tools/agent-mailbox/install.sh --check` prints `installed=yes`,
+  confirm `~/tools/secondopinion/install.sh --check` prints `installed=yes`,
   and restart Codex. Do not work around it by writing elsewhere.
 - Run `new` from the checkout the review is about. It records that checkout's
   `Repo`, `Git-Common-Dir`, `Branch`, `Commit`, `Dirty-State`, and your
@@ -26,44 +26,44 @@ may be open at once across repositories, worktrees, and sessions).
   the request and for what Claude may do in that repository. If a repository's
   `AGENTS.md` (typically an older branch) still names a repo-local
   `docs/superpowers/agent_mailbox/agent_mailbox.sh`, that file is either a shim
-  to `agent-mailbox` (current `main`) or a stale per-checkout helper; use
-  `agent-mailbox` directly in both cases (owner-authorized, see the
+  to `secondopinion` (current `main`) or a stale per-checkout helper; use
+  `secondopinion` directly in both cases (owner-authorized, see the
   repository's ADR 0006). Never create a per-checkout `pending_codex_prompt.md`.
 
 ## Creating a request
 
-1. `agent-mailbox new --topic "<short-topic>"` → note `exchange_id` and `prompt_path`.
+1. `secondopinion new --topic "<short-topic>"` → note `exchange_id` and `prompt_path`.
 2. Edit `prompt_path`: replace the `Task:` section with the focused request.
    Keep the header lines intact. Include only task-relevant paths; list the
    repository's startup files (whatever its `AGENTS.md`/`CLAUDE.md` require)
    under `Required reading`; keep the response requirements (exact
    `Exchange-ID`, PROVEN/LIKELY/UNPROVEN/REJECTED labels, grounding, verdict +
    next action). Say explicitly if the task is read-only.
-3. `agent-mailbox publish <ID>`. The exchange is invisible to Claude until
+3. `secondopinion publish <ID>`. The exchange is invisible to Claude until
    published; after publish the prompt is frozen (hash-bound). To change it,
    create a new exchange.
-4. Tell the user: run `/codex-mailbox <ID>` (or `/agent-mailbox:codex-mailbox
+4. Tell the user: run `/secondopinion-respond <ID>` (or `/secondopinion:secondopinion-respond
    <ID>` where the tool is installed as a Claude Code plugin) in Claude Code, in
    any checkout of that repository.
 
 ## Waiting for the response (keep working meanwhile)
 
-- Start `agent-mailbox wait <ID> --timeout 600` as a long-running command. With
+- Start `secondopinion wait <ID> --timeout 600` as a long-running command. With
   unified exec it yields after ~10 s with a handle while the process keeps
   running; continue other work and poll the handle between steps.
   Exit codes: `0` answered · `124` timeout (re-issue if still wanted) ·
   `2` archived · `1` error.
-- Or poll `agent-mailbox status <ID>` (instant) between steps.
+- Or poll `secondopinion status <ID>` (instant) between steps.
 - Do not busy-loop; never poll faster than the tool itself does.
 
 ## Reading the response
 
-1. `agent-mailbox read-response <ID>` — validates the `Exchange-ID`, the frozen
+1. `secondopinion read-response <ID>` — validates the `Exchange-ID`, the frozen
    prompt hash, and the response hash. If it exits non-zero, do NOT use the
    response; report the failure.
 2. Summarize Claude's findings and independently classify what is actionable,
    wrong, stale, or unproven.
-3. `agent-mailbox archive <ID>` only after the useful content has been consumed.
+3. `secondopinion archive <ID>` only after the useful content has been consumed.
 
 ## Rules
 

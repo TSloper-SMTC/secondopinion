@@ -1,13 +1,13 @@
-# agent-mailbox
+# secondopinion
 
 Global, concurrent, file-based mailbox for Codex → Claude Code review exchanges.
-One directory per exchange under `~/.agent-mailbox/`, so any number of
+One directory per exchange under `~/.secondopinion/`, so any number of
 exchanges can be open at once across repositories, git worktrees, and
 Codex/Claude sessions. Replaces per-checkout mailboxes (which silently split
 across worktrees).
 
 ```
-~/.agent-mailbox/
+~/.secondopinion/
   exchanges/<Exchange-ID>/prompt.md     Codex writes; frozen (SHA-256) by `publish`
   exchanges/<Exchange-ID>/meta          tool-owned state, authoritative
   exchanges/<Exchange-ID>/claim/        atomic claim (token + owner)
@@ -23,40 +23,40 @@ Two mutually exclusive forms: a successful install leaves exactly one Claude-sid
 form, as `--check` verifies. Skill mode uninstalls the plugin and creates the
 user-level skill symlink only after a successful re-inspection confirms the
 plugin is gone; plugin mode retires (or backs up) anything at
-`~/.claude/skills/codex-mailbox`. Switching fails before changing anything if an
+`~/.claude/skills/secondopinion-respond`. Switching fails before changing anything if an
 existing Claude plugin registry cannot be inspected (`claude plugin list --json`
 failing, malformed, or schema-invalid).
 
 **Skill mode (default)** — symlinks the CLI and both skills into `$HOME`:
 ```bash
-~/tools/agent-mailbox/install.sh        # ~/.local/bin/agent-mailbox, ~/.claude/skills/codex-mailbox, ~/.codex/skills/claude-mailbox
-~/tools/agent-mailbox/install.sh --check
+~/tools/secondopinion/install.sh        # ~/.local/bin/secondopinion, ~/.claude/skills/secondopinion-respond, ~/.codex/skills/secondopinion-request
+~/tools/secondopinion/install.sh --check
 ```
-Claude Code invokes the skill as `/codex-mailbox [ID]`.
+Claude Code invokes the skill as `/secondopinion-respond [ID]`.
 
 **Plugin mode** — the repo is also a Claude Code plugin *and* its own
 marketplace (`.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`;
 a `.codex-plugin/plugin.json` is included for Codex's plugin format):
 ```bash
-~/tools/agent-mailbox/install.sh --plugin
+~/tools/secondopinion/install.sh --plugin
 #  = symlink CLI + Codex skill, then
-#    claude plugin marketplace add ~/tools/agent-mailbox && claude plugin install agent-mailbox@agent-mailbox
-#    (retires a user-level ~/.claude/skills/codex-mailbox symlink so the skill is not listed twice)
+#    claude plugin marketplace add ~/tools/secondopinion && claude plugin install secondopinion@secondopinion
+#    (retires a user-level ~/.claude/skills/secondopinion-respond symlink so the skill is not listed twice)
 ```
-Claude Code then invokes the skill as `/agent-mailbox:codex-mailbox [ID]`.
+Claude Code then invokes the skill as `/secondopinion:secondopinion-respond [ID]`.
 After pulling the repo, re-run `install.sh --plugin` (it repoints a stale
 marketplace, updates or reinstalls to the checkout's version, re-enables a
 disabled plugin, and fails — before touching anything — if `claude`/`python3`
 are missing or the store path cannot be written into TOML); `--check` passes
 only when the marketplace points at this checkout and the plugin is exactly this
 version and enabled. `claude plugin validate --strict .claude-plugin/plugin.json` and the
-marketplace manifest pass. The `agent-mailbox` CLI itself is not part of the
+marketplace manifest pass. The `secondopinion` CLI itself is not part of the
 plugin model (plugins cannot manage PATH), which is why install.sh still
 symlinks it.
 
 `install.sh --check` never modifies HOME (it does not even start the `claude`
 CLI on a pristine HOME) and fails on missing, stale, disabled, wrong-version,
-duplicate (a current plugin plus anything at `~/.claude/skills/codex-mailbox`)
+duplicate (a current plugin plus anything at `~/.claude/skills/secondopinion-respond`)
 or uninspectable plugin state; the store must be a real member of
 `[sandbox_workspace_write].writable_roots` (comments ignored, multiline arrays
 understood); otherwise it reports which form is installed.
@@ -64,10 +64,10 @@ understood); otherwise it reports which form is installed.
 A non-check installation creates the store (0700) and adds it to Codex's
 sandbox as a writable root (`[sandbox_workspace_write] writable_roots` in
 `~/.codex/config.toml`) — without that, Codex's workspace-write sandbox sees
-`$HOME` read-only and `agent-mailbox new` fails. Restart sessions to load
+`$HOME` read-only and `secondopinion new` fails. Restart sessions to load
 skills. Replaced real files and directories are moved, without clobbering (same-second
-safe), to `$HOME/.local/state/agent-mailbox/backups/` (override with
-`AGENT_MAILBOX_BACKUP_DIR`) — outside the skills trees, so a backup can never
+safe), to `$HOME/.local/state/secondopinion/backups/` (override with
+`SECONDOPINION_BACKUP_DIR`) — outside the skills trees, so a backup can never
 be discovered as a duplicate skill, and outside the plugin source, so a plugin
 install never copies it.
 
@@ -75,22 +75,22 @@ install never copies it.
 
 Codex (any checkout):
 ```bash
-agent-mailbox new --topic "h1 review"      # -> exchange_id, prompt_path (records Repo, Git-Common-Dir, Branch, Commit, CODEX_THREAD_ID)
+secondopinion new --topic "h1 review"      # -> exchange_id, prompt_path (records Repo, Git-Common-Dir, Branch, Commit, CODEX_THREAD_ID)
 $EDITOR <prompt_path>                       # fill in Task:
-agent-mailbox publish <ID>                  # freeze; now visible as pending
-agent-mailbox wait <ID> --timeout 600 &     # or poll `status <ID>`; exit 0 answered / 124 timeout / 2 archived / 1 error
-agent-mailbox read-response <ID>            # validated (ID + prompt hash + response hash)
-agent-mailbox archive <ID>
+secondopinion publish <ID>                  # freeze; now visible as pending
+secondopinion wait <ID> --timeout 600 &     # or poll `status <ID>`; exit 0 answered / 124 timeout / 2 archived / 1 error
+secondopinion read-response <ID>            # validated (ID + prompt hash + response hash)
+secondopinion archive <ID>
 ```
 
-Claude Code (`/codex-mailbox [ID]` in skill mode, or `/agent-mailbox:codex-mailbox [ID]` in plugin mode, in any checkout of that repo):
+Claude Code (`/secondopinion-respond [ID]` in skill mode, or `/secondopinion:secondopinion-respond [ID]` in plugin mode, in any checkout of that repo):
 ```bash
-agent-mailbox list --pending --here         # exchanges for this repo (matched by git common dir → all worktrees)
-agent-mailbox show <ID>                     # read first: verify Repo/Branch/Commit, read that repo's AGENTS.md/CLAUDE.md
-agent-mailbox claim <ID> --owner claude:...  # claim immediately before substantive work -> claim_token
+secondopinion list --pending --here         # exchanges for this repo (matched by git common dir → all worktrees)
+secondopinion show <ID>                     # read first: verify Repo/Branch/Commit, read that repo's AGENTS.md/CLAUDE.md
+secondopinion claim <ID> --owner claude:...  # claim immediately before substantive work -> claim_token
 # ... do the task in the exact Repo path from the header, per that repo's policy ...
 tmp="$(mktemp)"; chmod 600 "$tmp"           # write the response OUTSIDE the target repository
-agent-mailbox respond <ID> --token <claim_token> --file "$tmp" && rm -f "$tmp"   # write-once; a failed respond keeps the file for retry
+secondopinion respond <ID> --token <claim_token> --file "$tmp" && rm -f "$tmp"   # write-once; a failed respond keeps the file for retry
 ```
 
 ## Guarantees
@@ -118,7 +118,7 @@ agent-mailbox respond <ID> --token <claim_token> --file "$tmp" && rm -f "$tmp"  
   on such a prompt is an error, not a no-op.
 - Two responders can't both answer (atomic claim + token; `respond` is
   write-once via `link(2)`); stale claims can be taken over after
-  `AGENT_MAILBOX_STALE_CLAIM_SECS` (default 1800) with `--takeover`.
+  `SECONDOPINION_STALE_CLAIM_SECS` (default 1800) with `--takeover`.
 - `read-response`/`wait` succeed only when Exchange-ID, prompt hash, and
   response hash all validate — never by mtime.
 - Strict ID grammar (no path traversal). `list` does not follow symlinked
@@ -147,10 +147,10 @@ so they cannot corrupt `meta` or the JSON output.
 
 ## Environment
 
-`AGENT_MAILBOX_DIR` (store), `AGENT_MAILBOX_OWNER` (default claim owner),
-`AGENT_MAILBOX_BACKUP_DIR` (installer backups; default
-`$HOME/.local/state/agent-mailbox/backups`),
-`AGENT_MAILBOX_STALE_CLAIM_SECS` (non-negative decimal seconds ≤ 4294967295,
+`SECONDOPINION_DIR` (store), `SECONDOPINION_OWNER` (default claim owner),
+`SECONDOPINION_BACKUP_DIR` (installer backups; default
+`$HOME/.local/state/secondopinion/backups`),
+`SECONDOPINION_STALE_CLAIM_SECS` (non-negative decimal seconds ≤ 4294967295,
 leading zeros allowed, the same rule as `wait --timeout`; malformed or
 out-of-range values are refused so nothing can wrap in shell arithmetic).
 

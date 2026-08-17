@@ -1,10 +1,10 @@
 #!/bin/bash
-# Behavioural tests for bin/agent-mailbox.
-# Run: tests/test_agent_mailbox.sh   (exit 0 = all pass)
+# Behavioural tests for bin/secondopinion.
+# Run: tests/test_secondopinion.sh   (exit 0 = all pass)
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AM="$HERE/../bin/agent-mailbox"
+AM="$HERE/../bin/secondopinion"
 PASS=0; FAIL=0; CURRENT=""
 
 # --- tiny harness -----------------------------------------------------------
@@ -21,8 +21,8 @@ val() { awk -v k="$1" -F= '$1==k{sub(/^[^=]*=/,""); print; exit}' ; }  # key=val
 
 # --- fixtures ---------------------------------------------------------------
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-export AGENT_MAILBOX_DIR="$TMP/store"
-export AGENT_MAILBOX_STALE_CLAIM_SECS=3600
+export SECONDOPINION_DIR="$TMP/store"
+export SECONDOPINION_STALE_CLAIM_SECS=3600
 unset CODEX_THREAD_ID
 
 mkrepo() { # mkrepo <dir>
@@ -51,13 +51,13 @@ out="$("$AM" list 2>&1)"; rc=$?
 assert_eq "$rc" 0 "(list on missing store)"
 assert_eq "$out" "" "(list output)"
 assert_rc 0 "$AM" list --pending
-assert_nofile "$AGENT_MAILBOX_DIR"   # list must not create the store
+assert_nofile "$SECONDOPINION_DIR"   # list must not create the store
 
 t "new: creates draft with grammar-valid ID, header, meta, private perms"
 ID1="$(new_in "$TMP/repoA-wt" "First Review!")"
 [[ "$ID1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z-first-review$ ]] && ok || fail "bad id '$ID1'"
 D1="$("$AM" path "$ID1")"
-assert_eq "$D1" "$AGENT_MAILBOX_DIR/exchanges/$ID1"
+assert_eq "$D1" "$SECONDOPINION_DIR/exchanges/$ID1"
 assert_file "$D1/prompt.md"
 assert_grep "^Exchange-ID: $ID1\$" "$D1/prompt.md"
 assert_grep "^Requester: Codex\$" "$D1/prompt.md"
@@ -69,7 +69,7 @@ assert_grep "^Dirty-State: clean\$" "$D1/prompt.md"
 assert_grep "^Codex-Thread: (unset)\$" "$D1/prompt.md"
 assert_eq "$("$AM" status "$ID1" | val state)" "draft"
 assert_eq "$("$AM" status "$ID1" | val git_common_dir)" "$COMMON_A"
-assert_eq "$(stat -c %a "$AGENT_MAILBOX_DIR")" "700"
+assert_eq "$(stat -c %a "$SECONDOPINION_DIR")" "700"
 assert_eq "$(stat -c %a "$D1/prompt.md")" "600"
 
 t "new: records CODEX_THREAD_ID and non-git cwd gracefully"
@@ -174,15 +174,15 @@ t "stale claim: takeover refused while fresh, allowed when stale"
 ID4="$(new_in "$TMP/repoB" stale)"; publish_prompt "$ID4" "Task: S"
 "$AM" claim "$ID4" --owner first >/dev/null
 assert_rc 1 "$AM" claim "$ID4" --owner second --takeover
-assert_rc 0 env AGENT_MAILBOX_STALE_CLAIM_SECS=0 "$AM" claim "$ID4" --owner second --takeover
+assert_rc 0 env SECONDOPINION_STALE_CLAIM_SECS=0 "$AM" claim "$ID4" --owner second --takeover
 assert_eq "$("$AM" status "$ID4" | val claimed_by)" "second"
-assert_rc 1 env AGENT_MAILBOX_STALE_CLAIM_SECS=0 "$AM" claim "$ID4" --owner third   # without --takeover still refused
+assert_rc 1 env SECONDOPINION_STALE_CLAIM_SECS=0 "$AM" claim "$ID4" --owner third   # without --takeover still refused
 
 t "archive: only answered (or --force); moves dir; idempotent; ID stays reserved"
 assert_rc 1 "$AM" archive "$ID2"                    # not answered
 assert_rc 0 "$AM" archive "$ID3"
-assert_nofile "$AGENT_MAILBOX_DIR/exchanges/$ID3"
-assert_file "$AGENT_MAILBOX_DIR/archive/$ID3/response.md"
+assert_nofile "$SECONDOPINION_DIR/exchanges/$ID3"
+assert_file "$SECONDOPINION_DIR/archive/$ID3/response.md"
 assert_eq "$("$AM" status "$ID3" | val state)" "archived"
 assert_rc 0 "$AM" archive "$ID3"                    # already archived → ok
 assert_rc 2 "$AM" wait "$ID3" --timeout 1           # archived → 2
@@ -198,7 +198,7 @@ assert_rc 1 "$AM" show "$ID5"
 
 t "store not creatable: one clear error naming the store and the sandbox hint, exit 1"
 RO="$TMP/ro"; mkdir -p "$RO"; chmod 500 "$RO"
-out="$(cd "$TMP" && AGENT_MAILBOX_DIR="$RO/store" "$AM" new --topic blocked 2>&1)"; rc=$?
+out="$(cd "$TMP" && SECONDOPINION_DIR="$RO/store" "$AM" new --topic blocked 2>&1)"; rc=$?
 chmod 700 "$RO"
 assert_eq "$rc" 1 "(rc for uncreatable store)"
 assert_eq "$(echo "$out" | grep -c 'cannot create directory')" "0"        # no raw mkdir spam
@@ -218,7 +218,7 @@ assert_rc 0 "$AM" list; assert_rc 0 "$AM" list --all --json
 
 t "containment: a symlinked exchange dir is never followed (list/status/wait/archive/path)"
 EXT="$TMP/external-exchange"; mkdir -p "$EXT"; printf 'exchange_id=2026-01-01T000000Z-evil\nstate=published\ncreated_epoch=1\nrepo=x\ngit_common_dir=x\ntarget=t\n' > "$EXT/meta"
-ln -s "$EXT" "$AGENT_MAILBOX_DIR/exchanges/2026-01-01T000000Z-evil"
+ln -s "$EXT" "$SECONDOPINION_DIR/exchanges/2026-01-01T000000Z-evil"
 assert_eq "$("$AM" list --all | grep -c evil)" "0"
 assert_rc 1 "$AM" status 2026-01-01T000000Z-evil
 assert_rc 1 "$AM" path 2026-01-01T000000Z-evil
@@ -226,7 +226,7 @@ assert_rc 1 "$AM" wait 2026-01-01T000000Z-evil --timeout 0
 assert_rc 1 "$AM" archive 2026-01-01T000000Z-evil --force
 assert_eq "$(grep -c 'state=published' "$EXT/meta")" "1"          # external meta untouched
 assert_nofile "$EXT/.lock"
-rm -f "$AGENT_MAILBOX_DIR/exchanges/2026-01-01T000000Z-evil"
+rm -f "$SECONDOPINION_DIR/exchanges/2026-01-01T000000Z-evil"
 
 t "containment: symlinked .lock / meta / claim inside a real exchange are refused"
 IDL="$(new_in "$TMP/repoB" lockfile)"; DL="$("$AM" path "$IDL")"
@@ -276,7 +276,7 @@ IDA="$(new_in "$TMP/repoB" half-archive)"; publish_prompt "$IDA" "Task: a"; DA="
 TA="$("$AM" claim "$IDA" --owner o | val claim_token)"; write_response "$IDA" "$TMP/ra.md"; "$AM" respond "$IDA" --token "$TA" --file "$TMP/ra.md" >/dev/null
 sed -i 's/^state=answered$/state=archived/' "$DA/meta"                       # simulate: meta flipped, mv never happened
 assert_rc 0 "$AM" archive "$IDA"
-assert_nofile "$AGENT_MAILBOX_DIR/exchanges/$IDA"; assert_file "$AGENT_MAILBOX_DIR/archive/$IDA/response.md"
+assert_nofile "$SECONDOPINION_DIR/exchanges/$IDA"; assert_file "$SECONDOPINION_DIR/archive/$IDA/response.md"
 
 t "metadata: control characters in owner/topic/target are refused; JSON always valid"
 IDM="$(new_in "$TMP/repoB" meta-inject)"; publish_prompt "$IDM" "Task: m"
@@ -309,11 +309,11 @@ printf 'Exchange-ID: %s\r\nResponder: R\r\n\r\nbody\r\n' "$IDC" > "$TMP/crlf.md"
 assert_rc 0 "$AM" respond "$IDC" --token "$TC" --file "$TMP/crlf.md"
 assert_rc 0 "$AM" read-response "$IDC"
 
-t "env: HOME unset without AGENT_MAILBOX_DIR gives one clear error, not a bash trace"
-out="$(env -u HOME -u AGENT_MAILBOX_DIR "$AM" list 2>&1)"; rc=$?
+t "env: HOME unset without SECONDOPINION_DIR gives one clear error, not a bash trace"
+out="$(env -u HOME -u SECONDOPINION_DIR "$AM" list 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc HOME unset)"
 assert_not_grep "unbound variable" <(echo "$out")
-assert_grep "AGENT_MAILBOX_DIR" <(echo "$out")
+assert_grep "SECONDOPINION_DIR" <(echo "$out")
 
 t "help: usage lists every command"
 for c in new publish list status show path claim respond read-response wait archive; do
@@ -324,24 +324,24 @@ done
 # round-3 review regressions (Codex QA of 1.1.0)
 
 t "new: newline in CODEX_THREAD_ID is rejected before any exchange is reserved"
-before_count="$(ls "$AGENT_MAILBOX_DIR/exchanges" | wc -l)"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
 out="$(cd "$TMP/repoB" && CODEX_THREAD_ID=$'qa-thread\ninjected_key=injected_value' "$AM" new --topic thread-injection 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc newline CODEX_THREAD_ID)"
 assert_grep "CODEX_THREAD_ID" <(echo "$out")
-assert_eq "$(ls "$AGENT_MAILBOX_DIR/exchanges" | wc -l)" "$before_count" "(no exchange reserved on rejection)"
-[ -z "$(ls "$AGENT_MAILBOX_DIR/exchanges" | grep thread-injection)" ] && ok || fail "exchange dir reserved despite rejection"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange reserved on rejection)"
+[ -z "$(ls "$SECONDOPINION_DIR/exchanges" | grep thread-injection)" ] && ok || fail "exchange dir reserved despite rejection"
 
 t "new: control bytes in CODEX_THREAD_ID are rejected"
 out="$(cd "$TMP/repoB" && CODEX_THREAD_ID=$'esc\033[31mred' "$AM" new --topic thread-esc 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc control CODEX_THREAD_ID)"
-[ -z "$(ls "$AGENT_MAILBOX_DIR/exchanges" | grep thread-esc)" ] && ok || fail "exchange dir reserved despite rejection"
+[ -z "$(ls "$SECONDOPINION_DIR/exchanges" | grep thread-esc)" ] && ok || fail "exchange dir reserved despite rejection"
 
 t "new: a repository path containing a newline is rejected"
 NLREPO="$TMP/nl/repo"$'\n'"header-break"; mkdir -p "$TMP/nl"; mkrepo "$NLREPO"
 out="$(cd "$NLREPO" && "$AM" new --topic nl-repo 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc newline repo path)"
 assert_grep "repository" <(echo "$out")
-[ -z "$(ls "$AGENT_MAILBOX_DIR/exchanges" | grep nl-repo)" ] && ok || fail "exchange dir reserved for newline repo path"
+[ -z "$(ls "$SECONDOPINION_DIR/exchanges" | grep nl-repo)" ] && ok || fail "exchange dir reserved for newline repo path"
 
 t "respond: an empty Responder value is rejected and the exchange stays claimed"
 IDR="$(new_in "$TMP/repoB" responder-empty)"; publish_prompt "$IDR" "task"
@@ -525,24 +525,24 @@ echo "$out_ctl" | grep -qi "control" && ok || fail "control-byte error does not 
 # ===========================================================================
 # round-8 review regressions (Codex QA of 1.3.2)
 
-t "env: a non-integer AGENT_MAILBOX_STALE_CLAIM_SECS is rejected with one clear error"
+t "env: a non-integer SECONDOPINION_STALE_CLAIM_SECS is rejected with one clear error"
 IDSC="$(new_in "$TMP/repoB" stale-secs)"; publish_prompt "$IDSC" "task"
 "$AM" claim "$IDSC" --owner o >/dev/null
-out="$(AGENT_MAILBOX_STALE_CLAIM_SECS=abc "$AM" claim "$IDSC" --owner p --takeover 2>&1)"; rc=$?
+out="$(SECONDOPINION_STALE_CLAIM_SECS=abc "$AM" claim "$IDSC" --owner p --takeover 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc bad STALE_CLAIM_SECS)"
-assert_grep "AGENT_MAILBOX_STALE_CLAIM_SECS" <(echo "$out")
+assert_grep "SECONDOPINION_STALE_CLAIM_SECS" <(echo "$out")
 assert_not_grep "integer expression expected" <(echo "$out")
 assert_eq "$("$AM" status "$IDSC" | val state)" "claimed"
 
 # ===========================================================================
 # round-9 review regressions (Codex QA of 1.3.3)
 
-t "env: an out-of-range AGENT_MAILBOX_STALE_CLAIM_SECS (2^64) is refused rather than wrapping to 0 and permitting takeover"
+t "env: an out-of-range SECONDOPINION_STALE_CLAIM_SECS (2^64) is refused rather than wrapping to 0 and permitting takeover"
 IDOV="$(new_in "$TMP/repoB" stale-overflow)"; publish_prompt "$IDOV" "task"
 "$AM" claim "$IDOV" --owner first >/dev/null
-out="$(AGENT_MAILBOX_STALE_CLAIM_SECS=18446744073709551616 "$AM" claim "$IDOV" --owner second --takeover 2>&1)"; rc=$?
+out="$(SECONDOPINION_STALE_CLAIM_SECS=18446744073709551616 "$AM" claim "$IDOV" --owner second --takeover 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc 2^64 STALE_CLAIM_SECS)"
-assert_grep "AGENT_MAILBOX_STALE_CLAIM_SECS" <(echo "$out")
+assert_grep "SECONDOPINION_STALE_CLAIM_SECS" <(echo "$out")
 assert_eq "$("$AM" status "$IDOV" | val claimed_by)" "first"
 
 t "wait: an out-of-range --timeout (2^64) is refused rather than becoming an immediate timeout"
@@ -559,6 +559,49 @@ IDZ="$(new_in "$TMP/repoB" zero-pad)"
 "$AM" wait "$IDZ" --timeout 00000000000 >/dev/null 2>&1; rc=$?
 assert_eq "$rc" 124 "(rc --timeout 00000000000 on a draft)"
 assert_rc 1 "$AM" wait "$IDZ" --timeout 04294967296
+
+# ===========================================================================
+# 2.0.0 rename: compatibility and migration
+
+t "compat: SECONDOPINION_DIR wins; a legacy AGENT_MAILBOX_DIR is honoured with one deprecation warning"
+LEG="$TMP/legacy-store"; NEW="$TMP/new-store"
+out="$(env -u SECONDOPINION_DIR AGENT_MAILBOX_DIR="$LEG" "$AM" list 2>&1 >/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(list via legacy env)"
+assert_grep "AGENT_MAILBOX_DIR" <(echo "$out"); assert_grep "SECONDOPINION_DIR" <(echo "$out")
+IDL="$(env -u SECONDOPINION_DIR AGENT_MAILBOX_DIR="$LEG" "$AM" new --topic legacy-env 2>/dev/null | val exchange_id)"
+[ -d "$LEG/exchanges/$IDL" ] && ok || fail "legacy env var did not select the store"
+out="$(SECONDOPINION_DIR="$NEW" AGENT_MAILBOX_DIR="$LEG" "$AM" new --topic both-set 2>&1)"; rc=$?
+IDB="$(echo "$out" | val exchange_id)"
+[ -d "$NEW/exchanges/$IDB" ] && ok || fail "SECONDOPINION_DIR did not take precedence"
+assert_not_grep "deprecated" <(echo "$out")
+
+t "compat: invoking through an 'agent-mailbox' alias works and prints one deprecation line on stderr"
+ALIAS="$TMP/aliasbin"; mkdir -p "$ALIAS"; ln -sfn "$AM" "$ALIAS/agent-mailbox"
+IDA="$(new_in "$TMP/repoB" alias-topic)"
+out_err="$("$ALIAS/agent-mailbox" status "$IDA" 2>&1 >/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(alias status)"
+assert_eq "$(echo "$out_err" | grep -c "deprecated")" "1"
+assert_eq "$("$ALIAS/agent-mailbox" status "$IDA" 2>/dev/null | val state)" "draft"
+
+t "compat: legacy AGENT_MAILBOX_OWNER and AGENT_MAILBOX_STALE_CLAIM_SECS are honoured with a warning"
+IDO="$(new_in "$TMP/repoB" legacy-owner)"; publish_prompt "$IDO" "task"
+out="$(env -u SECONDOPINION_OWNER AGENT_MAILBOX_OWNER=legacy-owner "$AM" claim "$IDO" 2>&1)"
+assert_eq "$(echo "$out" | val claimed_by)" "legacy-owner"
+assert_grep "AGENT_MAILBOX_OWNER" <(echo "$out")
+out="$(env -u SECONDOPINION_STALE_CLAIM_SECS AGENT_MAILBOX_STALE_CLAIM_SECS=abc "$AM" status "$IDO" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(legacy stale-secs still validated)"
+
+t "compat: with no env and only a legacy ~/.agent-mailbox store, the tool uses it and asks to migrate"
+LH="$TMP/legacy-home"; mkdir -p "$LH/.agent-mailbox/exchanges" "$LH/.agent-mailbox/archive"
+IDLH="$(cd "$TMP/repoB" && env -u SECONDOPINION_DIR -u AGENT_MAILBOX_DIR HOME="$LH" "$AM" new --topic legacy-home 2>/dev/null | val exchange_id)"
+[ -d "$LH/.agent-mailbox/exchanges/$IDLH" ] && ok || fail "legacy store not used"
+[ ! -e "$LH/.secondopinion" ] && ok || fail "tool created a second store next to the legacy one"
+out="$(env -u SECONDOPINION_DIR -u AGENT_MAILBOX_DIR HOME="$LH" "$AM" list 2>&1 >/dev/null)"
+assert_grep "install.sh" <(echo "$out")
+# once ~/.secondopinion exists it is preferred silently
+mkdir -p "$LH/.secondopinion"
+out="$(env -u SECONDOPINION_DIR -u AGENT_MAILBOX_DIR HOME="$LH" "$AM" list 2>&1 >/dev/null)"
+assert_eq "$out" "" "(no warning when the new store exists)"
 
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"

@@ -1,7 +1,7 @@
 #!/bin/bash
-# agent-mailbox — global, concurrent, file-based mailbox for Codex→Claude review exchanges.
+# secondopinion — global, concurrent, file-based mailbox for Codex→Claude review exchanges.
 #
-# Store layout (default ~/.agent-mailbox, override with AGENT_MAILBOX_DIR):
+# Store layout (default ~/.secondopinion, override with SECONDOPINION_DIR):
 #   exchanges/<ID>/prompt.md     requester writes (draft until `publish`)
 #   exchanges/<ID>/meta          tool-owned state (key=value), authoritative
 #   exchanges/<ID>/claim/        atomic claim by the responder (token + owner)
@@ -12,12 +12,38 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.3.6"
-if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
-    echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
+VERSION="2.0.0"
+warn() { echo "WARNING: $*" >&2; }
+
+# ---- 1.x compatibility (the tool was called agent-mailbox until 2.0.0) -----------------------
+# The old command name works as a deprecated alias, the old AGENT_MAILBOX_* variables are
+# honoured when the new SECONDOPINION_* ones are unset, and an un-migrated ~/.agent-mailbox
+# store is used (never duplicated) until install.sh moves it. Each case warns once per run.
+case "$(basename -- "$0")" in
+    agent-mailbox) warn "'agent-mailbox' is a deprecated alias of 'secondopinion'; update your scripts and skills.";;
+esac
+legacy_env() { # NEW OLD
+    if [ -z "${!1:-}" ] && [ -n "${!2:-}" ]; then
+        warn "$2 is deprecated; use $1 (honouring $2 for now)."
+        export "$1=${!2}"
+    fi
+}
+legacy_env SECONDOPINION_DIR AGENT_MAILBOX_DIR
+legacy_env SECONDOPINION_OWNER AGENT_MAILBOX_OWNER
+legacy_env SECONDOPINION_STALE_CLAIM_SECS AGENT_MAILBOX_STALE_CLAIM_SECS
+
+if [ -z "${SECONDOPINION_DIR:-}" ] && [ -z "${HOME:-}" ]; then
+    echo "ERROR: neither SECONDOPINION_DIR nor HOME is set; cannot locate the exchange store." >&2
     exit 1
 fi
-STORE="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
+if [ -n "${SECONDOPINION_DIR:-}" ]; then
+    STORE="$SECONDOPINION_DIR"
+elif [ -d "$HOME/.secondopinion" ] || [ ! -d "$HOME/.agent-mailbox" ]; then
+    STORE="$HOME/.secondopinion"
+else
+    STORE="$HOME/.agent-mailbox"
+    warn "using the legacy store $STORE; run install.sh to migrate it to $HOME/.secondopinion."
+fi
 EXCH="$STORE/exchanges"
 ARCH="$STORE/archive"
 # Seconds values (stale-claim threshold, wait timeout) are decimal, non-negative and bounded
@@ -33,7 +59,7 @@ parse_secs() { # name value -> prints the integer, or an error line on stderr an
     fi
     echo $((10#$v))
 }
-STALE_CLAIM_SECS="$(parse_secs AGENT_MAILBOX_STALE_CLAIM_SECS "${AGENT_MAILBOX_STALE_CLAIM_SECS:-1800}")" || exit 1
+STALE_CLAIM_SECS="$(parse_secs SECONDOPINION_STALE_CLAIM_SECS "${SECONDOPINION_STALE_CLAIM_SECS:-1800}")" || exit 1
 DEFAULT_WAIT_TIMEOUT=600
 POLL_SECS=2
 TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"
@@ -41,8 +67,8 @@ MAX_HEADER_LINES=64
 
 usage() {
     cat <<EOF
-agent-mailbox $VERSION — global file mailbox for Codex→Claude exchanges
-Store: $STORE   (override: AGENT_MAILBOX_DIR)
+secondopinion $VERSION — sealed, verifiable second-opinion exchanges between coding agents (Codex→Claude Code)
+Store: $STORE   (override: SECONDOPINION_DIR)
 
 Requester (Codex) side:
   new --topic TOPIC [--target NAME] [--requester NAME]   create a draft exchange, print its ID
@@ -65,8 +91,8 @@ Both:
   path ID                 print the exchange directory
   help | --help
 
-Environment: AGENT_MAILBOX_DIR, AGENT_MAILBOX_OWNER (default claim owner),
-             AGENT_MAILBOX_STALE_CLAIM_SECS (default 1800; --takeover allowed after this)
+Environment: SECONDOPINION_DIR, SECONDOPINION_OWNER (default claim owner),
+             SECONDOPINION_STALE_CLAIM_SECS (default 1800; --takeover allowed after this)
 EOF
 }
 
@@ -233,7 +259,7 @@ ensure_store() {
         echo "ERROR: cannot create mailbox store $STORE (read-only or no permission)." >&2
         echo "       Under a Codex workspace-write sandbox the store must be a writable root:" >&2
         echo "       ~/.codex/config.toml -> [sandbox_workspace_write] writable_roots = [\"$STORE\"]" >&2
-        echo "       (~/tools/agent-mailbox/install.sh adds it; or set AGENT_MAILBOX_DIR to a writable path)." >&2
+        echo "       (~/tools/secondopinion/install.sh adds it; or set SECONDOPINION_DIR to a writable path)." >&2
         exit 1
     fi
     chmod 700 "$STORE" "$EXCH" "$ARCH" 2>/dev/null || true
@@ -300,7 +326,7 @@ Codex-Thread: $thread
 
 Task:
 <!-- $TASK_PLACEHOLDER_MARK $target.
-     When the prompt is final, run:  agent-mailbox publish $id  -->
+     When the prompt is final, run:  secondopinion publish $id  -->
 
 Required reading:
 - The target repository's AGENTS.md / CLAUDE.md (at Repo above) and the startup files they name.
@@ -312,7 +338,7 @@ Response requirements:
 - Label conclusions PROVEN / LIKELY / UNPROVEN / REJECTED where applicable.
 - Ground claims in current source, current artifacts, current git history, or cited docs.
 - State a clear verdict and next action.
-- Publish with:  agent-mailbox claim $id  then  agent-mailbox respond $id --token <claim_token> --file <response.md>
+- Publish with:  secondopinion claim $id  then  secondopinion respond $id --token <claim_token> --file <response.md>
 EOF
     chmod 600 "$dir/prompt.md"
     lock "$dir"
@@ -324,7 +350,7 @@ EOF
     echo "exchange_dir=$dir"
     echo "prompt_path=$dir/prompt.md"
     echo "state=draft"
-    echo "next=edit prompt.md, then: agent-mailbox publish $id"
+    echo "next=edit prompt.md, then: secondopinion publish $id"
 }
 
 cmd_publish() {
@@ -444,7 +470,7 @@ cmd_list() {
 }
 
 cmd_claim() {
-    local id="" owner="${AGENT_MAILBOX_OWNER:-${USER:-user}@$(hostname)}" takeover=0
+    local id="" owner="${SECONDOPINION_OWNER:-${USER:-user}@$(hostname)}" takeover=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --owner) [ "$#" -ge 2 ] || die "--owner requires a value"; owner="$2"; shift;;
@@ -534,7 +560,7 @@ cmd_respond() {
     chmod 600 "$tmp"
     lock "$dir"
     local state; state="$(meta_get "$dir" state)"
-    [ "$state" = "claimed" ] || { unlock; die "exchange is not claimed (state=$state); run: agent-mailbox claim $id"; }
+    [ "$state" = "claimed" ] || { unlock; die "exchange is not claimed (state=$state); run: secondopinion claim $id"; }
     [ -f "$dir/claim/token" ] && [ ! -L "$dir/claim/token" ] && [ "$(cat "$dir/claim/token")" = "$token" ] || { unlock; die "claim token does not match"; }
     [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "published prompt.md failed hash/header validation; refusing to respond"; }
     if [ -e "$dir/response.md" ] || [ -L "$dir/response.md" ]; then
@@ -589,9 +615,9 @@ cmd_wait() {
         if [ "$state" = "answered" ]; then
             if [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
                 echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
-                echo "next=agent-mailbox read-response $id"; return 0
+                echo "next=secondopinion read-response $id"; return 0
             fi
-            die "exchange answered but response failed validation; run: agent-mailbox status $id"
+            die "exchange answered but response failed validation; run: secondopinion status $id"
         fi
         local now; now="$(epoch)"
         if [ "$now" -ge "$deadline" ]; then echo "exchange_id=$id"; echo "state=$state"; echo "result=timeout"; return 124; fi
@@ -644,7 +670,7 @@ main() {
         read-response) cmd_read_response "$@";;
         wait) cmd_wait "$@";;
         archive) cmd_archive "$@";;
-        version|--version) echo "agent-mailbox $VERSION";;
+        version|--version) echo "secondopinion $VERSION";;
         help|-h|--help) usage;;
         *) die "unknown command: $cmd (try --help)";;
     esac

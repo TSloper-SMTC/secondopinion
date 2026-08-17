@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
-  "name": "agent-mailbox",
-  "version": "1.3.6",
-  "description": "Global file-based mailbox for Codex→Claude Code review exchanges: the codex-mailbox skill answers pending exchanges held in the ~/.agent-mailbox store (requires the agent-mailbox CLI on PATH; see install.sh).",
+  "name": "secondopinion",
+  "version": "2.0.0",
+  "description": "Global file-based mailbox for Codex→Claude Code review exchanges: the secondopinion-respond skill answers pending exchanges held in the ~/.secondopinion store (requires the secondopinion CLI on PATH; see install.sh).",
   "author": { "name": "Tim Sloper", "email": "tim.sloper@outlook.com" },
   "license": "MIT",
   "keywords": ["codex", "claude-code", "review", "mailbox", "multi-agent"],
