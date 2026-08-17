@@ -232,7 +232,7 @@ t "containment: symlinked .lock / meta / claim inside a real exchange are refuse
 IDL="$(new_in "$TMP/repoB" lockfile)"; DL="$("$AM" path "$IDL")"
 ln -sfn "$TMP/outside-lock" "$DL/.lock"          # replace the real lock with a symlink
 assert_rc 1 "$AM" publish "$IDL"; assert_nofile "$TMP/outside-lock"; rm -f "$DL/.lock"
-"$AM" publish "$IDL" >/dev/null
+publish_prompt "$IDL" "task"; assert_eq "$("$AM" status "$IDL" | val state)" "published"
 mv "$DL/meta" "$TMP/meta-moved"; ln -s "$TMP/meta-moved" "$DL/meta"
 assert_rc 1 "$AM" status "$IDL"; assert_rc 1 "$AM" claim "$IDL" --owner o
 rm -f "$DL/meta"; mv "$TMP/meta-moved" "$DL/meta"
@@ -386,6 +386,66 @@ assert_rc 1 "$AM" archive "$IDS" "$IDS2" --force
 assert_rc 1 "$AM" respond "$IDS" "$IDS2" --token t --file /dev/null
 assert_eq "$("$AM" status "$IDS" | val state)" "published"    # neither exchange was touched
 assert_eq "$("$AM" status "$IDS2" | val state)" "published"
+
+# ===========================================================================
+# round-4 review regressions (Codex QA of 1.2.0)
+
+t "respond: an embedded CR (not a CRLF terminator) in the Responder line is rejected"
+IDH="$(new_in "$TMP/repoB" header-bytes)"; publish_prompt "$IDH" "task"
+TH="$("$AM" claim "$IDH" --owner o | val claim_token)"
+printf 'Exchange-ID: %s\nResponder: QA\rRED\n\nbody\n' "$IDH" > "$TMP/resp-cr.md"
+assert_rc 1 "$AM" respond "$IDH" --token "$TH" --file "$TMP/resp-cr.md"
+assert_eq "$("$AM" status "$IDH" | val state)" "claimed"
+
+t "respond: a NUL byte in a header line is rejected"
+printf 'Exchange-ID: %s\nResponder: QA\0RED\n\nbody\n' "$IDH" > "$TMP/resp-nul.md"
+assert_rc 1 "$AM" respond "$IDH" --token "$TH" --file "$TMP/resp-nul.md"
+assert_eq "$("$AM" status "$IDH" | val state)" "claimed"
+
+t "respond: an embedded CR in the Exchange-ID line is rejected (CR-stripping must not make it match)"
+printf 'Exchange-ID: \r%s\nResponder: R\n\nbody\n' "$IDH" > "$TMP/resp-cr1.md"
+assert_rc 1 "$AM" respond "$IDH" --token "$TH" --file "$TMP/resp-cr1.md"
+assert_eq "$("$AM" status "$IDH" | val state)" "claimed"
+
+t "respond: control bytes in the body (after the header block) are the responder's business and are accepted"
+printf 'Exchange-ID: %s\nResponder: R\n\nbody with \001 control\n' "$IDH" > "$TMP/resp-bodyctl.md"
+IDH2="$(new_in "$TMP/repoB" body-bytes)"; publish_prompt "$IDH2" "task"
+TH2="$("$AM" claim "$IDH2" --owner o | val claim_token)"
+printf 'Exchange-ID: %s\nResponder: R\n\nbody with \001 control\n' "$IDH2" > "$TMP/resp-bodyctl.md"
+assert_rc 0 "$AM" respond "$IDH2" --token "$TH2" --file "$TMP/resp-bodyctl.md"
+
+t "respond: Responder value keeps its full text (colons) and is trimmed at both ends"
+printf 'Exchange-ID: %s\nResponder:   QA: Team   \n\nbody\n' "$IDH" > "$TMP/resp-colon.md"
+assert_rc 0 "$AM" respond "$IDH" --token "$TH" --file "$TMP/resp-colon.md"
+assert_eq "$("$AM" status "$IDH" | val responder)" "QA: Team"
+
+t "publish: an embedded CR in a header line is rejected while CRLF line endings remain valid"
+IDPC="$(new_in "$TMP/repoB" prompt-cr)"; DPC="$("$AM" path "$IDPC")"
+sed -i '/^<!-- Replace this section/,/-->$/d' "$DPC/prompt.md"; printf 'task\n' >> "$DPC/prompt.md"
+sed -i '2s/^Requester: Codex$/Requester: Co\rdex/' "$DPC/prompt.md"
+assert_rc 1 "$AM" publish "$IDPC"
+assert_eq "$("$AM" status "$IDPC" | val state)" "draft"
+
+t "status/list: a legacy exchange whose header holds control bytes reports prompt_ok=no and is hidden from --pending"
+IDLG="$(new_in "$TMP/repoB" legacy-bytes)"; DLG="$("$AM" path "$IDLG")"
+sed -i '/^<!-- Replace this section/,/-->$/d' "$DLG/prompt.md"; printf 'task\n' >> "$DLG/prompt.md"
+sed -i '2s/^Requester: Codex$/Requester: Co\rdex/' "$DLG/prompt.md"
+sed -i 's/^state=draft$/state=published/' "$DLG/meta"     # simulate a store written by an older version
+printf 'prompt_sha256=%s\n' "$(sha256sum "$DLG/prompt.md" | cut -d' ' -f1)" >> "$DLG/meta"
+assert_eq "$("$AM" status "$IDLG" | val prompt_ok)" "no"
+[ -z "$("$AM" list --pending | grep "$IDLG")" ] && ok || fail "legacy control-byte exchange listed as pending"
+
+t "publish: a legitimate task containing the placeholder phrase mid-line still publishes"
+IDPP="$(new_in "$TMP/repoB" phrase)"; DPP="$("$AM" path "$IDPP")"
+sed -i '/^<!-- Replace this section/,/-->$/d' "$DPP/prompt.md"
+printf 'Please Replace this section with the focused request for the reviewer, then send.\n' >> "$DPP/prompt.md"
+assert_rc 0 "$AM" publish "$IDPP"
+
+t "wait: --timeout with a leading zero is parsed as decimal (no octal error)"
+IDW="$(new_in "$TMP/repoB" timeout-zero)"
+"$AM" wait "$IDW" --timeout 08 >/dev/null 2>"$TMP/wait-err"; rc=$?    # draft: times out after 8 s
+assert_eq "$rc" 124 "(rc --timeout 08)"
+assert_not_grep "value too great" "$TMP/wait-err"
 
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"

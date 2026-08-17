@@ -13,6 +13,7 @@ assert_eq() { [ "$1" = "$2" ] && ok || fail "expected '$2' got '$1'"; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME"
+unset AGENT_MAILBOX_DIR   # install.sh honours the override; these assertions target the default $HOME store
 export PATH="$HOME/.local/bin:$PATH"
 export AGENT_MAILBOX_BACKUP_DIR="$TMP/backups"
 

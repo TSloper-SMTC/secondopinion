@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
     echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
     exit 1
@@ -109,6 +109,17 @@ safe_value() { # name value
     return 0
 }
 trim() { printf '%s' "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//'; }
+# Header block of prompt.md / response.md = the lines before the first blank line
+# (at most 20). It may use CRLF line endings, and TAB is allowed, but no other
+# control byte may appear: an embedded CR, NUL or ESC would be silently dropped or
+# hidden by shell extraction (tr/command substitution) while remaining in the
+# hash-approved file. Checked at byte level in the C locale so UTF-8 text passes.
+header_bytes_ok() { # file -> 0 clean, 1 control bytes present (or unreadable)
+    local rc
+    head -n 20 -- "$1" 2>/dev/null | LC_ALL=C sed -e 's/\r$//' -e '/^$/q' -e 's/\t//g' | LC_ALL=C grep -aq '[[:cntrl:]]'
+    rc=$?
+    [ "$rc" -eq 1 ]
+}
 # Exactly one positional argument (the exchange ID) is accepted; a second one is an
 # error rather than silently replacing the first.
 positional() { # varname value
@@ -153,7 +164,8 @@ prompt_ok() { # dir -> yes|no|n/a
     state="$(meta_get "$dir" state)"
     case "$state" in draft|"") echo "n/a"; return;; esac
     want="$(meta_get "$dir" prompt_sha256)"
-    if regular "$dir/prompt.md" && [ -n "$want" ] && [ "$(sha "$dir/prompt.md")" = "$want" ]; then echo yes; else echo no; fi
+    if regular "$dir/prompt.md" && [ -n "$want" ] && [ "$(sha "$dir/prompt.md")" = "$want" ] \
+       && header_bytes_ok "$dir/prompt.md"; then echo yes; else echo no; fi
 }
 response_ok() { # dir -> yes|no|n/a
     local dir="$1" state want id
@@ -161,6 +173,7 @@ response_ok() { # dir -> yes|no|n/a
     case "$state" in answered|archived) ;; *) echo "n/a"; return;; esac
     want="$(meta_get "$dir" response_sha256)"; id="$(meta_get "$dir" exchange_id)"
     if regular "$dir/response.md" && [ -n "$want" ] && [ "$(sha "$dir/response.md")" = "$want" ] \
+       && header_bytes_ok "$dir/response.md" \
        && [ "$(head -n1 "$dir/response.md" | tr -d '\r')" = "Exchange-ID: $id" ]; then echo yes; else echo no; fi
 }
 
@@ -293,8 +306,9 @@ cmd_publish() {
         *) unlock; die "cannot publish from state '$state'";;
     esac
     regular "$dir/prompt.md" || { unlock; die "prompt.md missing or not a regular file"; }
+    header_bytes_ok "$dir/prompt.md" || { unlock; die "prompt.md header contains control bytes (embedded CR, NUL, ESC...); only CRLF line endings and TAB are allowed"; }
     [ "$(head -n1 "$dir/prompt.md" | tr -d '\r')" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
-    grep -q "$TASK_PLACEHOLDER_MARK" "$dir/prompt.md" && { unlock; die "prompt.md still contains the Task placeholder; edit the Task section before publish"; }
+    grep -q "^<!-- $TASK_PLACEHOLDER_MARK " "$dir/prompt.md" && { unlock; die "prompt.md still contains the Task placeholder; edit the Task section before publish"; }
     local h; h="$(sha "$dir/prompt.md")"
     chmod 400 "$dir/prompt.md"
     meta_set "$dir" state published prompt_sha256 "$h" published_utc "$(now_utc)"
@@ -445,13 +459,14 @@ cmd_claim() {
 # Validate a candidate response file (already snapshotted): first line, Responder header.
 # The Responder value is extracted once, trimmed, and must be nonempty and free of
 # newlines/control bytes because it is stored in meta and echoed in JSON.
-responder_of() { head -n5 "$1" | tr -d '\r' | awk -F': ' '/^Responder: /{print $2; exit}' | sed -E 's/[[:space:]]+$//'; }
+responder_of() { head -n5 "$1" | tr -d '\r' | sed -nE '/^Responder: /{s/^Responder: //; s/^[[:space:]]+//; s/[[:space:]]+$//; p; q}'; }
 validate_response_file() { # file id
+    header_bytes_ok "$1" || die "response header contains control bytes (embedded CR, NUL, ESC...); only CRLF line endings and TAB are allowed"
     [ "$(head -n1 "$1" | tr -d '\r')" = "Exchange-ID: $2" ] || die "response must start with 'Exchange-ID: $2'"
     head -n5 "$1" | tr -d '\r' | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header"
     local who; who="$(responder_of "$1")"
     safe_value "Responder" "$who"
-    [ -n "$(trim "$who")" ] || die "response 'Responder:' value must not be empty"
+    [ -n "$who" ] || die "response 'Responder:' value must not be empty"
     return 0
 }
 finalize_response() { # dir  (caller holds lock; response.md exists and validated)
@@ -529,6 +544,7 @@ cmd_wait() {
     done
     [ -n "$id" ] || die "usage: wait ID [--timeout S]"
     [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be an integer number of seconds"
+    timeout=$((10#$timeout))
     require_id "$id"
     local deadline=$(( $(epoch) + timeout )) dir state
     while :; do

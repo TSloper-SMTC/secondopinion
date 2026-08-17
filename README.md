@@ -66,8 +66,12 @@ agent-mailbox respond <ID> --token <claim_token> --file "$tmp"; rm -f "$tmp"   #
   options, the derived repository path/branch/commit and `CODEX_THREAD_ID` must
   be free of newlines and control characters (nothing can inject header or
   `meta` lines). A response's `Responder:` value must be nonempty and control-free.
-- Every command takes exactly one exchange ID; a second positional argument is an
-  error rather than silently replacing the first.
+- Every command that addresses an exchange accepts exactly one exchange ID; a
+  second positional argument is an error rather than silently replacing the first.
+- Prompt and response headers (the lines before the first blank line) may use CRLF
+  line endings and TAB, but no other control byte: an embedded CR, NUL or ESC is
+  refused by `publish`/`respond` and makes `status` report `prompt_ok`/
+  `response_ok=no` (checked at byte level; UTF-8 text is fine).
 - Two responders can't both answer (atomic claim + token; `respond` is
   write-once via `link(2)`); stale claims can be taken over after
   `AGENT_MAILBOX_STALE_CLAIM_SECS` (default 1800) with `--takeover`.
@@ -79,9 +83,12 @@ agent-mailbox respond <ID> --token <claim_token> --file "$tmp"; rm -f "$tmp"   #
   or `response.md`; `umask 077` (store `0700`, files `0600`, published prompt
   `0400`); `wait` always has a finite timeout.
 - Interrupted operations are retry-safe: an orphan `claim/` does not block a
-  fresh claim, a linked-but-unfinalized `response.md` rolls forward on the next
-  `respond`, and an interrupted `archive` completes (or restores state) on
-  retry. `respond` snapshots the candidate file before validating it, so a
+  fresh claim, a valid linked-but-unfinalized `response.md` rolls forward on the
+  next `respond` (an invalid one is refused for manual inspection: while the
+  exchange is still `claimed` and `meta` holds no `response_sha256`, inspect
+  `<exchange_dir>/response.md`, remove it if it is not the intended response,
+  then re-run `respond`), and an interrupted `archive` completes (or restores
+  state) on retry. `respond` snapshots the candidate file before validating it, so a
   file swapped underneath cannot change what is published.
 
 ## Threat model
