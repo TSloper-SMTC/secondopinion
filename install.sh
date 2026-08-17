@@ -13,7 +13,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # backed-up SKILL.md is discovered as a duplicate skill.
 BACKUP_DIR="${AGENT_MAILBOX_BACKUP_DIR:-$ROOT/backups}"
 CHECK=0
-[ "${1:-}" = "--check" ] && CHECK=1
+case "$#:${1:-}" in
+    0:) ;;
+    1:--check) CHECK=1;;
+    1:-h|1:--help) sed -n '2,4p' "$0"; exit 0;;
+    *) echo "usage: install.sh [--check]   (unknown or surplus argument: '$*')" >&2; exit 1;;
+esac
 
 # dest -> source
 LINKS=(

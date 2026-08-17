@@ -76,5 +76,13 @@ assert_eq "$rc" 1
 echo "$out" | grep -q "unbound variable" && fail "bash trace leaked: $out" || ok
 echo "$out" | grep -q "HOME" && ok || fail "error does not mention HOME: $out"
 
+t "unknown or surplus arguments are rejected before anything is installed"
+FRESH="$TMP/home-args"; mkdir -p "$FRESH"
+assert_rc 1 env HOME="$FRESH" "$ROOT/install.sh" --checkk
+[ ! -e "$FRESH/.local/bin/agent-mailbox" ] && [ ! -e "$FRESH/.codex/config.toml" ] && ok || fail "install.sh --checkk installed something"
+assert_rc 1 env HOME="$FRESH" "$ROOT/install.sh" --check extra
+assert_rc 1 env HOME="$FRESH" "$ROOT/install.sh" extra
+[ ! -e "$FRESH/.local/bin/agent-mailbox" ] && ok || fail "install.sh with surplus argument installed something"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

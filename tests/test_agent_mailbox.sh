@@ -448,5 +448,53 @@ assert_eq "$rc" 124 "(rc --timeout 08)"
 assert_not_grep "value too great" "$TMP/wait-err"
 
 # ===========================================================================
+# round-5 review regressions (Codex QA of 1.2.1)
+
+t "respond: the header block is validated through the first blank line, not a fixed 20 lines"
+IDX="$(new_in "$TMP/repoB" header-21)"; publish_prompt "$IDX" "task"
+TX="$("$AM" claim "$IDX" --owner o | val claim_token)"
+{ printf 'Exchange-ID: %s\nResponder: R\n' "$IDX"; for N in $(seq 3 20); do printf 'X-%02d: clean\n' "$N"; done; printf 'X-21: bad\033RED\n\nbody\n'; } > "$TMP/resp-21.md"
+assert_rc 1 "$AM" respond "$IDX" --token "$TX" --file "$TMP/resp-21.md"
+assert_eq "$("$AM" status "$IDX" | val state)" "claimed"
+
+t "respond: a Responder line after the first blank line (in the body) does not count"
+printf 'Exchange-ID: %s\n\nResponder: Body Only\n' "$IDX" > "$TMP/resp-bodyresp.md"
+assert_rc 1 "$AM" respond "$IDX" --token "$TX" --file "$TMP/resp-bodyresp.md"
+assert_eq "$("$AM" status "$IDX" | val state)" "claimed"
+
+t "respond: an oversized header block is rejected rather than silently truncated"
+{ printf 'Exchange-ID: %s\nResponder: R\n' "$IDX"; for N in $(seq 3 80); do printf 'X-%02d: clean\n' "$N"; done; printf '\nbody\n'; } > "$TMP/resp-huge.md"
+assert_rc 1 "$AM" respond "$IDX" --token "$TX" --file "$TMP/resp-huge.md"
+assert_eq "$("$AM" status "$IDX" | val state)" "claimed"
+
+t "respond: a Responder line on header line 6 (inside the header block) is accepted"
+printf 'Exchange-ID: %s\nX-2: a\nX-3: b\nX-4: c\nX-5: d\nResponder: Late Header\n\nbody\n' "$IDX" > "$TMP/resp-line6.md"
+assert_rc 0 "$AM" respond "$IDX" --token "$TX" --file "$TMP/resp-line6.md"
+assert_eq "$("$AM" status "$IDX" | val responder)" "Late Header"
+
+t "publish: a control byte on header line 21 is rejected"
+IDQ="$(new_in "$TMP/repoB" prompt-21)"; DQ="$("$AM" path "$IDQ")"
+{ printf 'Exchange-ID: %s\nRequester: Codex\n' "$IDQ"; for N in $(seq 3 20); do printf 'X-%02d: clean\n' "$N"; done; printf 'X-21: bad\033RED\n\nTask:\nreal task\n'; } > "$DQ/prompt.md"
+assert_rc 1 "$AM" publish "$IDQ"
+assert_eq "$("$AM" status "$IDQ" | val state)" "draft"
+
+t "publish: repeating publish on a tampered published prompt reports an integrity failure instead of exit 0"
+IDT="$(new_in "$TMP/repoB" republish-tamper)"; publish_prompt "$IDT" "task"; DT="$("$AM" path "$IDT")"
+chmod u+w "$DT/prompt.md"; printf '\ntamper\n' >> "$DT/prompt.md"
+assert_rc 1 "$AM" publish "$IDT"
+assert_eq "$("$AM" status "$IDT" | val prompt_ok)" "no"
+
+t "publish: an indented untouched Task placeholder is still refused"
+IDI="$(new_in "$TMP/repoB" indented-placeholder)"; DI="$("$AM" path "$IDI")"
+sed -i 's/^<!-- Replace this section/    <!-- Replace this section/' "$DI/prompt.md"
+assert_rc 1 "$AM" publish "$IDI"
+assert_eq "$("$AM" status "$IDI" | val state)" "draft"
+
+t "claim: a published prompt that fails hash/header validation is refused with an accurate message"
+out="$("$AM" claim "$IDT" --owner o 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc claim tampered)"
+assert_grep "validation" <(echo "$out")
+
+# ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

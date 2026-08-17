@@ -68,10 +68,13 @@ agent-mailbox respond <ID> --token <claim_token> --file "$tmp"; rm -f "$tmp"   #
   `meta` lines). A response's `Responder:` value must be nonempty and control-free.
 - Every command that addresses an exchange accepts exactly one exchange ID; a
   second positional argument is an error rather than silently replacing the first.
-- Prompt and response headers (the lines before the first blank line) may use CRLF
-  line endings and TAB, but no other control byte: an embedded CR, NUL or ESC is
-  refused by `publish`/`respond` and makes `status` report `prompt_ok`/
-  `response_ok=no` (checked at byte level; UTF-8 text is fine).
+- Prompt and response headers end at the first blank line (or EOF); every line in
+  that block is byte-validated and header values (`Exchange-ID:`, `Responder:`) are
+  taken only from it. CRLF line endings and TAB are allowed; any other control byte
+  (embedded CR, NUL, ESC...) or a block longer than 64 lines is refused by
+  `publish`/`respond` and makes `status` report `prompt_ok`/`response_ok=no`
+  (byte-level check in the C locale; UTF-8 text is fine). Re-running `publish` on
+  a published prompt that no longer validates is an error, not a no-op.
 - Two responders can't both answer (atomic claim + token; `respond` is
   write-once via `link(2)`); stale claims can be taken over after
   `AGENT_MAILBOX_STALE_CLAIM_SECS` (default 1800) with `--takeover`.

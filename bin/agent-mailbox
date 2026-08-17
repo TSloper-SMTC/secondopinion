@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
     echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
     exit 1
@@ -24,6 +24,7 @@ STALE_CLAIM_SECS="${AGENT_MAILBOX_STALE_CLAIM_SECS:-1800}"
 DEFAULT_WAIT_TIMEOUT=600
 POLL_SECS=2
 TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"
+MAX_HEADER_LINES=64
 
 usage() {
     cat <<EOF
@@ -43,7 +44,8 @@ Responder (Claude) side:
   show ID                 print prompt.md
   claim ID [--owner NAME] [--takeover]   atomically claim a published exchange, print claim_token
   respond ID --token TOKEN --file FILE   publish response (write-once); FILE must start
-                          with 'Exchange-ID: ID' and contain a 'Responder:' line
+                          with 'Exchange-ID: ID' and contain a nonempty 'Responder:' line in
+                          its header block (the lines before the first blank line)
 
 Both:
   status ID [--json]      tool-owned state plus prompt_ok / response_ok validation
@@ -110,16 +112,25 @@ safe_value() { # name value
 }
 trim() { printf '%s' "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//'; }
 # Header block of prompt.md / response.md = the lines before the first blank line
-# (at most 20). It may use CRLF line endings, and TAB is allowed, but no other
-# control byte may appear: an embedded CR, NUL or ESC would be silently dropped or
-# hidden by shell extraction (tr/command substitution) while remaining in the
-# hash-approved file. Checked at byte level in the C locale so UTF-8 text passes.
-header_bytes_ok() { # file -> 0 clean, 1 control bytes present (or unreadable)
-    local rc
-    head -n 20 -- "$1" 2>/dev/null | LC_ALL=C sed -e 's/\r$//' -e '/^$/q' -e 's/\t//g' | LC_ALL=C grep -aq '[[:cntrl:]]'
-    rc=$?
-    [ "$rc" -eq 1 ]
+# (or the whole file if it has none), at most MAX_HEADER_LINES. Every header value is
+# taken from this block only, so a `Responder:` line in the body does not count and a
+# line beyond the first blank line is never validated by mistake. The block may use
+# CRLF line endings, and TAB is allowed, but no other control byte may appear: an
+# embedded CR, NUL or ESC would be silently dropped or hidden by shell extraction
+# (tr/command substitution) while remaining in the hash-approved file. Bytes are
+# checked in the C locale BEFORE any command substitution, so NUL is caught and UTF-8
+# text passes. An oversized (or unterminated beyond the bound) header is rejected,
+# never silently truncated.
+header_block() { # file -> CR-stripped header lines through the first blank line (bounded)
+    LC_ALL=C sed -e 's/\r$//' -e '/^$/q' -- "$1" 2>/dev/null | head -n $((MAX_HEADER_LINES + 2))
 }
+header_ok() { # file -> 0 clean; 1 control bytes present, oversized, or unreadable
+    regular "$1" || return 1
+    [ "$(header_block "$1" | wc -l)" -le $((MAX_HEADER_LINES + 1)) ] || return 1
+    header_block "$1" | LC_ALL=C sed 's/\t//g' | LC_ALL=C grep -aq '[[:cntrl:]]' && return 1
+    return 0
+}
+HEADER_ERROR="header block is invalid: control bytes (embedded CR, NUL, ESC...) or more than $MAX_HEADER_LINES lines before the first blank line; CRLF line endings and TAB are allowed"
 # Exactly one positional argument (the exchange ID) is accepted; a second one is an
 # error rather than silently replacing the first.
 positional() { # varname value
@@ -165,7 +176,7 @@ prompt_ok() { # dir -> yes|no|n/a
     case "$state" in draft|"") echo "n/a"; return;; esac
     want="$(meta_get "$dir" prompt_sha256)"
     if regular "$dir/prompt.md" && [ -n "$want" ] && [ "$(sha "$dir/prompt.md")" = "$want" ] \
-       && header_bytes_ok "$dir/prompt.md"; then echo yes; else echo no; fi
+       && header_ok "$dir/prompt.md"; then echo yes; else echo no; fi
 }
 response_ok() { # dir -> yes|no|n/a
     local dir="$1" state want id
@@ -173,7 +184,7 @@ response_ok() { # dir -> yes|no|n/a
     case "$state" in answered|archived) ;; *) echo "n/a"; return;; esac
     want="$(meta_get "$dir" response_sha256)"; id="$(meta_get "$dir" exchange_id)"
     if regular "$dir/response.md" && [ -n "$want" ] && [ "$(sha "$dir/response.md")" = "$want" ] \
-       && header_bytes_ok "$dir/response.md" \
+       && header_ok "$dir/response.md" \
        && [ "$(head -n1 "$dir/response.md" | tr -d '\r')" = "Exchange-ID: $id" ]; then echo yes; else echo no; fi
 }
 
@@ -301,14 +312,16 @@ cmd_publish() {
     lock "$dir"
     local state; state="$(meta_get "$dir" state)"
     case "$state" in
-        published|claimed|answered) unlock; echo "exchange_id=$1"; echo "state=$state"; echo "prompt_sha256=$(meta_get "$dir" prompt_sha256)"; echo "note=already published"; return 0;;
+        published|claimed|answered)
+            [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "published prompt.md failed hash/header validation (state=$state); create a new exchange"; }
+            unlock; echo "exchange_id=$1"; echo "state=$state"; echo "prompt_sha256=$(meta_get "$dir" prompt_sha256)"; echo "note=already published"; return 0;;
         draft) ;;
         *) unlock; die "cannot publish from state '$state'";;
     esac
     regular "$dir/prompt.md" || { unlock; die "prompt.md missing or not a regular file"; }
-    header_bytes_ok "$dir/prompt.md" || { unlock; die "prompt.md header contains control bytes (embedded CR, NUL, ESC...); only CRLF line endings and TAB are allowed"; }
+    header_ok "$dir/prompt.md" || { unlock; die "prompt.md $HEADER_ERROR"; }
     [ "$(head -n1 "$dir/prompt.md" | tr -d '\r')" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
-    grep -q "^<!-- $TASK_PLACEHOLDER_MARK " "$dir/prompt.md" && { unlock; die "prompt.md still contains the Task placeholder; edit the Task section before publish"; }
+    grep -q "^[[:space:]]*<!-- $TASK_PLACEHOLDER_MARK " "$dir/prompt.md" && { unlock; die "prompt.md still contains the Task placeholder; edit the Task section before publish"; }
     local h; h="$(sha "$dir/prompt.md")"
     chmod 400 "$dir/prompt.md"
     meta_set "$dir" state published prompt_sha256 "$h" published_utc "$(now_utc)"
@@ -443,7 +456,7 @@ cmd_claim() {
         draft) unlock; die "exchange is not published yet";;
         *) unlock; die "cannot claim from state '$state'";;
     esac
-    [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "prompt.md was modified after publish; refusing to claim"; }
+    [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "published prompt.md failed hash/header validation; refusing to claim"; }
     mkdir "$dir/claim" 2>/dev/null || { unlock; die "claim race lost; retry"; }
     local token; token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
     if ! { printf '%s\n' "$token" > "$dir/claim/token" && printf '%s\n' "$owner" > "$dir/claim/owner" \
@@ -459,11 +472,11 @@ cmd_claim() {
 # Validate a candidate response file (already snapshotted): first line, Responder header.
 # The Responder value is extracted once, trimmed, and must be nonempty and free of
 # newlines/control bytes because it is stored in meta and echoed in JSON.
-responder_of() { head -n5 "$1" | tr -d '\r' | sed -nE '/^Responder: /{s/^Responder: //; s/^[[:space:]]+//; s/[[:space:]]+$//; p; q}'; }
+responder_of() { header_block "$1" | sed -nE '/^Responder: /{s/^Responder: //; s/^[[:space:]]+//; s/[[:space:]]+$//; p; q}'; }
 validate_response_file() { # file id
-    header_bytes_ok "$1" || die "response header contains control bytes (embedded CR, NUL, ESC...); only CRLF line endings and TAB are allowed"
+    header_ok "$1" || die "response $HEADER_ERROR"
     [ "$(head -n1 "$1" | tr -d '\r')" = "Exchange-ID: $2" ] || die "response must start with 'Exchange-ID: $2'"
-    head -n5 "$1" | tr -d '\r' | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header"
+    header_block "$1" | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header block (before the first blank line)"
     local who; who="$(responder_of "$1")"
     safe_value "Responder" "$who"
     [ -n "$who" ] || die "response 'Responder:' value must not be empty"
@@ -502,7 +515,7 @@ cmd_respond() {
     local state; state="$(meta_get "$dir" state)"
     [ "$state" = "claimed" ] || { unlock; die "exchange is not claimed (state=$state); run: agent-mailbox claim $id"; }
     [ -f "$dir/claim/token" ] && [ ! -L "$dir/claim/token" ] && [ "$(cat "$dir/claim/token")" = "$token" ] || { unlock; die "claim token does not match"; }
-    [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "prompt.md was modified after publish; refusing to respond"; }
+    [ "$(prompt_ok "$dir")" = "yes" ] || { unlock; die "published prompt.md failed hash/header validation; refusing to respond"; }
     if [ -e "$dir/response.md" ] || [ -L "$dir/response.md" ]; then
         # A response already exists while state=claimed: a previous respond linked it but did
         # not finalize meta (interrupted). Roll forward if it validates; never overwrite it.
