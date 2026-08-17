@@ -496,5 +496,32 @@ assert_eq "$rc" 1 "(rc claim tampered)"
 assert_grep "validation" <(echo "$out")
 
 # ===========================================================================
+# round-6 review regressions (Codex QA of 1.2.2)
+
+t "respond: the 64-record header bound holds when the header runs to EOF (no blank line)"
+IDE="$(new_in "$TMP/repoB" header-eof)"; publish_prompt "$IDE" "task"
+TE="$("$AM" claim "$IDE" --owner o | val claim_token)"
+{ printf 'Exchange-ID: %s\nResponder: EOF64\n' "$IDE"; for N in $(seq 3 64); do printf 'X-%02d: clean\n' "$N"; done; } > "$TMP/resp-eof64.md"     # 64 records, EOF, no blank line
+{ printf 'Exchange-ID: %s\nResponder: EOF65\n' "$IDE"; for N in $(seq 3 65); do printf 'X-%02d: clean\n' "$N"; done; } > "$TMP/resp-eof65.md"     # 65 records at EOF
+{ printf 'Exchange-ID: %s\nResponder: EOF66\n' "$IDE"; for N in $(seq 3 65); do printf 'X-%02d: clean\n' "$N"; done; printf 'X-66: unterminated'; } > "$TMP/resp-eof66.md"   # 66th record without newline
+{ printf 'Exchange-ID: %s\nResponder: B65\n' "$IDE"; for N in $(seq 3 65); do printf 'X-%02d: clean\n' "$N"; done; printf '\nbody\n'; } > "$TMP/resp-blank65.md"   # 65 records then blank
+assert_rc 1 "$AM" respond "$IDE" --token "$TE" --file "$TMP/resp-eof65.md"
+assert_rc 1 "$AM" respond "$IDE" --token "$TE" --file "$TMP/resp-eof66.md"
+assert_rc 1 "$AM" respond "$IDE" --token "$TE" --file "$TMP/resp-blank65.md"
+assert_eq "$("$AM" status "$IDE" | val state)" "claimed"
+assert_rc 0 "$AM" respond "$IDE" --token "$TE" --file "$TMP/resp-eof64.md"
+assert_eq "$("$AM" status "$IDE" | val responder)" "EOF64"
+
+t "respond: header errors name the actual reason (control bytes vs too many lines)"
+IDN="$(new_in "$TMP/repoB" header-reason)"; publish_prompt "$IDN" "task"
+TN="$("$AM" claim "$IDN" --owner o | val claim_token)"
+{ printf 'Exchange-ID: %s\nResponder: R\n' "$IDN"; for N in $(seq 3 65); do printf 'X-%02d: clean\n' "$N"; done; } > "$TMP/resp-lines65.md"
+{ printf 'Exchange-ID: %s\nResponder: R\033x\n\nbody\n' "$IDN"; } > "$TMP/resp-ctl.md"
+out_lines="$("$AM" respond "$IDN" --token "$TN" --file "$TMP/resp-lines65.md" 2>&1)"
+out_ctl="$("$AM" respond "$IDN" --token "$TN" --file "$TMP/resp-ctl.md" 2>&1)"
+echo "$out_lines" | grep -qi "lines" && ok || fail "line-bound error does not mention lines: $out_lines"
+echo "$out_ctl" | grep -qi "control" && ok || fail "control-byte error does not mention control bytes: $out_ctl"
+
+# ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

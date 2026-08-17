@@ -88,11 +88,14 @@ agent-mailbox respond <ID> --token <claim_token> --file "$tmp"; rm -f "$tmp"   #
   second positional argument is an error rather than silently replacing the first.
 - Prompt and response headers end at the first blank line (or EOF); every line in
   that block is byte-validated and header values (`Exchange-ID:`, `Responder:`) are
-  taken only from it. CRLF line endings and TAB are allowed; any other control byte
-  (embedded CR, NUL, ESC...) or a block longer than 64 lines is refused by
-  `publish`/`respond` and makes `status` report `prompt_ok`/`response_ok=no`
-  (byte-level check in the C locale; UTF-8 text is fine). Re-running `publish` on
-  a published prompt that no longer validates is an error, not a no-op.
+  taken only from it. Header records 1–64 are accepted; record 65 is refused
+  whether the block ends with a blank line, EOF, or an unterminated final line.
+  CRLF line endings and TAB are allowed; any other control byte (embedded CR, NUL,
+  ESC...) is refused (byte-level check in the C locale; UTF-8 text is fine). A
+  rejected candidate changes nothing: the exchange stays `draft`/`claimed` (status
+  shows `n/a`) and can be retried; a stored, hash-bound prompt/response that later
+  fails validation reports `prompt_ok`/`response_ok=no`, and re-running `publish`
+  on such a prompt is an error, not a no-op.
 - Two responders can't both answer (atomic claim + token; `respond` is
   write-once via `link(2)`); stale claims can be taken over after
   `AGENT_MAILBOX_STALE_CLAIM_SECS` (default 1800) with `--takeover`.

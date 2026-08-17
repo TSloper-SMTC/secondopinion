@@ -84,5 +84,19 @@ assert_rc 1 env HOME="$FRESH" "$ROOT/install.sh" --check extra
 assert_rc 1 env HOME="$FRESH" "$ROOT/install.sh" extra
 [ ! -e "$FRESH/.local/bin/agent-mailbox" ] && ok || fail "install.sh with surplus argument installed something"
 
+t "a store path containing a double quote or backslash is refused before any mutation (no malformed TOML)"
+QH="$TMP/home-quote"; mkdir -p "$QH"
+assert_rc 1 env HOME="$QH" AGENT_MAILBOX_DIR="$TMP/store\"quoted" "$ROOT/install.sh"
+[ ! -e "$QH/.codex/config.toml" ] && [ ! -e "$QH/.local/bin/agent-mailbox" ] && ok || fail "install mutated HOME despite unsafe store path"
+assert_rc 1 env HOME="$QH" AGENT_MAILBOX_DIR="$TMP/store\\back" "$ROOT/install.sh" --check
+assert_rc 1 env HOME="$QH" AGENT_MAILBOX_DIR="$TMP/store\"quoted" "$ROOT/install.sh" --check
+
+t "--check matches the writable_roots entry as a fixed string, not a regex"
+RH="$TMP/home-regex"; mkdir -p "$RH/.codex"
+printf '[sandbox_workspace_write]\nwritable_roots = ["%s"]\n' "$TMP/store-XYZ" > "$RH/.codex/config.toml"
+out="$(env HOME="$RH" AGENT_MAILBOX_DIR="$TMP/store-X.Z" "$ROOT/install.sh" --check 2>&1)"; rc=$?
+assert_eq "$rc" 1
+echo "$out" | grep -q "MISSING.*writable_roots\|ACTION" && ok || fail "regex '.' matched a different store path in --check: $out"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

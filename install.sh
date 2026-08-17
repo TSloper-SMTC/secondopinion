@@ -26,6 +26,13 @@ case "$#:${1:-}" in
 esac
 PLUGIN_ID="agent-mailbox@agent-mailbox"
 CLAUDE_SKILL_LINK="$HOME/.claude/skills/codex-mailbox"
+STORE_DIR="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
+CODEX_CFG="$HOME/.codex/config.toml"
+# The store path is written into TOML as a quoted string: refuse anything that
+# cannot be represented verbatim (quotes, backslashes, control characters).
+case "$STORE_DIR" in
+    *[\"\\]*|*[[:cntrl:]]*) echo "ERROR: store path '$STORE_DIR' contains a quote, backslash or control character; choose another AGENT_MAILBOX_DIR." >&2; exit 1;;
+esac
 
 plugin_installed() { command -v claude >/dev/null 2>&1 && claude plugin list 2>/dev/null | grep -q "^ *❯ *$PLUGIN_ID\b\|$PLUGIN_ID"; }
 marketplace_present() { claude plugin marketplace list 2>/dev/null | grep -q "agent-mailbox"; }
@@ -66,13 +73,11 @@ done
 
 # --- Codex sandbox: the store must be a writable root, or Codex's workspace-write
 # sandbox sees $HOME read-only and `agent-mailbox new` fails ("Read-only file system").
-STORE_DIR="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
-CODEX_CFG="$HOME/.codex/config.toml"
 if [ "$CHECK" != 1 ]; then
     mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
 fi
 if [ -f "$CODEX_CFG" ] && grep -q '^\[sandbox_workspace_write\]' "$CODEX_CFG"; then
-    if grep -q "^writable_roots *=.*\"$STORE_DIR\"" "$CODEX_CFG"; then
+    if grep -E '^writable_roots *=' "$CODEX_CFG" | grep -Fq "\"$STORE_DIR\""; then
         echo "ok        $CODEX_CFG: [sandbox_workspace_write] writable_roots includes $STORE_DIR"
     else
         echo "ACTION    $CODEX_CFG already has a [sandbox_workspace_write] table; add \"$STORE_DIR\" to its writable_roots array by hand (not edited automatically)." >&2

@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
     echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
     exit 1
@@ -124,13 +124,21 @@ trim() { printf '%s' "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//'; }
 header_block() { # file -> CR-stripped header lines through the first blank line (bounded)
     LC_ALL=C sed -e 's/\r$//' -e '/^$/q' -- "$1" 2>/dev/null | head -n $((MAX_HEADER_LINES + 2))
 }
-header_ok() { # file -> 0 clean; 1 control bytes present, oversized, or unreadable
-    regular "$1" || return 1
-    [ "$(header_block "$1" | wc -l)" -le $((MAX_HEADER_LINES + 1)) ] || return 1
-    header_block "$1" | LC_ALL=C sed 's/\t//g' | LC_ALL=C grep -aq '[[:cntrl:]]' && return 1
-    return 0
+header_records() { # file -> number of header records (a terminating blank line is not a record;
+                   #         an unterminated final line is; EOF-safe: grep -c '' counts partial lines)
+    local total last
+    total="$(header_block "$1" | grep -c '')"
+    last="$(header_block "$1" | tail -n1)"
+    if [ "$total" -gt 0 ] && [ -z "$last" ]; then echo $((total - 1)); else echo "$total"; fi
 }
-HEADER_ERROR="header block is invalid: control bytes (embedded CR, NUL, ESC...) or more than $MAX_HEADER_LINES lines before the first blank line; CRLF line endings and TAB are allowed"
+# header_check file -> prints "" (clean) or the reason; callers die with it.
+header_check() {
+    regular "$1" || { echo "file is missing or not a regular file"; return 0; }
+    [ "$(header_records "$1")" -le "$MAX_HEADER_LINES" ] || { echo "header block has more than $MAX_HEADER_LINES lines before the first blank line (records 1-$MAX_HEADER_LINES are accepted; record $((MAX_HEADER_LINES + 1)) is refused whether the block ends with a blank line, EOF or an unterminated line)"; return 0; }
+    header_block "$1" | LC_ALL=C sed 's/\t//g' | LC_ALL=C grep -aq '[[:cntrl:]]' && { echo "header block contains control bytes (embedded CR, NUL, ESC...); CRLF line endings and TAB are allowed"; return 0; }
+    echo ""
+}
+header_ok() { [ -z "$(header_check "$1")" ]; }
 # Exactly one positional argument (the exchange ID) is accepted; a second one is an
 # error rather than silently replacing the first.
 positional() { # varname value
@@ -319,7 +327,7 @@ cmd_publish() {
         *) unlock; die "cannot publish from state '$state'";;
     esac
     regular "$dir/prompt.md" || { unlock; die "prompt.md missing or not a regular file"; }
-    header_ok "$dir/prompt.md" || { unlock; die "prompt.md $HEADER_ERROR"; }
+    local hreason; hreason="$(header_check "$dir/prompt.md")"; [ -z "$hreason" ] || { unlock; die "prompt.md $hreason"; }
     [ "$(head -n1 "$dir/prompt.md" | tr -d '\r')" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
     grep -q "^[[:space:]]*<!-- $TASK_PLACEHOLDER_MARK " "$dir/prompt.md" && { unlock; die "prompt.md still contains the Task placeholder; edit the Task section before publish"; }
     local h; h="$(sha "$dir/prompt.md")"
@@ -474,7 +482,7 @@ cmd_claim() {
 # newlines/control bytes because it is stored in meta and echoed in JSON.
 responder_of() { header_block "$1" | sed -nE '/^Responder: /{s/^Responder: //; s/^[[:space:]]+//; s/[[:space:]]+$//; p; q}'; }
 validate_response_file() { # file id
-    header_ok "$1" || die "response $HEADER_ERROR"
+    local hreason; hreason="$(header_check "$1")"; [ -z "$hreason" ] || die "response $hreason"
     [ "$(head -n1 "$1" | tr -d '\r')" = "Exchange-ID: $2" ] || die "response must start with 'Exchange-ID: $2'"
     header_block "$1" | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header block (before the first blank line)"
     local who; who="$(responder_of "$1")"
