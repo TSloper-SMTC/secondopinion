@@ -69,5 +69,11 @@ t "installed tool runs through the symlink"
 "$ROOT/install.sh" >/dev/null 2>&1
 out="$("$HOME/.local/bin/agent-mailbox" --version)"; [[ "$out" == agent-mailbox* ]] && ok || fail "version via symlink: '$out'"
 
+t "env: HOME unset gives one clear error, not a bash trace"
+out="$(env -u HOME "$ROOT/install.sh" --check 2>&1)"; rc=$?
+assert_eq "$rc" 1
+echo "$out" | grep -q "unbound variable" && fail "bash trace leaked: $out" || ok
+echo "$out" | grep -q "HOME" && ok || fail "error does not mention HOME: $out"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -4,6 +4,10 @@
 #   install.sh --check  report status; exit 0 if fully installed, 1 otherwise
 set -euo pipefail
 
+if [ -z "${HOME:-}" ]; then
+    echo "ERROR: HOME is not set; cannot locate ~/.local/bin, ~/.claude/skills or ~/.codex/skills." >&2
+    exit 1
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Backups of replaced real dirs/files go OUTSIDE the skills trees, otherwise a
 # backed-up SKILL.md is discovered as a duplicate skill.

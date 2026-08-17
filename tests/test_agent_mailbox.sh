@@ -35,8 +35,9 @@ COMMON_A="$(cd "$TMP/repoA" && realpath "$(git rev-parse --git-common-dir)")"
 new_in() { # new_in <dir> <topic> [extra args] -> prints exchange_id
   (cd "$1" && "$AM" new --topic "$2" "${@:3}") | val exchange_id
 }
-publish_prompt() { # publish_prompt <id> <body>
+publish_prompt() { # publish_prompt <id> <body>  (fills the Task section like a real requester)
   local p; p="$("$AM" path "$1")/prompt.md"
+  sed -i '/^<!-- Replace this section/,/-->$/d' "$p"
   printf '\n%s\n' "$2" >> "$p"
   "$AM" publish "$1" >/dev/null
 }
@@ -300,6 +301,7 @@ assert_eq "$("$AM" status "$IDF" | val responder)" "Claude Code"      # trailing
 
 t "CRLF: a prompt/response with CRLF headers still validates"
 IDC="$(new_in "$TMP/repoB" crlf)"; DC="$("$AM" path "$IDC")"
+sed -i '/^<!-- Replace this section/,/-->$/d' "$DC/prompt.md"; printf 'task body\n' >> "$DC/prompt.md"
 sed -i 's/$/\r/' "$DC/prompt.md"
 assert_rc 0 "$AM" publish "$IDC"
 TC="$("$AM" claim "$IDC" --owner o | val claim_token)"
@@ -317,6 +319,73 @@ t "help: usage lists every command"
 for c in new publish list status show path claim respond read-response wait archive; do
   assert_grep "\b$c\b" <("$AM" --help 2>&1)
 done
+
+# ===========================================================================
+# round-3 review regressions (Codex QA of 1.1.0)
+
+t "new: newline in CODEX_THREAD_ID is rejected before any exchange is reserved"
+before_count="$(ls "$AGENT_MAILBOX_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoB" && CODEX_THREAD_ID=$'qa-thread\ninjected_key=injected_value' "$AM" new --topic thread-injection 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc newline CODEX_THREAD_ID)"
+assert_grep "CODEX_THREAD_ID" <(echo "$out")
+assert_eq "$(ls "$AGENT_MAILBOX_DIR/exchanges" | wc -l)" "$before_count" "(no exchange reserved on rejection)"
+[ -z "$(ls "$AGENT_MAILBOX_DIR/exchanges" | grep thread-injection)" ] && ok || fail "exchange dir reserved despite rejection"
+
+t "new: control bytes in CODEX_THREAD_ID are rejected"
+out="$(cd "$TMP/repoB" && CODEX_THREAD_ID=$'esc\033[31mred' "$AM" new --topic thread-esc 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc control CODEX_THREAD_ID)"
+[ -z "$(ls "$AGENT_MAILBOX_DIR/exchanges" | grep thread-esc)" ] && ok || fail "exchange dir reserved despite rejection"
+
+t "new: a repository path containing a newline is rejected"
+NLREPO="$TMP/nl/repo"$'\n'"header-break"; mkdir -p "$TMP/nl"; mkrepo "$NLREPO"
+out="$(cd "$NLREPO" && "$AM" new --topic nl-repo 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc newline repo path)"
+assert_grep "repository" <(echo "$out")
+[ -z "$(ls "$AGENT_MAILBOX_DIR/exchanges" | grep nl-repo)" ] && ok || fail "exchange dir reserved for newline repo path"
+
+t "respond: an empty Responder value is rejected and the exchange stays claimed"
+IDR="$(new_in "$TMP/repoB" responder-empty)"; publish_prompt "$IDR" "task"
+TR="$("$AM" claim "$IDR" --owner o | val claim_token)"
+printf 'Exchange-ID: %s\nResponder:    \n\nbody\n' "$IDR" > "$TMP/resp-empty.md"
+assert_rc 1 "$AM" respond "$IDR" --token "$TR" --file "$TMP/resp-empty.md"
+assert_eq "$("$AM" status "$IDR" | val state)" "claimed"
+assert_nofile "$("$AM" path "$IDR")/response.md"
+
+t "respond: control bytes in the Responder value are rejected; a valid retry then succeeds"
+printf 'Exchange-ID: %s\nResponder: QA\033[31mRED\n\nbody\n' "$IDR" > "$TMP/resp-esc.md"
+assert_rc 1 "$AM" respond "$IDR" --token "$TR" --file "$TMP/resp-esc.md"
+assert_eq "$("$AM" status "$IDR" | val state)" "claimed"
+write_response "$IDR" "$TMP/resp-ok.md" "QA User"
+assert_rc 0 "$AM" respond "$IDR" --token "$TR" --file "$TMP/resp-ok.md"
+assert_eq "$("$AM" status "$IDR" | val responder)" "QA User"
+
+t "respond: roll-forward of an unfinalized response.md applies the same Responder validation"
+IDR2="$(new_in "$TMP/repoB" responder-rollforward)"; publish_prompt "$IDR2" "task"
+TR2="$("$AM" claim "$IDR2" --owner o | val claim_token)"
+printf 'Exchange-ID: %s\nResponder:   \n\nbody\n' "$IDR2" > "$("$AM" path "$IDR2")/response.md"   # interrupted respond left an invalid file
+write_response "$IDR2" "$TMP/resp-ok2.md"
+assert_rc 1 "$AM" respond "$IDR2" --token "$TR2" --file "$TMP/resp-ok2.md"
+assert_eq "$("$AM" status "$IDR2" | val state)" "claimed"
+
+t "publish: refuses a prompt whose Task placeholder is untouched"
+IDP="$(new_in "$TMP/repoB" placeholder)"
+out="$("$AM" publish "$IDP" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc untouched placeholder)"
+assert_grep "placeholder" <(echo "$out")
+assert_eq "$("$AM" status "$IDP" | val state)" "draft"
+publish_prompt "$IDP" "real task"
+assert_eq "$("$AM" status "$IDP" | val state)" "published"
+
+t "surplus positional arguments are rejected instead of silently using the last one"
+IDS="$(new_in "$TMP/repoB" surplus)"; publish_prompt "$IDS" "task"
+IDS2="$(new_in "$TMP/repoB" surplus-two)"; publish_prompt "$IDS2" "task"   # a second VALID id as the surplus argument
+assert_rc 1 "$AM" status "$IDS" "$IDS2"
+assert_rc 1 "$AM" claim "$IDS" "$IDS2" --owner o
+assert_rc 1 "$AM" wait "$IDS" "$IDS2" --timeout 0
+assert_rc 1 "$AM" archive "$IDS" "$IDS2" --force
+assert_rc 1 "$AM" respond "$IDS" "$IDS2" --token t --file /dev/null
+assert_eq "$("$AM" status "$IDS" | val state)" "published"    # neither exchange was touched
+assert_eq "$("$AM" status "$IDS2" | val state)" "published"
 
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"

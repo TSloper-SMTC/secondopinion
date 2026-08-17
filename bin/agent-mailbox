@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
     echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
     exit 1
@@ -23,6 +23,7 @@ ARCH="$STORE/archive"
 STALE_CLAIM_SECS="${AGENT_MAILBOX_STALE_CLAIM_SECS:-1800}"
 DEFAULT_WAIT_TIMEOUT=600
 POLL_SECS=2
+TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"
 
 usage() {
     cat <<EOF
@@ -108,6 +109,13 @@ safe_value() { # name value
     return 0
 }
 trim() { printf '%s' "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//'; }
+# Exactly one positional argument (the exchange ID) is accepted; a second one is an
+# error rather than silently replacing the first.
+positional() { # varname value
+    local -n _slot="$1"
+    [ -z "$_slot" ] || die "unexpected extra argument: '$2' (only one exchange ID is accepted)"
+    _slot="$2"
+}
 
 # ---- meta (key=value) ------------------------------------------------------
 meta_get() { # dir key
@@ -204,17 +212,9 @@ cmd_new() {
     slug="$(printf '%s' "$topic" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60)"
     [ -n "$slug" ] || slug="exchange"
 
-    ensure_store
-    local base id n=1
-    base="$(date -u +%Y-%m-%dT%H%M%SZ)-$slug"; id="$base"
-    while :; do
-        if [ -e "$ARCH/$id" ] || ! mkdir "$EXCH/$id" 2>/dev/null; then
-            n=$((n+1)); id="$base-$n"; [ "$n" -le 1000 ] || die "could not reserve an exchange id"; continue
-        fi
-        break
-    done
-    local dir="$EXCH/$id"
-
+    # Derive and validate every header/meta value BEFORE reserving an exchange
+    # directory: an unsafe repository path or CODEX_THREAD_ID must not create a
+    # half-formed exchange, and no derived value may inject header/meta lines.
     local repo common branch commit dirty
     repo="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
     if [ -n "$repo" ]; then
@@ -226,6 +226,20 @@ cmd_new() {
         repo="(none)"; common="(none)"; branch="(none)"; commit="(none)"; dirty="(none)"
     fi
     local thread="${CODEX_THREAD_ID:-(unset)}" created; created="$(now_utc)"
+    safe_value "repository path" "$repo"; safe_value "git common dir" "$common"
+    safe_value "branch name" "$branch"; safe_value "commit" "$commit"; safe_value "dirty state" "$dirty"
+    safe_value "CODEX_THREAD_ID" "$thread"
+
+    ensure_store
+    local base id n=1
+    base="$(date -u +%Y-%m-%dT%H%M%SZ)-$slug"; id="$base"
+    while :; do
+        if [ -e "$ARCH/$id" ] || ! mkdir "$EXCH/$id" 2>/dev/null; then
+            n=$((n+1)); id="$base-$n"; [ "$n" -le 1000 ] || die "could not reserve an exchange id"; continue
+        fi
+        break
+    done
+    local dir="$EXCH/$id"
 
     cat > "$dir/prompt.md" <<EOF
 Exchange-ID: $id
@@ -240,7 +254,7 @@ Created-UTC: $created
 Codex-Thread: $thread
 
 Task:
-<!-- Replace this section with the focused request for $target.
+<!-- $TASK_PLACEHOLDER_MARK $target.
      When the prompt is final, run:  agent-mailbox publish $id  -->
 
 Required reading:
@@ -280,6 +294,7 @@ cmd_publish() {
     esac
     regular "$dir/prompt.md" || { unlock; die "prompt.md missing or not a regular file"; }
     [ "$(head -n1 "$dir/prompt.md" | tr -d '\r')" = "Exchange-ID: $1" ] || { unlock; die "prompt.md must start with 'Exchange-ID: $1'"; }
+    grep -q "$TASK_PLACEHOLDER_MARK" "$dir/prompt.md" && { unlock; die "prompt.md still contains the Task placeholder; edit the Task section before publish"; }
     local h; h="$(sha "$dir/prompt.md")"
     chmod 400 "$dir/prompt.md"
     meta_set "$dir" state published prompt_sha256 "$h" published_utc "$(now_utc)"
@@ -318,7 +333,7 @@ emit_status() { # dir [json]
 
 cmd_status() {
     local id="" json=""
-    while [ "$#" -gt 0 ]; do case "$1" in --json) json=1;; -h|--help) usage; exit 0;; *) id="$1";; esac; shift; done
+    while [ "$#" -gt 0 ]; do case "$1" in --json) json=1;; -h|--help) usage; exit 0;; *) positional id "$1";; esac; shift; done
     [ -n "$id" ] || die "usage: status ID [--json]"
     local dir; dir="$(exdir "$id")"
     emit_status "$dir" "$json"; [ -n "$json" ] && echo
@@ -387,7 +402,7 @@ cmd_claim() {
             --owner) [ "$#" -ge 2 ] || die "--owner requires a value"; owner="$2"; shift;;
             --takeover) takeover=1;;
             -h|--help) usage; exit 0;;
-            *) id="$1";;
+            *) positional id "$1";;
         esac; shift
     done
     [ -n "$id" ] || die "usage: claim ID [--owner NAME] [--takeover]"
@@ -428,12 +443,17 @@ cmd_claim() {
 }
 
 # Validate a candidate response file (already snapshotted): first line, Responder header.
+# The Responder value is extracted once, trimmed, and must be nonempty and free of
+# newlines/control bytes because it is stored in meta and echoed in JSON.
+responder_of() { head -n5 "$1" | tr -d '\r' | awk -F': ' '/^Responder: /{print $2; exit}' | sed -E 's/[[:space:]]+$//'; }
 validate_response_file() { # file id
     [ "$(head -n1 "$1" | tr -d '\r')" = "Exchange-ID: $2" ] || die "response must start with 'Exchange-ID: $2'"
     head -n5 "$1" | tr -d '\r' | grep -q '^Responder: ' || die "response must contain a 'Responder: <name>' line in its header"
+    local who; who="$(responder_of "$1")"
+    safe_value "Responder" "$who"
+    [ -n "$(trim "$who")" ] || die "response 'Responder:' value must not be empty"
     return 0
 }
-responder_of() { head -n5 "$1" | tr -d '\r' | awk -F': ' '/^Responder: /{print $2; exit}' | sed -E 's/[[:space:]]+$//'; }
 finalize_response() { # dir  (caller holds lock; response.md exists and validated)
     meta_set "$1" state answered answered_utc "$(now_utc)" response_sha256 "$(sha "$1/response.md")" responder "$(responder_of "$1/response.md")"
 }
@@ -445,7 +465,7 @@ cmd_respond() {
             --token) [ "$#" -ge 2 ] || die "--token requires a value"; token="$2"; shift;;
             --file) [ "$#" -ge 2 ] || die "--file requires a value"; file="$2"; shift;;
             -h|--help) usage; exit 0;;
-            *) id="$1";;
+            *) positional id "$1";;
         esac; shift
     done
     [ -n "$id" ] && [ -n "$token" ] && [ -n "$file" ] || die "usage: respond ID --token TOKEN --file FILE"
@@ -472,8 +492,7 @@ cmd_respond() {
         # A response already exists while state=claimed: a previous respond linked it but did
         # not finalize meta (interrupted). Roll forward if it validates; never overwrite it.
         [ -L "$dir/response.md" ] && { unlock; die "refusing symlinked response.md"; }
-        if regular "$dir/response.md" && [ "$(head -n1 "$dir/response.md" | tr -d '\r')" = "Exchange-ID: $id" ] \
-           && head -n5 "$dir/response.md" | tr -d '\r' | grep -q '^Responder: '; then
+        if regular "$dir/response.md" && ( validate_response_file "$dir/response.md" "$id" ) >/dev/null 2>&1; then
             finalize_response "$dir"; unlock
             echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"; echo "note=recovered existing response (write-once); the new file was ignored"
             return 0
@@ -505,7 +524,7 @@ cmd_wait() {
         case "$1" in
             --timeout) [ "$#" -ge 2 ] || die "--timeout requires seconds"; timeout="$2"; shift;;
             -h|--help) echo "usage: wait ID [--timeout S]   (default timeout ${DEFAULT_WAIT_TIMEOUT}s; exit 0 answered, 124 timeout, 2 archived, 1 error)"; exit 0;;
-            *) id="$1";;
+            *) positional id "$1";;
         esac; shift
     done
     [ -n "$id" ] || die "usage: wait ID [--timeout S]"
@@ -534,7 +553,7 @@ cmd_wait() {
 
 cmd_archive() {
     local id="" force=0
-    while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; -h|--help) usage; exit 0;; *) id="$1";; esac; shift; done
+    while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; -h|--help) usage; exit 0;; *) positional id "$1";; esac; shift; done
     [ -n "$id" ] || die "usage: archive ID [--force]"
     require_id "$id"
     [ -L "$EXCH/$id" ] || [ -L "$ARCH/$id" ] && die "refusing symlinked exchange directory: $id"
