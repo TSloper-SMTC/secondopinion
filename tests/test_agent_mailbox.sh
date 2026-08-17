@@ -552,5 +552,14 @@ assert_eq "$rc" 1 "(rc 2^64 --timeout)"
 assert_grep "timeout" <(echo "$out")
 
 # ===========================================================================
+# round-10 review regressions (Codex QA of 1.3.4)
+
+t "wait: zero-padded decimals are normalized (00000000000 == 0), out-of-range still refused"
+IDZ="$(new_in "$TMP/repoB" zero-pad)"
+"$AM" wait "$IDZ" --timeout 00000000000 >/dev/null 2>&1; rc=$?
+assert_eq "$rc" 124 "(rc --timeout 00000000000 on a draft)"
+assert_rc 1 "$AM" wait "$IDZ" --timeout 04294967296
+
+# ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

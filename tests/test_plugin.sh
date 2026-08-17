@@ -113,6 +113,54 @@ if command -v claude >/dev/null 2>&1; then
   assert_eq "$rc" 1 "(--check must fail on malformed plugin JSON)"
   # with the real CLI back, the state is still a clean plugin install
   ( cd "$BH" && HOME="$BH" PATH="$BH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "real CLI --check failed after the broken-cli attempts"
+
+  t "duplicate detection: a REAL directory at ~/.claude/skills/codex-mailbox next to a current plugin fails --check"
+  DH="$TMP/home-realdir"; mkdir -p "$DH"
+  ( cd "$DH" && HOME="$DH" PATH="$DH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "--plugin failed in realdir fixture"
+  mkdir -p "$DH/.claude/skills/codex-mailbox"; echo legacy > "$DH/.claude/skills/codex-mailbox/SKILL.md"
+  ( cd "$DH" && HOME="$DH" PATH="$DH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(real skill dir + plugin must be a duplicate)"
+
+  t "plugin -> skill switch: the skill symlink is created only after the plugin is confirmed absent by a successful re-inspection"
+  SH2="$TMP/home-stateful"; mkdir -p "$SH2"
+  ( cd "$SH2" && HOME="$SH2" PATH="$SH2/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "--plugin failed in stateful fixture"
+  REAL_CLAUDE="$(command -v claude)"; SSTUB="$TMP/stateful-stub"; mkdir -p "$SSTUB"
+  # stub: passes every call through to the real CLI, except that after an uninstall it makes the next `plugin list --json` fail
+  cat > "$SSTUB/claude" <<STUB
+#!/bin/bash
+flag="$SSTUB/after-uninstall"
+if [ "\$1 \$2" = "plugin uninstall" ]; then touch "\$flag"; exec "$REAL_CLAUDE" "\$@"; fi
+if [ "\$1 \$2 \$3" = "plugin list --json" ] && [ -e "\$flag" ]; then rm -f "\$flag"; exit 47; fi
+exec "$REAL_CLAUDE" "\$@"
+STUB
+  chmod +x "$SSTUB/claude"
+  ( cd "$SH2" && HOME="$SH2" PATH="$SSTUB:$SH2/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(switch must fail when the post-uninstall re-inspection fails)"
+  [ ! -e "$SH2/.claude/skills/codex-mailbox" ] && ok || fail "skill symlink created although the plugin's absence was not confirmed"
+  # a real retry recovers
+  ( cd "$SH2" && HOME="$SH2" PATH="$SH2/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" >/dev/null 2>&1 ) && ok || fail "real retry of skill mode failed"
+  ( cd "$SH2" && HOME="$SH2" PATH="$SH2/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check after recovery failed"
+
+  t "schema-invalid plugin JSON (enabled as a string, non-list) is treated as uninspectable, not as enabled"
+  JH="$TMP/home-schema"; mkdir -p "$JH"
+  ( cd "$JH" && HOME="$JH" PATH="$JH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "--plugin failed in schema fixture"
+  ( cd "$JH" && HOME="$JH" claude plugin disable --scope user agent-mailbox@agent-mailbox >/dev/null 2>&1 )
+  JSTUB="$TMP/schema-stub"; mkdir -p "$JSTUB"
+  cat > "$JSTUB/claude" <<STUB
+#!/bin/bash
+if [ "\$1 \$2 \$3" = "plugin list --json" ]; then printf '[{"id":"agent-mailbox@agent-mailbox","version":"$TOOL_VERSION","enabled":"false"}]\n'; exit 0; fi
+exec "$REAL_CLAUDE" "\$@"
+STUB
+  chmod +x "$JSTUB/claude"
+  ( cd "$JH" && HOME="$JH" PATH="$JSTUB:$JH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(--check must not approve a string-typed enabled field)"
+  cat > "$JSTUB/claude" <<STUB
+#!/bin/bash
+if [ "\$1 \$2 \$3" = "plugin list --json" ]; then printf '{"id":"agent-mailbox@agent-mailbox"}\n'; exit 0; fi
+exec "$REAL_CLAUDE" "\$@"
+STUB
+  ( cd "$JH" && HOME="$JH" PATH="$JSTUB:$JH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(--check must not approve a non-list plugin JSON)"
 else
   echo "note: 'claude' CLI not on PATH; plugin validate/install tests skipped"
 fi

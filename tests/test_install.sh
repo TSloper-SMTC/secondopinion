@@ -106,5 +106,14 @@ assert_eq "$rc" 1
 after="$(cd "$EH" && find . | sort | md5sum)"
 [ "$before" = "$after" ] && ok || fail "--check mutated an empty HOME: $(cd "$EH" && find . | head -5 | tr '\n' ' ')"
 
+t "--check requires the store inside the [sandbox_workspace_write] table, not any writable_roots line"
+TH2="$TMP/home-toml"; mkdir -p "$TH2/.codex" "$TH2/.local/bin" "$TH2/.claude/skills" "$TH2/.codex/skills"
+ln -sfn "$ROOT/bin/agent-mailbox" "$TH2/.local/bin/agent-mailbox"; ln -sfn "$ROOT/skills/claude/codex-mailbox" "$TH2/.claude/skills/codex-mailbox"; ln -sfn "$ROOT/skills/codex/claude-mailbox" "$TH2/.codex/skills/claude-mailbox"
+printf '[unrelated]\nwritable_roots = ["%s"]\n\n[sandbox_workspace_write]\nwritable_roots = ["/somewhere/else"]\n' "$TH2/.agent-mailbox" > "$TH2/.codex/config.toml"
+( cd "$TH2" && env HOME="$TH2" PATH="$TH2/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+assert_eq "$rc" 1 "(store only in an unrelated table must not pass)"
+printf '[sandbox_workspace_write]\nwritable_roots = ["/somewhere/else", "%s"]\n' "$TH2/.agent-mailbox" > "$TH2/.codex/config.toml"
+( cd "$TH2" && env HOME="$TH2" PATH="$TH2/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "store present in the right table (second array member) must pass"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

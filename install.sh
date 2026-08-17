@@ -58,9 +58,14 @@ data = sys.stdin.read()
 body, _, rc = data.rpartition("RC=")
 try:
     if rc.strip() != "0": raise ValueError("cli")
-    for p in json.loads(body):
-        if p.get("id") == sys.argv[1]:
-            print("OK", p.get("version", ""), "true" if p.get("enabled") else "false"); break
+    data = json.loads(body)
+    if not isinstance(data, list): raise ValueError("shape")
+    hits = [p for p in data if isinstance(p, dict) and p.get("id") == sys.argv[1]]
+    if len(hits) > 1: raise ValueError("duplicate ids")
+    if hits:
+        p = hits[0]
+        if not isinstance(p.get("version"), str) or not isinstance(p.get("enabled"), bool): raise ValueError("schema")
+        print("OK", p["version"], "true" if p["enabled"] else "false")
     else:
         print("OK")
 except Exception:
@@ -76,9 +81,13 @@ data = sys.stdin.read()
 body, _, rc = data.rpartition("RC=")
 try:
     if rc.strip() != "0": raise ValueError("cli")
-    for m in json.loads(body):
-        if m.get("name") == sys.argv[1]:
-            print("OK", m.get("path", "")); break
+    data = json.loads(body)
+    if not isinstance(data, list): raise ValueError("shape")
+    hits = [m for m in data if isinstance(m, dict) and m.get("name") == sys.argv[1]]
+    if len(hits) > 1: raise ValueError("duplicate names")
+    if hits:
+        if not isinstance(hits[0].get("path"), str): raise ValueError("schema")
+        print("OK", hits[0]["path"])
     else:
         print("OK")
 except Exception:
@@ -105,6 +114,19 @@ plugin_current() { plugin_present && [ "$MARKET_PATH" = "$ROOT" ] && [ "$PLUGIN_
 marketplace_path() { echo "$MARKET_PATH"; }
 plugin_state() { echo "$PLUGIN_STATE"; }
 refresh_plugins() { PLUGIN_INSPECT="absent"; PLUGIN_STATE=""; MARKET_PATH=""; inspect_plugins; }
+
+# --- skill mode: the plugin form must not stay active alongside the user-level skill --------
+# Done BEFORE any symlink is created: the skill symlink is only added once the plugin is
+# confirmed absent by a successful re-inspection (a stateful CLI failure must not leave both).
+if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
+    claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || claude plugin uninstall "$PLUGIN_ID" >/dev/null 2>&1 \
+        || { echo "ERROR: could not uninstall $PLUGIN_ID; skill mode would duplicate the plugin skill. Run: claude plugin uninstall $PLUGIN_ID" >&2; exit 1; }
+    refresh_plugins
+    if [ "$PLUGIN_INSPECT" != "ok" ] || plugin_present; then
+        echo "ERROR: could not confirm that $PLUGIN_ID is absent after uninstall (inspection=$PLUGIN_INSPECT, state='$PLUGIN_STATE'); refusing to create the user-level skill. Re-run install.sh." >&2; exit 1
+    fi
+    echo "removed   plugin $PLUGIN_ID (skill mode uses the user-level /codex-mailbox skill instead)"
+fi
 
 # ---- symlinks -----------------------------------------------------------------------------
 # dest -> source
@@ -147,7 +169,7 @@ if [ "$CHECK" != 1 ]; then
     mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
 fi
 if [ -f "$CODEX_CFG" ] && grep -q '^\[sandbox_workspace_write\]' "$CODEX_CFG"; then
-    if grep -E '^writable_roots *=' "$CODEX_CFG" | grep -Fq "\"$STORE_DIR\""; then
+    if awk '/^\[sandbox_workspace_write\]/{f=1; next} /^\[/{f=0} f' "$CODEX_CFG" | grep -E '^writable_roots *=' | grep -Fq "\"$STORE_DIR\""; then
         echo "ok        $CODEX_CFG: [sandbox_workspace_write] writable_roots includes $STORE_DIR"
     else
         echo "ACTION    $CODEX_CFG already has a [sandbox_workspace_write] table; add \"$STORE_DIR\" to its writable_roots array by hand (not edited automatically)." >&2
@@ -159,15 +181,6 @@ else
     mkdir -p "$(dirname "$CODEX_CFG")"
     { [ -f "$CODEX_CFG" ] && [ -n "$(tail -c1 "$CODEX_CFG")" ] && echo; printf '\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\n' "$STORE_DIR"; } >> "$CODEX_CFG"
     echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] (Codex sandbox may write the store)"
-fi
-
-# --- skill mode: the plugin form must not stay active alongside the user-level skill --------
-if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
-    claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || claude plugin uninstall "$PLUGIN_ID" >/dev/null 2>&1 \
-        || { echo "ERROR: could not uninstall $PLUGIN_ID; skill mode would duplicate the plugin skill. Run: claude plugin uninstall $PLUGIN_ID" >&2; exit 1; }
-    refresh_plugins
-    plugin_present && { echo "ERROR: $PLUGIN_ID is still installed after uninstall; refusing a duplicate skill" >&2; exit 1; }
-    echo "removed   plugin $PLUGIN_ID (skill mode uses the user-level /codex-mailbox skill instead)"
 fi
 
 # --- plugin mode: Claude side through the plugin system ------------------------------------
@@ -222,7 +235,7 @@ if [ "$PLUGIN" = 1 ]; then
 fi
 if [ "$CHECK" = 1 ]; then
     [ "${INSPECT_FAILED:-0}" = 1 ] && status=1
-    if plugin_current && [ -L "$CLAUDE_SKILL_LINK" ]; then
+    if plugin_current && { [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; }; then
         echo "DUPLICATE both the plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
     elif plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /agent-mailbox:codex-mailbox)"
     elif [ -L "$CLAUDE_SKILL_LINK" ]; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /codex-mailbox)"

@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.3.4"
+VERSION="1.3.5"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
     echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
     exit 1
@@ -24,11 +24,14 @@ ARCH="$STORE/archive"
 # so they can never wrap in Bash arithmetic (2^64 would wrap to 0 and, e.g., permit takeover).
 MAX_SECS=4294967295
 parse_secs() { # name value -> prints the integer, or an error line on stderr and returns 1
-    if ! [[ "$2" =~ ^[0-9]{1,10}$ ]] || [ "$((10#$2))" -gt "$MAX_SECS" ]; then
+    local v
+    [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: $1 must be a non-negative decimal number of seconds no greater than $MAX_SECS (got '$2')." >&2; return 1; }
+    v="${2#"${2%%[!0]*}"}"; [ -n "$v" ] || v=0        # strip leading zeros (any count) before the width check
+    if [ "${#v}" -gt 10 ] || [ "$((10#$v))" -gt "$MAX_SECS" ]; then
         echo "ERROR: $1 must be a non-negative decimal number of seconds no greater than $MAX_SECS (got '$2')." >&2
         return 1
     fi
-    echo $((10#$2))
+    echo $((10#$v))
 }
 STALE_CLAIM_SECS="$(parse_secs AGENT_MAILBOX_STALE_CLAIM_SECS "${AGENT_MAILBOX_STALE_CLAIM_SECS:-1800}")" || exit 1
 DEFAULT_WAIT_TIMEOUT=600

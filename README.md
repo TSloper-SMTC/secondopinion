@@ -19,10 +19,13 @@ States: `draft → published → claimed → answered → archived`.
 
 ## Install
 
-Two mutually exclusive forms; running either installer switches cleanly (skill
-mode uninstalls the plugin, plugin mode retires the user-level skill symlink).
-Switching fails before changing anything if an existing Claude plugin registry
-cannot be inspected (`claude plugin list --json` failing or malformed).
+Two mutually exclusive forms: a successful install leaves exactly one Claude-side
+form, as `--check` verifies. Skill mode uninstalls the plugin and creates the
+user-level skill symlink only after a successful re-inspection confirms the
+plugin is gone; plugin mode retires (or backs up) anything at
+`~/.claude/skills/codex-mailbox`. Switching fails before changing anything if an
+existing Claude plugin registry cannot be inspected (`claude plugin list --json`
+failing, malformed, or schema-invalid).
 
 **Skill mode (default)** — symlinks the CLI and both skills into `$HOME`:
 ```bash
@@ -53,8 +56,11 @@ symlinks it.
 
 `install.sh --check` never modifies HOME (it does not even start the `claude`
 CLI on a pristine HOME) and fails on missing, stale, disabled, wrong-version,
-duplicate (both forms active) or uninspectable plugin state; otherwise it
-reports which form is installed. Also creates the store (0700) and adds it to Codex's sandbox as a
+duplicate (a current plugin plus anything at `~/.claude/skills/codex-mailbox`)
+or uninspectable plugin state, and requires the store inside the
+`[sandbox_workspace_write]` table specifically; otherwise it reports which form
+is installed. A non-check installation is what creates the store and Codex
+sandbox entry. Also creates the store (0700) and adds it to Codex's sandbox as a
 writable root (`[sandbox_workspace_write] writable_roots` in
 `~/.codex/config.toml`) — without that, Codex's workspace-write sandbox sees
 `$HOME` read-only and `agent-mailbox new` fails. Restart sessions to load
@@ -138,9 +144,9 @@ so they cannot corrupt `meta` or the JSON output.
 ## Environment
 
 `AGENT_MAILBOX_DIR` (store), `AGENT_MAILBOX_OWNER` (default claim owner),
-`AGENT_MAILBOX_STALE_CLAIM_SECS` (non-negative decimal seconds ≤ 4294967295, the
-same rule as `wait --timeout`; malformed or out-of-range values are refused so
-nothing can wrap in shell arithmetic).
+`AGENT_MAILBOX_STALE_CLAIM_SECS` (non-negative decimal seconds ≤ 4294967295,
+leading zeros allowed, the same rule as `wait --timeout`; malformed or
+out-of-range values are refused so nothing can wrap in shell arithmetic).
 
 ## Tests
 
