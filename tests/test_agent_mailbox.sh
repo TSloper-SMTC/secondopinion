@@ -535,5 +535,22 @@ assert_not_grep "integer expression expected" <(echo "$out")
 assert_eq "$("$AM" status "$IDSC" | val state)" "claimed"
 
 # ===========================================================================
+# round-9 review regressions (Codex QA of 1.3.3)
+
+t "env: an out-of-range AGENT_MAILBOX_STALE_CLAIM_SECS (2^64) is refused rather than wrapping to 0 and permitting takeover"
+IDOV="$(new_in "$TMP/repoB" stale-overflow)"; publish_prompt "$IDOV" "task"
+"$AM" claim "$IDOV" --owner first >/dev/null
+out="$(AGENT_MAILBOX_STALE_CLAIM_SECS=18446744073709551616 "$AM" claim "$IDOV" --owner second --takeover 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc 2^64 STALE_CLAIM_SECS)"
+assert_grep "AGENT_MAILBOX_STALE_CLAIM_SECS" <(echo "$out")
+assert_eq "$("$AM" status "$IDOV" | val claimed_by)" "first"
+
+t "wait: an out-of-range --timeout (2^64) is refused rather than becoming an immediate timeout"
+IDWO="$(new_in "$TMP/repoB" wait-overflow)"
+out="$("$AM" wait "$IDWO" --timeout 18446744073709551616 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc 2^64 --timeout)"
+assert_grep "timeout" <(echo "$out")
+
+# ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

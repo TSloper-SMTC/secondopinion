@@ -98,6 +98,21 @@ if command -v claude >/dev/null 2>&1; then
   out="$(cd "$XH" && HOME="$XH" PATH="$XH/.local/bin:$PATH" "$ROOT/install.sh" --check 2>&1)"; rc=$?
   assert_eq "$rc" 1 "(--check must reject skill symlink + plugin both active)"
   echo "$out" | grep -qi "duplicate\|both" && ok || fail "--check does not name the duplicate state: $out"
+
+  t "plugin inspection fails CLOSED: a broken claude CLI (nonzero exit / malformed JSON) blocks skill-mode mutation and --check"
+  BH="$TMP/home-broken"; mkdir -p "$BH"
+  ( cd "$BH" && HOME="$BH" PATH="$BH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "--plugin failed in broken-cli fixture"
+  STUB="$TMP/stubbin"; mkdir -p "$STUB"; printf '#!/bin/bash\nexit 47\n' > "$STUB/claude"; chmod +x "$STUB/claude"
+  ( cd "$BH" && HOME="$BH" PATH="$STUB:$BH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(skill mode must refuse when plugin state cannot be inspected)"
+  [ ! -e "$BH/.claude/skills/codex-mailbox" ] && ok || fail "skill symlink was created although the plugin state was uninspectable (duplicate risk)"
+  ( cd "$BH" && HOME="$BH" PATH="$STUB:$BH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(--check must fail when plugin state cannot be inspected)"
+  printf '#!/bin/bash\necho "not json"\n' > "$STUB/claude"      # malformed JSON variant
+  ( cd "$BH" && HOME="$BH" PATH="$STUB:$BH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(--check must fail on malformed plugin JSON)"
+  # with the real CLI back, the state is still a clean plugin install
+  ( cd "$BH" && HOME="$BH" PATH="$BH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "real CLI --check failed after the broken-cli attempts"
 else
   echo "note: 'claude' CLI not on PATH; plugin validate/install tests skipped"
 fi

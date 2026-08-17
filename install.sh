@@ -42,34 +42,69 @@ if [ "$PLUGIN" = 1 ] && ! have_claude; then
     echo "ERROR: --plugin needs the 'claude' CLI and python3 on PATH (nothing was installed)." >&2; exit 1
 fi
 
-# ---- plugin state (JSON, never text grep) -------------------------------------------------
-marketplace_path() { # -> path of the agent-mailbox marketplace, or ""
-    claude plugin marketplace list --json 2>/dev/null | python3 -c '
+# ---- plugin state (JSON, never text grep; tri-state: present / absent / error) --------------
+# Running the claude CLI creates ~/.claude.json etc. on a pristine HOME, so it is consulted only
+# when a plugin registry already exists. If the registry exists but cannot be inspected (CLI
+# failure, malformed JSON), the state is ERROR and every mode-changing or approving path fails
+# closed rather than assuming "absent".
+PLUGIN_STATE=""; MARKET_PATH=""; PLUGIN_INSPECT="absent"
+inspect_plugins() {
+    [ -e "$HOME/.claude/plugins" ] || { PLUGIN_INSPECT="absent"; return 0; }
+    have_claude || { PLUGIN_INSPECT="error"; return 0; }
+    local out
+    out="$( { claude plugin list --json 2>/dev/null; echo "RC=$?"; } | python3 -c '
 import json, sys
+data = sys.stdin.read()
+body, _, rc = data.rpartition("RC=")
 try:
-    for m in json.load(sys.stdin):
-        if m.get("name") == sys.argv[1]:
-            print(m.get("path", "")); break
-except Exception:
-    pass' "$MARKETPLACE" 2>/dev/null || true
-}
-plugin_state() { # -> "<version> true|false" or ""
-    claude plugin list --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    for p in json.load(sys.stdin):
+    if rc.strip() != "0": raise ValueError("cli")
+    for p in json.loads(body):
         if p.get("id") == sys.argv[1]:
-            print(p.get("version", ""), "true" if p.get("enabled") else "false"); break
+            print("OK", p.get("version", ""), "true" if p.get("enabled") else "false"); break
+    else:
+        print("OK")
 except Exception:
-    pass' "$PLUGIN_ID" 2>/dev/null || true
+    print("ERR")' "$PLUGIN_ID" 2>/dev/null )" || out="ERR"
+    case "$out" in
+        OK) PLUGIN_STATE="";;
+        OK\ *) PLUGIN_STATE="${out#OK }";;
+        *) PLUGIN_INSPECT="error"; return 0;;
+    esac
+    out="$( { claude plugin marketplace list --json 2>/dev/null; echo "RC=$?"; } | python3 -c '
+import json, sys
+data = sys.stdin.read()
+body, _, rc = data.rpartition("RC=")
+try:
+    if rc.strip() != "0": raise ValueError("cli")
+    for m in json.loads(body):
+        if m.get("name") == sys.argv[1]:
+            print("OK", m.get("path", "")); break
+    else:
+        print("OK")
+except Exception:
+    print("ERR")' "$MARKETPLACE" 2>/dev/null )" || out="ERR"
+    case "$out" in
+        OK) MARKET_PATH="";;
+        OK\ *) MARKET_PATH="${out#OK }";;
+        *) PLUGIN_INSPECT="error"; return 0;;
+    esac
+    PLUGIN_INSPECT="ok"
 }
-# The Claude side counts as installed in plugin form only when the marketplace points at THIS
-# checkout and the plugin is exactly this version and enabled.
-# Running the claude CLI creates ~/.claude.json etc. on a pristine HOME, so read-only checks
-# consult it only when a plugin registry already exists (nothing to find otherwise).
-plugin_registry_exists() { [ -e "$HOME/.claude/plugins" ]; }
-plugin_present() { have_claude && plugin_registry_exists && [ -n "$(plugin_state)" ]; }
-plugin_current() { plugin_present && [ "$(marketplace_path)" = "$ROOT" ] && [ "$(plugin_state)" = "$VERSION true" ]; }
+inspect_plugins
+if [ "$PLUGIN_INSPECT" = "error" ]; then
+    if [ "$CHECK" = 1 ]; then
+        echo "UNINSPECTABLE  ~/.claude/plugins exists but 'claude plugin list --json' / 'marketplace list --json' could not be read; cannot approve the Claude side" >&2
+        # fall through: symlink/config checks still run, but the check will fail
+        INSPECT_FAILED=1
+    else
+        echo "ERROR: ~/.claude/plugins exists but the Claude plugin state cannot be inspected (claude CLI failed or returned malformed JSON); refusing to change install mode." >&2; exit 1
+    fi
+fi
+plugin_present() { [ "$PLUGIN_INSPECT" = "ok" ] && [ -n "$PLUGIN_STATE" ]; }
+plugin_current() { plugin_present && [ "$MARKET_PATH" = "$ROOT" ] && [ "$PLUGIN_STATE" = "$VERSION true" ]; }
+marketplace_path() { echo "$MARKET_PATH"; }
+plugin_state() { echo "$PLUGIN_STATE"; }
+refresh_plugins() { PLUGIN_INSPECT="absent"; PLUGIN_STATE=""; MARKET_PATH=""; inspect_plugins; }
 
 # ---- symlinks -----------------------------------------------------------------------------
 # dest -> source
@@ -130,6 +165,7 @@ fi
 if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
     claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || claude plugin uninstall "$PLUGIN_ID" >/dev/null 2>&1 \
         || { echo "ERROR: could not uninstall $PLUGIN_ID; skill mode would duplicate the plugin skill. Run: claude plugin uninstall $PLUGIN_ID" >&2; exit 1; }
+    refresh_plugins
     plugin_present && { echo "ERROR: $PLUGIN_ID is still installed after uninstall; refusing a duplicate skill" >&2; exit 1; }
     echo "removed   plugin $PLUGIN_ID (skill mode uses the user-level /codex-mailbox skill instead)"
 fi
@@ -163,6 +199,7 @@ if [ "$PLUGIN" = 1 ]; then
         ver="${state%% *}"
         if [ "$ver" != "$VERSION" ]; then
             claude plugin update --scope user "$PLUGIN_ID" >/dev/null 2>&1 || true
+            refresh_plugins
             if [ "$(plugin_state | cut -d' ' -f1)" != "$VERSION" ]; then
                 # update could not reach this version (e.g. stale cache): reinstall from the repointed marketplace
                 claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || true
@@ -170,11 +207,13 @@ if [ "$PLUGIN" = 1 ]; then
             fi
             echo "updated   plugin $PLUGIN_ID $ver -> $VERSION"
         fi
+        refresh_plugins
         if [ "$(plugin_state | cut -d' ' -f2)" != "true" ]; then
             claude plugin enable --scope user "$PLUGIN_ID" >/dev/null || { echo "ERROR: claude plugin enable $PLUGIN_ID failed" >&2; exit 1; }
             echo "enabled   plugin $PLUGIN_ID"
         fi
     fi
+    refresh_plugins
     if plugin_current; then
         echo "ok        plugin $PLUGIN_ID $VERSION enabled from $ROOT (skill: /agent-mailbox:codex-mailbox; restart Claude Code to apply)"
     else
@@ -182,6 +221,7 @@ if [ "$PLUGIN" = 1 ]; then
     fi
 fi
 if [ "$CHECK" = 1 ]; then
+    [ "${INSPECT_FAILED:-0}" = 1 ] && status=1
     if plugin_current && [ -L "$CLAUDE_SKILL_LINK" ]; then
         echo "DUPLICATE both the plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
     elif plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /agent-mailbox:codex-mailbox)"
