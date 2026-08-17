@@ -13,6 +13,7 @@ if [ -z "${HOME:-}" ]; then
     exit 1
 fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$ROOT/bin/agent-mailbox")"
 # Backups of replaced real dirs/files go OUTSIDE the skills trees, otherwise a
 # backed-up SKILL.md is discovered as a duplicate skill.
 BACKUP_DIR="${AGENT_MAILBOX_BACKUP_DIR:-$ROOT/backups}"
@@ -25,18 +26,48 @@ case "$#:${1:-}" in
     *) echo "usage: install.sh [--check|--plugin]   (unknown or surplus argument: '$*')" >&2; exit 1;;
 esac
 PLUGIN_ID="agent-mailbox@agent-mailbox"
+MARKETPLACE="agent-mailbox"
 CLAUDE_SKILL_LINK="$HOME/.claude/skills/codex-mailbox"
 STORE_DIR="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
 CODEX_CFG="$HOME/.codex/config.toml"
+
+# ---- every precondition is checked BEFORE any mutation ------------------------------------
 # The store path is written into TOML as a quoted string: refuse anything that
 # cannot be represented verbatim (quotes, backslashes, control characters).
 case "$STORE_DIR" in
-    *[\"\\]*|*[[:cntrl:]]*) echo "ERROR: store path '$STORE_DIR' contains a quote, backslash or control character; choose another AGENT_MAILBOX_DIR." >&2; exit 1;;
+    *[\"\\]*|*[[:cntrl:]]*) printf 'ERROR: store path %q contains a quote, backslash or control character; choose another AGENT_MAILBOX_DIR.\n' "$STORE_DIR" >&2; exit 1;;
 esac
+have_claude() { command -v claude >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; }
+if [ "$PLUGIN" = 1 ] && ! have_claude; then
+    echo "ERROR: --plugin needs the 'claude' CLI and python3 on PATH (nothing was installed)." >&2; exit 1
+fi
 
-plugin_installed() { command -v claude >/dev/null 2>&1 && claude plugin list 2>/dev/null | grep -q "^ *❯ *$PLUGIN_ID\b\|$PLUGIN_ID"; }
-marketplace_present() { claude plugin marketplace list 2>/dev/null | grep -q "agent-mailbox"; }
+# ---- plugin state (JSON, never text grep) -------------------------------------------------
+marketplace_path() { # -> path of the agent-mailbox marketplace, or ""
+    claude plugin marketplace list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for m in json.load(sys.stdin):
+        if m.get("name") == sys.argv[1]:
+            print(m.get("path", "")); break
+except Exception:
+    pass' "$MARKETPLACE" 2>/dev/null || true
+}
+plugin_state() { # -> "<version> true|false" or ""
+    claude plugin list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for p in json.load(sys.stdin):
+        if p.get("id") == sys.argv[1]:
+            print(p.get("version", ""), "true" if p.get("enabled") else "false"); break
+except Exception:
+    pass' "$PLUGIN_ID" 2>/dev/null || true
+}
+# The Claude side counts as installed in plugin form only when the marketplace points at THIS
+# checkout and the plugin is exactly this version and enabled.
+plugin_current() { have_claude && [ "$(marketplace_path)" = "$ROOT" ] && [ "$(plugin_state)" = "$VERSION true" ]; }
 
+# ---- symlinks -----------------------------------------------------------------------------
 # dest -> source
 LINKS=(
     "$HOME/.local/bin/agent-mailbox|$ROOT/bin/agent-mailbox"
@@ -44,7 +75,7 @@ LINKS=(
 )
 # The Claude skill is a symlink in skill mode; in plugin mode it comes from the plugin.
 # --check accepts either form.
-if [ "$PLUGIN" = 0 ] && ! { [ "$CHECK" = 1 ] && plugin_installed; }; then
+if [ "$PLUGIN" = 0 ] && ! { [ "$CHECK" = 1 ] && plugin_current; }; then
     LINKS+=("$CLAUDE_SKILL_LINK|$ROOT/skills/claude/codex-mailbox")
 fi
 
@@ -91,32 +122,55 @@ else
     echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] (Codex sandbox may write the store)"
 fi
 
-# --- plugin mode: Claude side through the plugin system --------------------------------
+# --- plugin mode: Claude side through the plugin system ------------------------------------
 if [ "$PLUGIN" = 1 ]; then
-    command -v claude >/dev/null 2>&1 || { echo "ERROR: --plugin needs the 'claude' CLI on PATH." >&2; exit 1; }
     if [ -L "$CLAUDE_SKILL_LINK" ]; then
         rm -f "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (user-level skill would duplicate the plugin skill)"
     elif [ -e "$CLAUDE_SKILL_LINK" ]; then
         mkdir -p "$BACKUP_DIR"; bak="$BACKUP_DIR/codex-mailbox.bak-$(date -u +%Y%m%dT%H%M%SZ)"
         mv -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
     fi
-    if marketplace_present; then
-        claude plugin marketplace update agent-mailbox >/dev/null 2>&1 || true
-        echo "ok        marketplace agent-mailbox ($ROOT) refreshed"
-    else
-        claude plugin marketplace add "$ROOT" >/dev/null || { echo "ERROR: claude plugin marketplace add $ROOT failed" >&2; exit 1; }
-        echo "added     marketplace agent-mailbox -> $ROOT"
+    mp="$(marketplace_path)"
+    if [ -n "$mp" ] && [ "$mp" != "$ROOT" ]; then
+        # A marketplace of our name pointing elsewhere (moved or stale checkout): replace it.
+        claude plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 || true
+        echo "removed   stale marketplace $MARKETPLACE -> $mp"; mp=""
     fi
-    if plugin_installed; then
-        claude plugin update "$PLUGIN_ID" >/dev/null 2>&1 || true
-        echo "ok        plugin $PLUGIN_ID updated (restart Claude Code to apply)"
+    if [ -z "$mp" ]; then
+        claude plugin marketplace add "$ROOT" >/dev/null || { echo "ERROR: claude plugin marketplace add $ROOT failed" >&2; exit 1; }
+        echo "added     marketplace $MARKETPLACE -> $ROOT"
     else
+        claude plugin marketplace update "$MARKETPLACE" >/dev/null || { echo "ERROR: claude plugin marketplace update $MARKETPLACE failed" >&2; exit 1; }
+        echo "ok        marketplace $MARKETPLACE ($ROOT) refreshed"
+    fi
+    state="$(plugin_state)"
+    if [ -z "$state" ]; then
         claude plugin install "$PLUGIN_ID" >/dev/null || { echo "ERROR: claude plugin install $PLUGIN_ID failed" >&2; exit 1; }
-        echo "installed plugin $PLUGIN_ID (skill: /agent-mailbox:codex-mailbox)"
+        echo "installed plugin $PLUGIN_ID $VERSION"
+    else
+        ver="${state%% *}"
+        if [ "$ver" != "$VERSION" ]; then
+            claude plugin update --scope user "$PLUGIN_ID" >/dev/null 2>&1 || true
+            if [ "$(plugin_state | cut -d' ' -f1)" != "$VERSION" ]; then
+                # update could not reach this version (e.g. stale cache): reinstall from the repointed marketplace
+                claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || true
+                claude plugin install "$PLUGIN_ID" >/dev/null || { echo "ERROR: claude plugin (re)install $PLUGIN_ID failed" >&2; exit 1; }
+            fi
+            echo "updated   plugin $PLUGIN_ID $ver -> $VERSION"
+        fi
+        if [ "$(plugin_state | cut -d' ' -f2)" != "true" ]; then
+            claude plugin enable --scope user "$PLUGIN_ID" >/dev/null || { echo "ERROR: claude plugin enable $PLUGIN_ID failed" >&2; exit 1; }
+            echo "enabled   plugin $PLUGIN_ID"
+        fi
+    fi
+    if plugin_current; then
+        echo "ok        plugin $PLUGIN_ID $VERSION enabled from $ROOT (skill: /agent-mailbox:codex-mailbox; restart Claude Code to apply)"
+    else
+        echo "ERROR: plugin verification failed: state='$(plugin_state)' marketplace='$(marketplace_path)' (want '$VERSION true' from $ROOT)" >&2; exit 1
     fi
 fi
 if [ "$CHECK" = 1 ]; then
-    if plugin_installed; then echo "ok        Claude side: plugin $PLUGIN_ID (skill /agent-mailbox:codex-mailbox)"
+    if plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /agent-mailbox:codex-mailbox)"
     elif [ -L "$CLAUDE_SKILL_LINK" ]; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /codex-mailbox)"
     fi
 fi

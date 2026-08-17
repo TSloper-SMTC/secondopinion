@@ -37,9 +37,13 @@ a `.codex-plugin/plugin.json` is included for Codex's plugin format):
 #    claude plugin marketplace add ~/tools/agent-mailbox && claude plugin install agent-mailbox@agent-mailbox
 #    (retires a user-level ~/.claude/skills/codex-mailbox symlink so the skill is not listed twice)
 ```
-Claude Code then invokes the skill as `/agent-mailbox:codex-mailbox [ID]`;
-update with `claude plugin update agent-mailbox@agent-mailbox` after pulling
-the repo. `claude plugin validate --strict .claude-plugin/plugin.json` and the
+Claude Code then invokes the skill as `/agent-mailbox:codex-mailbox [ID]`.
+After pulling the repo, re-run `install.sh --plugin` (it repoints a stale
+marketplace, updates or reinstalls to the checkout's version, re-enables a
+disabled plugin, and fails — before touching anything — if `claude`/`python3`
+are missing or the store path cannot be written into TOML); `--check` passes
+only when the marketplace points at this checkout and the plugin is exactly this
+version and enabled. `claude plugin validate --strict .claude-plugin/plugin.json` and the
 marketplace manifest pass. The `agent-mailbox` CLI itself is not part of the
 plugin model (plugins cannot manage PATH), which is why install.sh still
 symlinks it.
@@ -63,7 +67,7 @@ agent-mailbox read-response <ID>            # validated (ID + prompt hash + resp
 agent-mailbox archive <ID>
 ```
 
-Claude Code (`/codex-mailbox [ID]`, in any checkout of that repo):
+Claude Code (`/codex-mailbox [ID]` in skill mode, or `/agent-mailbox:codex-mailbox [ID]` in plugin mode, in any checkout of that repo):
 ```bash
 agent-mailbox list --pending --here         # exchanges for this repo (matched by git common dir → all worktrees)
 agent-mailbox show <ID>                     # read first: verify Repo/Branch/Commit, read that repo's AGENTS.md/CLAUDE.md

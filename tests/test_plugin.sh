@@ -60,6 +60,31 @@ if command -v claude >/dev/null 2>&1; then
   [ -L "$HOME/.codex/skills/claude-mailbox" ] && ok || fail "Codex skill symlink missing after --plugin"
   [ ! -e "$HOME/.claude/skills/codex-mailbox" ] && ok || fail "user-level codex-mailbox skill still present (duplicate of plugin skill)"
   ( cd "$HOME" && "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check does not accept the plugin-mode install"
+
+  t "install.sh --plugin without the claude CLI fails BEFORE any mutation"
+  NH="$TMP/home-noclaude"; mkdir -p "$NH"
+  ( cd "$NH" && env HOME="$NH" PATH="/usr/bin:/bin" AGENT_MAILBOX_DIR="$NH/store" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(rc --plugin without claude)"
+  [ ! -e "$NH/.local/bin/agent-mailbox" ] && [ ! -e "$NH/.codex" ] && [ ! -e "$NH/store" ] && ok || fail "--plugin mutated HOME before the claude prerequisite failed"
+
+  t "install.sh --plugin repairs a stale marketplace/older plugin and verifies version + enabled; --check is state-aware"
+  SH="$TMP/home-stale"; mkdir -p "$SH"; OLD="$TMP/old-copy"; cp -r "$ROOT" "$OLD"; rm -rf "$OLD/.git"
+  for f in bin/agent-mailbox .claude-plugin/plugin.json .codex-plugin/plugin.json .claude-plugin/marketplace.json; do sed -i "s/$TOOL_VERSION/1.0.0/g" "$OLD/$f"; done
+  ( cd "$SH" && HOME="$SH" claude plugin marketplace add "$OLD" >/dev/null 2>&1 && HOME="$SH" claude plugin install agent-mailbox@agent-mailbox >/dev/null 2>&1 ) && ok || fail "could not seed the older install"
+  assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list 2>&1 | sed -n 's/^ *Version: *//p' | head -1)" "1.0.0" "(seeded older version)"
+  rm -rf "$OLD"                                                     # stale marketplace source
+  ( cd "$SH" && HOME="$SH" PATH="$SH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(--check must not accept a stale/older plugin)"
+  ( cd "$SH" && HOME="$SH" PATH="$SH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "install.sh --plugin failed to repair a stale marketplace"
+  assert_eq "$(cd "$SH" && HOME="$SH" claude plugin marketplace list --json 2>/dev/null | python3 -c 'import json,sys; print([m["path"] for m in json.load(sys.stdin) if m["name"]=="agent-mailbox"][0])')" "$ROOT" "(marketplace path repointed to ROOT)"
+  assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; p=[x for x in json.load(sys.stdin) if x["id"]=="agent-mailbox@agent-mailbox"][0]; print(p["version"], p["enabled"])')" "$TOOL_VERSION True" "(version + enabled after repair)"
+  ( cd "$SH" && HOME="$SH" PATH="$SH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check rejects a correct plugin install"
+  # a disabled plugin is not an installed one: --check fails, --plugin re-enables
+  ( cd "$SH" && HOME="$SH" claude plugin disable --scope user agent-mailbox@agent-mailbox >/dev/null 2>&1 )
+  ( cd "$SH" && HOME="$SH" PATH="$SH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+  assert_eq "$rc" 1 "(--check must not accept a disabled plugin)"
+  ( cd "$SH" && HOME="$SH" PATH="$SH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "install.sh --plugin failed on a disabled plugin"
+  assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print([x["enabled"] for x in json.load(sys.stdin) if x["id"]=="agent-mailbox@agent-mailbox"][0])')" "True" "(re-enabled)"
 else
   echo "note: 'claude' CLI not on PATH; plugin validate/install tests skipped"
 fi
