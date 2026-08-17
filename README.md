@@ -19,7 +19,8 @@ States: `draft → published → claimed → answered → archived`.
 
 ## Install
 
-Two equivalent forms; pick one per machine.
+Two mutually exclusive forms; running either installer switches cleanly (skill
+mode uninstalls the plugin, plugin mode retires the user-level skill symlink).
 
 **Skill mode (default)** — symlinks the CLI and both skills into `$HOME`:
 ```bash
@@ -48,7 +49,10 @@ marketplace manifest pass. The `agent-mailbox` CLI itself is not part of the
 plugin model (plugins cannot manage PATH), which is why install.sh still
 symlinks it.
 
-Either way `install.sh --check` reports the installed form. Also creates the store (0700) and adds it to Codex's sandbox as a
+`install.sh --check` never modifies HOME (it does not even start the `claude`
+CLI on a pristine HOME) and fails on missing, stale, disabled, wrong-version or
+duplicate (both forms active) state; otherwise it reports which form is
+installed. Also creates the store (0700) and adds it to Codex's sandbox as a
 writable root (`[sandbox_workspace_write] writable_roots` in
 `~/.codex/config.toml`) — without that, Codex's workspace-write sandbox sees
 `$HOME` read-only and `agent-mailbox new` fails. Restart sessions to load
@@ -132,7 +136,7 @@ so they cannot corrupt `meta` or the JSON output.
 ## Environment
 
 `AGENT_MAILBOX_DIR` (store), `AGENT_MAILBOX_OWNER` (default claim owner),
-`AGENT_MAILBOX_STALE_CLAIM_SECS`.
+`AGENT_MAILBOX_STALE_CLAIM_SECS` (integer seconds; anything else is refused).
 
 ## Tests
 

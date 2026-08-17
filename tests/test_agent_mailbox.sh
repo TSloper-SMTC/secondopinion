@@ -523,5 +523,17 @@ echo "$out_lines" | grep -qi "lines" && ok || fail "line-bound error does not me
 echo "$out_ctl" | grep -qi "control" && ok || fail "control-byte error does not mention control bytes: $out_ctl"
 
 # ===========================================================================
+# round-8 review regressions (Codex QA of 1.3.2)
+
+t "env: a non-integer AGENT_MAILBOX_STALE_CLAIM_SECS is rejected with one clear error"
+IDSC="$(new_in "$TMP/repoB" stale-secs)"; publish_prompt "$IDSC" "task"
+"$AM" claim "$IDSC" --owner o >/dev/null
+out="$(AGENT_MAILBOX_STALE_CLAIM_SECS=abc "$AM" claim "$IDSC" --owner p --takeover 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc bad STALE_CLAIM_SECS)"
+assert_grep "AGENT_MAILBOX_STALE_CLAIM_SECS" <(echo "$out")
+assert_not_grep "integer expression expected" <(echo "$out")
+assert_eq "$("$AM" status "$IDSC" | val state)" "claimed"
+
+# ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

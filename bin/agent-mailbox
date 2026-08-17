@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.3.2"
+VERSION="1.3.3"
 if [ -z "${AGENT_MAILBOX_DIR:-}" ] && [ -z "${HOME:-}" ]; then
     echo "ERROR: neither AGENT_MAILBOX_DIR nor HOME is set; cannot locate the mailbox store." >&2
     exit 1
@@ -21,6 +21,11 @@ STORE="${AGENT_MAILBOX_DIR:-$HOME/.agent-mailbox}"
 EXCH="$STORE/exchanges"
 ARCH="$STORE/archive"
 STALE_CLAIM_SECS="${AGENT_MAILBOX_STALE_CLAIM_SECS:-1800}"
+if ! [[ "$STALE_CLAIM_SECS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: AGENT_MAILBOX_STALE_CLAIM_SECS must be an integer number of seconds (got '$STALE_CLAIM_SECS')." >&2
+    exit 1
+fi
+STALE_CLAIM_SECS=$((10#$STALE_CLAIM_SECS))
 DEFAULT_WAIT_TIMEOUT=600
 POLL_SECS=2
 TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"

@@ -85,6 +85,19 @@ if command -v claude >/dev/null 2>&1; then
   assert_eq "$rc" 1 "(--check must not accept a disabled plugin)"
   ( cd "$SH" && HOME="$SH" PATH="$SH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "install.sh --plugin failed on a disabled plugin"
   assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print([x["enabled"] for x in json.load(sys.stdin) if x["id"]=="agent-mailbox@agent-mailbox"][0])')" "True" "(re-enabled)"
+
+  t "switching plugin -> skill mode is symmetric: plain install.sh removes the plugin; --check rejects a duplicate state"
+  XH="$TMP/home-switch"; mkdir -p "$XH"
+  ( cd "$XH" && HOME="$XH" PATH="$XH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" --plugin >/dev/null 2>&1 ) && ok || fail "--plugin failed in switch fixture"
+  ( cd "$XH" && HOME="$XH" PATH="$XH/.local/bin:$PATH" AGENT_MAILBOX_BACKUP_DIR="$TMP/backups" "$ROOT/install.sh" >/dev/null 2>&1 ) && ok || fail "plain install.sh failed after --plugin"
+  [ -L "$XH/.claude/skills/codex-mailbox" ] && ok || fail "skill symlink missing after switching back to skill mode"
+  assert_eq "$(cd "$XH" && HOME="$XH" claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["id"]=="agent-mailbox@agent-mailbox"]))')" "0" "(plugin removed when switching to skill mode)"
+  ( cd "$XH" && HOME="$XH" PATH="$XH/.local/bin:$PATH" "$ROOT/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check rejects a clean skill-mode install after the switch"
+  # force a duplicate: skill symlink present AND plugin installed -> --check must fail and name it
+  ( cd "$XH" && HOME="$XH" claude plugin install agent-mailbox@agent-mailbox >/dev/null 2>&1 )
+  out="$(cd "$XH" && HOME="$XH" PATH="$XH/.local/bin:$PATH" "$ROOT/install.sh" --check 2>&1)"; rc=$?
+  assert_eq "$rc" 1 "(--check must reject skill symlink + plugin both active)"
+  echo "$out" | grep -qi "duplicate\|both" && ok || fail "--check does not name the duplicate state: $out"
 else
   echo "note: 'claude' CLI not on PATH; plugin validate/install tests skipped"
 fi

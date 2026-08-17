@@ -65,7 +65,11 @@ except Exception:
 }
 # The Claude side counts as installed in plugin form only when the marketplace points at THIS
 # checkout and the plugin is exactly this version and enabled.
-plugin_current() { have_claude && [ "$(marketplace_path)" = "$ROOT" ] && [ "$(plugin_state)" = "$VERSION true" ]; }
+# Running the claude CLI creates ~/.claude.json etc. on a pristine HOME, so read-only checks
+# consult it only when a plugin registry already exists (nothing to find otherwise).
+plugin_registry_exists() { [ -e "$HOME/.claude/plugins" ]; }
+plugin_present() { have_claude && plugin_registry_exists && [ -n "$(plugin_state)" ]; }
+plugin_current() { plugin_present && [ "$(marketplace_path)" = "$ROOT" ] && [ "$(plugin_state)" = "$VERSION true" ]; }
 
 # ---- symlinks -----------------------------------------------------------------------------
 # dest -> source
@@ -122,6 +126,14 @@ else
     echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] (Codex sandbox may write the store)"
 fi
 
+# --- skill mode: the plugin form must not stay active alongside the user-level skill --------
+if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
+    claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || claude plugin uninstall "$PLUGIN_ID" >/dev/null 2>&1 \
+        || { echo "ERROR: could not uninstall $PLUGIN_ID; skill mode would duplicate the plugin skill. Run: claude plugin uninstall $PLUGIN_ID" >&2; exit 1; }
+    plugin_present && { echo "ERROR: $PLUGIN_ID is still installed after uninstall; refusing a duplicate skill" >&2; exit 1; }
+    echo "removed   plugin $PLUGIN_ID (skill mode uses the user-level /codex-mailbox skill instead)"
+fi
+
 # --- plugin mode: Claude side through the plugin system ------------------------------------
 if [ "$PLUGIN" = 1 ]; then
     if [ -L "$CLAUDE_SKILL_LINK" ]; then
@@ -170,8 +182,11 @@ if [ "$PLUGIN" = 1 ]; then
     fi
 fi
 if [ "$CHECK" = 1 ]; then
-    if plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /agent-mailbox:codex-mailbox)"
+    if plugin_current && [ -L "$CLAUDE_SKILL_LINK" ]; then
+        echo "DUPLICATE both the plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
+    elif plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /agent-mailbox:codex-mailbox)"
     elif [ -L "$CLAUDE_SKILL_LINK" ]; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /codex-mailbox)"
+    elif plugin_present; then echo "STALE     plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $ROOT' (state='$(plugin_state)', marketplace='$(marketplace_path)'); run install.sh --plugin" >&2; status=1
     fi
 fi
 

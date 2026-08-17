@@ -98,5 +98,13 @@ out="$(env HOME="$RH" AGENT_MAILBOX_DIR="$TMP/store-X.Z" "$ROOT/install.sh" --ch
 assert_eq "$rc" 1
 echo "$out" | grep -q "MISSING.*writable_roots\|ACTION" && ok || fail "regex '.' matched a different store path in --check: $out"
 
+t "--check on an empty HOME is side-effect-free (does not let the claude CLI create its config)"
+EH="$TMP/home-empty"; mkdir -p "$EH"
+before="$(cd "$EH" && find . | sort | md5sum)"
+( cd "$EH" && env HOME="$EH" PATH="$EH/.local/bin:$PATH" AGENT_MAILBOX_DIR="$EH/store" "$ROOT/install.sh" --check >/dev/null 2>&1 ); rc=$?
+assert_eq "$rc" 1
+after="$(cd "$EH" && find . | sort | md5sum)"
+[ "$before" = "$after" ] && ok || fail "--check mutated an empty HOME: $(cd "$EH" && find . | head -5 | tr '\n' ' ')"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
