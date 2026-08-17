@@ -1,7 +1,11 @@
 #!/bin/bash
-# install.sh — link the agent-mailbox tool and both skills into the user's home.
-#   install.sh          install/refresh symlinks (existing real dirs are backed up, never deleted)
-#   install.sh --check  report status; exit 0 if fully installed, 1 otherwise
+# install.sh — link the agent-mailbox tool and skills into the user's home.
+#   install.sh           skill mode: symlink the CLI and BOTH skills (Claude skill = /codex-mailbox)
+#   install.sh --plugin  plugin mode: symlink the CLI and the Codex skill; install the Claude side as
+#                        the Claude Code plugin agent-mailbox@agent-mailbox (/agent-mailbox:codex-mailbox)
+#                        via `claude plugin marketplace add` + `claude plugin install`, and retire a
+#                        user-level ~/.claude/skills/codex-mailbox symlink so the skill is not duplicated
+#   install.sh --check   report status; exit 0 if fully installed (either mode), 1 otherwise
 set -euo pipefail
 
 if [ -z "${HOME:-}" ]; then
@@ -12,20 +16,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Backups of replaced real dirs/files go OUTSIDE the skills trees, otherwise a
 # backed-up SKILL.md is discovered as a duplicate skill.
 BACKUP_DIR="${AGENT_MAILBOX_BACKUP_DIR:-$ROOT/backups}"
-CHECK=0
+CHECK=0; PLUGIN=0
 case "$#:${1:-}" in
     0:) ;;
     1:--check) CHECK=1;;
-    1:-h|1:--help) sed -n '2,4p' "$0"; exit 0;;
-    *) echo "usage: install.sh [--check]   (unknown or surplus argument: '$*')" >&2; exit 1;;
+    1:--plugin) PLUGIN=1;;
+    1:-h|1:--help) sed -n '2,8p' "$0"; exit 0;;
+    *) echo "usage: install.sh [--check|--plugin]   (unknown or surplus argument: '$*')" >&2; exit 1;;
 esac
+PLUGIN_ID="agent-mailbox@agent-mailbox"
+CLAUDE_SKILL_LINK="$HOME/.claude/skills/codex-mailbox"
+
+plugin_installed() { command -v claude >/dev/null 2>&1 && claude plugin list 2>/dev/null | grep -q "^ *❯ *$PLUGIN_ID\b\|$PLUGIN_ID"; }
+marketplace_present() { claude plugin marketplace list 2>/dev/null | grep -q "agent-mailbox"; }
 
 # dest -> source
 LINKS=(
     "$HOME/.local/bin/agent-mailbox|$ROOT/bin/agent-mailbox"
-    "$HOME/.claude/skills/codex-mailbox|$ROOT/skills/claude/codex-mailbox"
     "$HOME/.codex/skills/claude-mailbox|$ROOT/skills/codex/claude-mailbox"
 )
+# The Claude skill is a symlink in skill mode; in plugin mode it comes from the plugin.
+# --check accepts either form.
+if [ "$PLUGIN" = 0 ] && ! { [ "$CHECK" = 1 ] && plugin_installed; }; then
+    LINKS+=("$CLAUDE_SKILL_LINK|$ROOT/skills/claude/codex-mailbox")
+fi
 
 status=0
 for pair in "${LINKS[@]}"; do
@@ -70,6 +84,36 @@ else
     mkdir -p "$(dirname "$CODEX_CFG")"
     { [ -f "$CODEX_CFG" ] && [ -n "$(tail -c1 "$CODEX_CFG")" ] && echo; printf '\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\n' "$STORE_DIR"; } >> "$CODEX_CFG"
     echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] (Codex sandbox may write the store)"
+fi
+
+# --- plugin mode: Claude side through the plugin system --------------------------------
+if [ "$PLUGIN" = 1 ]; then
+    command -v claude >/dev/null 2>&1 || { echo "ERROR: --plugin needs the 'claude' CLI on PATH." >&2; exit 1; }
+    if [ -L "$CLAUDE_SKILL_LINK" ]; then
+        rm -f "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (user-level skill would duplicate the plugin skill)"
+    elif [ -e "$CLAUDE_SKILL_LINK" ]; then
+        mkdir -p "$BACKUP_DIR"; bak="$BACKUP_DIR/codex-mailbox.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+        mv -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
+    fi
+    if marketplace_present; then
+        claude plugin marketplace update agent-mailbox >/dev/null 2>&1 || true
+        echo "ok        marketplace agent-mailbox ($ROOT) refreshed"
+    else
+        claude plugin marketplace add "$ROOT" >/dev/null || { echo "ERROR: claude plugin marketplace add $ROOT failed" >&2; exit 1; }
+        echo "added     marketplace agent-mailbox -> $ROOT"
+    fi
+    if plugin_installed; then
+        claude plugin update "$PLUGIN_ID" >/dev/null 2>&1 || true
+        echo "ok        plugin $PLUGIN_ID updated (restart Claude Code to apply)"
+    else
+        claude plugin install "$PLUGIN_ID" >/dev/null || { echo "ERROR: claude plugin install $PLUGIN_ID failed" >&2; exit 1; }
+        echo "installed plugin $PLUGIN_ID (skill: /agent-mailbox:codex-mailbox)"
+    fi
+fi
+if [ "$CHECK" = 1 ]; then
+    if plugin_installed; then echo "ok        Claude side: plugin $PLUGIN_ID (skill /agent-mailbox:codex-mailbox)"
+    elif [ -L "$CLAUDE_SKILL_LINK" ]; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /codex-mailbox)"
+    fi
 fi
 
 case ":$PATH:" in

@@ -42,8 +42,9 @@ may be open at once across repositories, worktrees, and sessions).
 3. `agent-mailbox publish <ID>`. The exchange is invisible to Claude until
    published; after publish the prompt is frozen (hash-bound). To change it,
    create a new exchange.
-4. Tell the user: run `/codex-mailbox <ID>` in Claude Code, in any checkout of
-   that repository.
+4. Tell the user: run `/codex-mailbox <ID>` (or `/agent-mailbox:codex-mailbox
+   <ID>` where the tool is installed as a Claude Code plugin) in Claude Code, in
+   any checkout of that repository.
 
 ## Waiting for the response (keep working meanwhile)
 

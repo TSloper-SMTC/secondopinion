@@ -1,0 +1,14 @@
+{
+  "name": "agent-mailbox",
+  "description": "Tim Sloper's agent tooling: the agent-mailbox Codex→Claude Code review-exchange plugin.",
+  "owner": { "name": "Tim Sloper", "email": "tim.sloper@outlook.com" },
+  "plugins": [
+    {
+      "name": "agent-mailbox",
+      "source": "./",
+      "version": "1.3.0",
+      "description": "Global file-based mailbox for Codex→Claude Code review exchanges (codex-mailbox skill).",
+      "author": { "name": "Tim Sloper" }
+    }
+  ]
+}

@@ -9,8 +9,9 @@ Answer Codex→Claude review exchanges held in the global `agent-mailbox` store
 (`~/.agent-mailbox`; tool `agent-mailbox` on PATH; one directory per exchange,
 any number open at once across repositories and sessions).
 
-Use only when the user invokes `/codex-mailbox [ID]` or asks to process the
-Codex mailbox.
+Use only when the user invokes `/codex-mailbox [ID]` (skill-mode install) or
+`/agent-mailbox:codex-mailbox [ID]` (plugin-mode install), or asks to process
+the Codex mailbox.
 
 ## Workflow
 

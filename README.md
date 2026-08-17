@@ -19,14 +19,32 @@ States: `draft → published → claimed → answered → archived`.
 
 ## Install
 
+Two equivalent forms; pick one per machine.
+
+**Skill mode (default)** — symlinks the CLI and both skills into `$HOME`:
 ```bash
-~/tools/agent-mailbox/install.sh        # symlinks bin + both skills into $HOME
+~/tools/agent-mailbox/install.sh        # ~/.local/bin/agent-mailbox, ~/.claude/skills/codex-mailbox, ~/.codex/skills/claude-mailbox
 ~/tools/agent-mailbox/install.sh --check
 ```
+Claude Code invokes the skill as `/codex-mailbox [ID]`.
 
-Links: `~/.local/bin/agent-mailbox`, `~/.claude/skills/codex-mailbox`
-(Claude Code, all projects), `~/.codex/skills/claude-mailbox` (Codex, all
-projects). Also creates the store (0700) and adds it to Codex's sandbox as a
+**Plugin mode** — the repo is also a Claude Code plugin *and* its own
+marketplace (`.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`;
+a `.codex-plugin/plugin.json` is included for Codex's plugin format):
+```bash
+~/tools/agent-mailbox/install.sh --plugin
+#  = symlink CLI + Codex skill, then
+#    claude plugin marketplace add ~/tools/agent-mailbox && claude plugin install agent-mailbox@agent-mailbox
+#    (retires a user-level ~/.claude/skills/codex-mailbox symlink so the skill is not listed twice)
+```
+Claude Code then invokes the skill as `/agent-mailbox:codex-mailbox [ID]`;
+update with `claude plugin update agent-mailbox@agent-mailbox` after pulling
+the repo. `claude plugin validate --strict .claude-plugin/plugin.json` and the
+marketplace manifest pass. The `agent-mailbox` CLI itself is not part of the
+plugin model (plugins cannot manage PATH), which is why install.sh still
+symlinks it.
+
+Either way `install.sh --check` reports the installed form. Also creates the store (0700) and adds it to Codex's sandbox as a
 writable root (`[sandbox_workspace_write] writable_roots` in
 `~/.codex/config.toml`) — without that, Codex's workspace-write sandbox sees
 `$HOME` read-only and `agent-mailbox new` fails. Restart sessions to load
