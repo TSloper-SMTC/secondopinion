@@ -50,7 +50,11 @@ human relay and nothing installed on the responding side.
   handshakes startup (nonzero `responder=startup-failed`), warns inside
   PID-namespaced sandboxes whose teardown kills detached responders, and
   `ask --attach ID` re-launches a responder for an existing published
-  exchange; `ask`/`review --max-turns` sizes the responder turn budget.
+  exchange; `ask`/`review --max-turns` sizes the responder turn budget. The
+  CLI's final line pairs `main \"$@\"; exit` so a running invocation never
+  re-reads its own script file — an in-place update of the dev tree under a
+  blocked `ask` previously got parsed as shell input after the response
+  (exit 2, \"syntax error near unexpected token\").
 - Release hardening (final Codex QA round): `ask` refuses unreadable respond
   instructions before creating an exchange and rejects a zero timeout (GNU
   `timeout 0` = no limit); a responder that claims and then dies is reported as

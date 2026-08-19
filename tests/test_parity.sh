@@ -477,5 +477,37 @@ else
   echo "note: unprivileged user+pid namespaces unavailable; sandbox reproduction skipped"
 fi
 
+# ===========================================================================
+# Hot-update safety: a running invocation must never parse bytes from a replacement
+
+t "hot update: enlarging the CLI in place while an invocation is blocked does not corrupt that invocation"
+mkdir -p "$TMP/hot/bin" "$TMP/hot/skills/secondopinion-respond"
+cp "$AM" "$TMP/hot/bin/secondopinion"; chmod +x "$TMP/hot/bin/secondopinion"
+cp "$HERE/../plugins/secondopinion/skills/secondopinion-respond/SKILL.md" "$TMP/hot/skills/secondopinion-respond/SKILL.md"
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$TMP/hot/bin/secondopinion" ask --topic "hot update" --file "$TMP/request.md" --timeout 3 >/dev/null 2>"$TMP/hot.err") &
+AP=$!
+sleep 1
+printf '\n)))appended-by-an-updater(((\n' >> "$TMP/hot/bin/secondopinion"   # same-inode enlargement, like an in-place editor
+wait "$AP"; rc=$?
+assert_eq "$rc" 124 "(the blocked invocation must finish its own lifecycle, not the replacement's)"
+grep -qi "syntax error" "$TMP/hot.err" && fail "old invocation parsed bytes from the replacement: $(cat "$TMP/hot.err")" || ok
+# truncate-and-rewrite variant (the exact shape of an in-place editor's write_text)
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$TMP/hot/bin/secondopinion" ask --topic "hot rewrite" --file "$TMP/request.md" --timeout 3 >/dev/null 2>"$TMP/hot2.err") &
+AP=$!
+sleep 1
+python3 - "$TMP/hot/bin/secondopinion" <<'PYEOF'
+import sys
+path = sys.argv[1]
+body = open(path).read()
+open(path, "w").write(body + "\n# enlarged in place\n" + ("x=$(true)\n" * 400))   # same inode, larger file
+PYEOF
+wait "$AP"; rc=$?
+assert_eq "$rc" 124 "(rewrite variant: blocked invocation unaffected)"
+grep -qi "syntax error" "$TMP/hot2.err" && fail "old invocation parsed bytes from the rewritten file: $(cat "$TMP/hot2.err")" || ok
+# The property is guaranteed by one structural fact: the CLI's final executed line pairs
+# main with exit, so bash never reads the script fd again after main returns. Bash's
+# re-read behavior is buffer-timing dependent, so this line IS the regression guard.
+assert_eq "$(tail -1 "$AM")" 'main "$@"; exit' "(exit-guard on the final line)"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

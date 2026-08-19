@@ -1375,4 +1375,9 @@ main() {
     esac
 }
 
-main "$@"
+# The exit on the SAME line as main is load-bearing: bash otherwise reads more of this
+# file after main returns, at its old byte offset — so an in-place update of the script
+# while an invocation is blocked (e.g. a dev-tree edit under a running `ask`) would be
+# parsed as shell input and crash that invocation ("syntax error near unexpected token").
+# With the paired exit, a running invocation never touches the script fd again.
+main "$@"; exit
