@@ -6,10 +6,21 @@ Renamed from `agent-mailbox` to **secondopinion**; first version that needs no
 human relay.
 
 - `secondopinion ask`: one command creates and publishes the exchange, runs a
-  headless Claude Code responder in the calling checkout
-  (`claude -p "/secondopinion-respond <ID>" --permission-mode dontAsk` plus a
-  tool allowlist; `--write` = `acceptEdits`), waits, validates and prints the
-  answer (`--background`, `--timeout`, `--model`, `--json`).
+  headless Claude Code responder in the calling checkout, waits, validates and
+  prints the answer (`--background`, `--timeout`, `--model`, `--json`). The
+  responder prompt is **self-contained** — the full respond workflow travels
+  inline plus `--permission-mode dontAsk` and a tool allowlist (`--write` =
+  `acceptEdits`) — so nothing has to be installed in Claude, only the `claude`
+  CLI on PATH: the mirror of the Claude→Codex plugin, which installs nothing
+  in Codex.
+- `scripts/install.sh` default is the **true Codex plugin**
+  (`codex plugin marketplace add` + `codex plugin add secondopinion@secondopinion`)
+  and leaves the Claude side empty (removing any earlier secondopinion
+  skill/plugin there). `--claude` opts into the Claude Code plugin for
+  interactive responding; `--skills` is the symlink form for setups without
+  plugin support; `--plugin` is a deprecated alias for `--claude`. `--check`
+  requires the Codex side in exactly one current form and accepts an absent
+  Claude side.
 - Standard plugin layout: `skills/<name>/SKILL.md`, `bin/`, `scripts/`,
   `LICENSE`, `CHANGELOG.md`; both manifests use the default `skills/` scan.
 - Compatibility: `agent-mailbox` remains a deprecated alias, `AGENT_MAILBOX_*`

@@ -1,11 +1,19 @@
 #!/bin/bash
-# install.sh — link the secondopinion tool and skills into the user's home.
-#   install.sh           skill mode: symlink the CLI and BOTH skills (Claude skill = /secondopinion-respond)
-#   install.sh --plugin  plugin mode: symlink the CLI and the Codex skill; install the Claude side as
-#                        the Claude Code plugin secondopinion@secondopinion (/secondopinion:secondopinion-respond)
-#                        via `claude plugin marketplace add` + `claude plugin install`, and retire a
-#                        user-level ~/.claude/skills/secondopinion-respond symlink so the skill is not duplicated
-#   install.sh --check   report status; exit 0 if fully installed (either mode), 1 otherwise
+# install.sh — install secondopinion for Codex (and, optionally, Claude Code).
+#   install.sh           default: the Codex PLUGIN (codex plugin marketplace add + codex plugin add),
+#                        the CLI symlink, the store and the Codex sandbox config. NOTHING is installed
+#                        in Claude: `secondopinion ask` carries the respond instructions inline and
+#                        needs only the `claude` CLI on PATH (the mirror of the Claude->Codex plugin,
+#                        which installs nothing in Codex).
+#   install.sh --claude  additionally install the Claude Code plugin secondopinion@secondopinion, for
+#                        interactive responding (/secondopinion:secondopinion-respond). Optional.
+#   install.sh --skills  symlink form instead of plugins: ~/.codex/skills/secondopinion-request
+#                        (with --claude: ~/.claude/skills/secondopinion-respond). For setups without
+#                        plugin support. Mutually exclusive with the plugin form; switching retires
+#                        the other form.
+#   install.sh --plugin  deprecated alias for --claude.
+#   install.sh --check   report status; exit 0 if fully installed (the Codex side in exactly one
+#                        current form; the Claude side may be absent, but must be current if present).
 set -euo pipefail
 
 if [ -z "${HOME:-}" ]; then
@@ -26,14 +34,17 @@ backup_path() { # basename -> a fresh, non-clobbering path under BACKUP_DIR (sam
     while [ -e "$cand" ] || [ -L "$cand" ]; do cand="$base-$n"; n=$((n+1)); done
     echo "$cand"
 }
-CHECK=0; PLUGIN=0
-case "$#:${1:-}" in
-    0:) ;;
-    1:--check) CHECK=1;;
-    1:--plugin) PLUGIN=1;;
-    1:-h|1:--help) sed -n '2,8p' "$0"; exit 0;;
-    *) echo "usage: install.sh [--check|--plugin]   (unknown or surplus argument: '$*')" >&2; exit 1;;
-esac
+CHECK=0; SKILLS=0; CLAUDE=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK=1;;
+        --skills) SKILLS=1;;
+        --claude) CLAUDE=1;;
+        --plugin) CLAUDE=1; echo "note      --plugin is deprecated; it now means --claude (the Codex plugin is always installed by default)" >&2;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0;;
+        *) echo "usage: install.sh [--check] [--claude] [--skills]   (unknown argument: '$arg')" >&2; exit 1;;
+    esac
+done
 PLUGIN_ID="secondopinion@secondopinion"
 MARKETPLACE="secondopinion"
 CLAUDE_SKILL_LINK="$HOME/.claude/skills/secondopinion-respond"
@@ -48,8 +59,12 @@ case "$STORE_DIR" in
     *[\"\\]*|*[[:cntrl:]]*) printf 'ERROR: store path %q contains a quote, backslash or control character; choose another SECONDOPINION_DIR.\n' "$STORE_DIR" >&2; exit 1;;
 esac
 have_claude() { command -v claude >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; }
-if [ "$PLUGIN" = 1 ] && ! have_claude; then
-    echo "ERROR: --plugin needs the 'claude' CLI and python3 on PATH (nothing was installed)." >&2; exit 1
+have_codex_cli() { command -v codex >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; }
+if [ "$CHECK" = 0 ] && [ "$SKILLS" = 0 ] && ! have_codex_cli; then
+    echo "ERROR: the default install form is the Codex plugin and needs the 'codex' CLI and python3 on PATH; use --skills for a symlink-only install (nothing was installed)." >&2; exit 1
+fi
+if [ "$CHECK" = 0 ] && [ "$CLAUDE" = 1 ] && [ "$SKILLS" = 0 ] && ! have_claude; then
+    echo "ERROR: --claude needs the 'claude' CLI and python3 on PATH (nothing was installed)." >&2; exit 1
 fi
 
 # ---- Codex sandbox config: semantic membership of the store in
@@ -266,35 +281,48 @@ except Exception:
 }
 
 
-# --- skill mode: the plugin form must not stay active alongside the user-level skill --------
-# Done BEFORE any symlink is created: the skill symlink is only added once the plugin is
-# confirmed absent by a successful re-inspection (a stateful CLI failure must not leave both).
-if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
+# --- retire forms the chosen mode does not use. Done BEFORE any symlink is created: a skill
+# symlink is only added once the same-side plugin is confirmed absent by a successful
+# re-inspection (a stateful CLI failure must not leave both forms active).
+# The Claude plugin stays ONLY for `--claude` in plugin form; by default nothing remains
+# installed in Claude.
+if [ "$CHECK" = 0 ] && { [ "$CLAUDE" = 0 ] || [ "$SKILLS" = 1 ]; } && plugin_present; then
     claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 || claude plugin uninstall "$PLUGIN_ID" >/dev/null 2>&1 \
-        || { echo "ERROR: could not uninstall $PLUGIN_ID; skill mode would duplicate the plugin skill. Run: claude plugin uninstall $PLUGIN_ID" >&2; exit 1; }
+        || { echo "ERROR: could not uninstall the Claude plugin $PLUGIN_ID. Run: claude plugin uninstall $PLUGIN_ID" >&2; exit 1; }
     refresh_plugins
     if [ "$PLUGIN_INSPECT" != "ok" ] || plugin_present; then
-        echo "ERROR: could not confirm that $PLUGIN_ID is absent after uninstall (inspection=$PLUGIN_INSPECT, state='$PLUGIN_STATE'); refusing to create the user-level skill. Re-run install.sh." >&2; exit 1
+        echo "ERROR: could not confirm that $PLUGIN_ID is absent after uninstall (inspection=$PLUGIN_INSPECT, state='$PLUGIN_STATE'); stopping before creating anything in its place. Re-run install.sh." >&2; exit 1
     fi
-    echo "removed   plugin $PLUGIN_ID (skill mode uses the user-level /secondopinion-respond skill instead)"
+    if [ "$CLAUDE" = 1 ]; then echo "removed   Claude plugin $PLUGIN_ID (--skills uses the user-level /secondopinion-respond skill instead)"
+    else echo "removed   Claude plugin $PLUGIN_ID (nothing needs to be installed in Claude; re-add with install.sh --claude)"; fi
 fi
-if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && codex_plugin_present; then
-    codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 || { echo "ERROR: could not remove the Codex plugin $PLUGIN_ID; skill mode would duplicate the Codex skill. Run: codex plugin remove $PLUGIN_ID" >&2; exit 1; }
+# The Claude user-level skill stays ONLY for `--skills --claude`.
+if [ "$CHECK" = 0 ] && ! { [ "$SKILLS" = 1 ] && [ "$CLAUDE" = 1 ]; }; then
+    if [ -L "$CLAUDE_SKILL_LINK" ]; then
+        rm -f -- "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (nothing needs to be installed in Claude; re-add with install.sh --skills --claude)"
+    elif [ -e "$CLAUDE_SKILL_LINK" ]; then
+        mkdir -p "$BACKUP_DIR"; bak="$(backup_path secondopinion-respond)"
+        mv -T -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
+    fi
+fi
+# The Codex plugin is removed only in --skills form.
+if [ "$SKILLS" = 1 ] && [ "$CHECK" = 0 ] && codex_plugin_present; then
+    codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 || { echo "ERROR: could not remove the Codex plugin $PLUGIN_ID; --skills would duplicate the Codex skill. Run: codex plugin remove $PLUGIN_ID" >&2; exit 1; }
     refresh_codex
     if [ "$CODEX_INSPECT" != "ok" ] || codex_plugin_present; then
         echo "ERROR: could not confirm that the Codex plugin $PLUGIN_ID is absent after removal (inspection=$CODEX_INSPECT, state='$CODEX_STATE'); refusing to create the Codex skill symlink." >&2; exit 1
     fi
-    echo "removed   Codex plugin $PLUGIN_ID (skill mode uses the ~/.codex/skills symlink instead)"
+    echo "removed   Codex plugin $PLUGIN_ID (--skills uses the ~/.codex/skills symlink instead)"
 fi
 
 # ---- symlinks -----------------------------------------------------------------------------
 # Parallel arrays (a delimiter inside HOME must not be able to split a tuple).
 DESTS=("$HOME/.local/bin/secondopinion")
 SRCS=("$ROOT/bin/secondopinion")
-CODEX_SKILL_LINK="$HOME/.codex/skills/secondopinion-request"
-# The Codex skill is a symlink in skill mode (and in plugin mode when the codex CLI is absent);
-# otherwise it comes from the Codex plugin. --check accepts either form.
-if ! { [ "$PLUGIN" = 1 ] && have_codex; } && ! { [ "$CHECK" = 1 ] && codex_plugin_current; }; then
+CODEX_SKILL_LINK="$(codex_home)/skills/secondopinion-request"
+# The Codex skill is a symlink only in --skills form; otherwise it comes from the Codex
+# plugin. --check reports the side explicitly below (either form accepted).
+if [ "$CHECK" = 0 ] && [ "$SKILLS" = 1 ]; then
     DESTS+=("$CODEX_SKILL_LINK"); SRCS+=("$ROOT/skills/secondopinion-request")
 fi
 # ~/.local/bin/agent-mailbox is the deprecated 1.x alias (same binary; prints a warning). It is
@@ -306,9 +334,9 @@ if [ "$CHECK" != 1 ]; then
         if [ -L "$old" ]; then rm -f -- "$old"; echo "retired   $old (1.x skill name)"; fi
     done
 fi
-# The Claude skill is a symlink in skill mode; in plugin mode it comes from the plugin.
-# --check accepts either form.
-if [ "$PLUGIN" = 0 ] && ! { [ "$CHECK" = 1 ] && plugin_current; }; then
+# The Claude skill is a symlink only for --skills --claude; with --claude alone it comes
+# from the Claude plugin; by default the Claude side stays empty.
+if [ "$CHECK" = 0 ] && [ "$SKILLS" = 1 ] && [ "$CLAUDE" = 1 ]; then
     DESTS+=("$CLAUDE_SKILL_LINK"); SRCS+=("$ROOT/skills/secondopinion-respond")
 fi
 link_ok() { # dest src -> both resolve and to the same target
@@ -378,14 +406,32 @@ else
     echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] and network_access = true (Codex sandbox may write the store and reach Claude)"
 fi
 
-# --- plugin mode: Claude side through the plugin system ------------------------------------
-if [ "$PLUGIN" = 1 ]; then
-    if [ -L "$CLAUDE_SKILL_LINK" ]; then
-        rm -f "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (user-level skill would duplicate the plugin skill)"
-    elif [ -e "$CLAUDE_SKILL_LINK" ]; then
-        mkdir -p "$BACKUP_DIR"; bak="$(backup_path secondopinion-respond)"
-        mv -T -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
+# --- Codex side, default form: the true Codex plugin from this repo's marketplace ----------
+if [ "$CHECK" = 0 ] && [ "$SKILLS" = 0 ]; then
+    if [ -L "$CODEX_SKILL_LINK" ]; then rm -f -- "$CODEX_SKILL_LINK"; echo "retired   $CODEX_SKILL_LINK (the Codex skill now comes from the plugin)"; fi
+    cmr="$(codex_marketplace_root)"
+    if [ -n "$cmr" ] && [ "$cmr" != "$REPO_ROOT" ]; then
+        codex plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 || true; echo "removed   stale Codex marketplace $MARKETPLACE -> $cmr"; cmr=""
     fi
+    if [ -z "$cmr" ]; then
+        codex plugin marketplace add "$REPO_ROOT" >/dev/null 2>&1 || { echo "ERROR: codex plugin marketplace add $REPO_ROOT failed" >&2; exit 1; }
+        echo "added     Codex marketplace $MARKETPLACE -> $REPO_ROOT"
+    fi
+    refresh_codex
+    if ! codex_plugin_current; then
+        codex_plugin_present && { codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 || true; }
+        codex plugin add "$PLUGIN_ID" >/dev/null 2>&1 || { echo "ERROR: codex plugin add $PLUGIN_ID failed" >&2; exit 1; }
+        refresh_codex
+    fi
+    if codex_plugin_current; then
+        echo "ok        Codex plugin $PLUGIN_ID $VERSION enabled from $REPO_ROOT (restart Codex to apply)"
+    else
+        echo "ERROR: Codex plugin verification failed: state='$CODEX_STATE' marketplace='$CODEX_MARKET_ROOT' (want '$VERSION true' from $REPO_ROOT)" >&2; exit 1
+    fi
+fi
+
+# --- Claude side, only with --claude in plugin form: the Claude Code plugin ----------------
+if [ "$CHECK" = 0 ] && [ "$CLAUDE" = 1 ] && [ "$SKILLS" = 0 ]; then
     mp="$(marketplace_path)"
     if [ -n "$mp" ] && [ "$mp" != "$REPO_ROOT" ]; then
         # A marketplace of our name pointing elsewhere (moved or stale checkout): replace it.
@@ -423,49 +469,33 @@ if [ "$PLUGIN" = 1 ]; then
     fi
     refresh_plugins
     if plugin_current; then
-        echo "ok        plugin $PLUGIN_ID $VERSION enabled from $REPO_ROOT (skill: /secondopinion:secondopinion-respond; restart Claude Code to apply)"
+        echo "ok        Claude plugin $PLUGIN_ID $VERSION enabled from $REPO_ROOT (skill: /secondopinion:secondopinion-respond; restart Claude Code to apply)"
     else
         echo "ERROR: plugin verification failed: state='$(plugin_state)' marketplace='$(marketplace_path)' (want '$VERSION true' from $REPO_ROOT)" >&2; exit 1
-    fi
-    # Codex side: same marketplace repo through `codex plugin`; skill symlink retired.
-    if have_codex; then
-        if [ -L "$CODEX_SKILL_LINK" ]; then rm -f -- "$CODEX_SKILL_LINK"; echo "retired   $CODEX_SKILL_LINK (Codex skill now comes from the plugin)"; fi
-        cmr="$(codex_marketplace_root)"
-        if [ -n "$cmr" ] && [ "$cmr" != "$REPO_ROOT" ]; then
-            codex plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 || true; echo "removed   stale Codex marketplace $MARKETPLACE -> $cmr"; cmr=""
-        fi
-        if [ -z "$cmr" ]; then
-            codex plugin marketplace add "$REPO_ROOT" >/dev/null 2>&1 || { echo "ERROR: codex plugin marketplace add $REPO_ROOT failed" >&2; exit 1; }
-            echo "added     Codex marketplace $MARKETPLACE -> $REPO_ROOT"
-        fi
-        refresh_codex
-        if ! codex_plugin_current; then
-            codex_plugin_present && { codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 || true; }
-            codex plugin add "$PLUGIN_ID" >/dev/null 2>&1 || { echo "ERROR: codex plugin add $PLUGIN_ID failed" >&2; exit 1; }
-            refresh_codex
-        fi
-        if codex_plugin_current; then
-            echo "ok        Codex plugin $PLUGIN_ID $VERSION enabled from $REPO_ROOT (restart Codex to apply)"
-        else
-            echo "ERROR: Codex plugin verification failed: state='$CODEX_STATE' marketplace='$CODEX_MARKET_ROOT' (want '$VERSION true' from $REPO_ROOT)" >&2; exit 1
-        fi
-    else
-        echo "note      'codex' CLI not on PATH: the Codex skill was symlinked instead of installed as a plugin"
     fi
 fi
 if [ "$CHECK" = 1 ]; then
     [ "${INSPECT_FAILED:-0}" = 1 ] && status=1
+    # Codex side: REQUIRED, in exactly one current form.
     if codex_plugin_current && { [ -e "$CODEX_SKILL_LINK" ] || [ -L "$CODEX_SKILL_LINK" ]; }; then
-        echo "DUPLICATE both the Codex plugin $PLUGIN_ID and the skill symlink $CODEX_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
+        echo "DUPLICATE both the Codex plugin $PLUGIN_ID and the skill symlink $CODEX_SKILL_LINK are active; run install.sh (plugin) or install.sh --skills to pick one" >&2; status=1
     elif codex_plugin_current; then echo "ok        Codex side: plugin $PLUGIN_ID $VERSION"
-    elif [ -L "$CODEX_SKILL_LINK" ]; then echo "ok        Codex side: skill symlink $CODEX_SKILL_LINK"
-    elif codex_plugin_present; then echo "STALE     Codex plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$CODEX_STATE', marketplace='$CODEX_MARKET_ROOT'); run install.sh --plugin" >&2; status=1
+    elif link_ok "$CODEX_SKILL_LINK" "$ROOT/skills/secondopinion-request"; then echo "ok        Codex side: skill symlink $CODEX_SKILL_LINK"
+    elif codex_plugin_present; then echo "STALE     Codex plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$CODEX_STATE', marketplace='$CODEX_MARKET_ROOT'); run install.sh" >&2; status=1
+    elif [ -e "$CODEX_SKILL_LINK" ] || [ -L "$CODEX_SKILL_LINK" ]; then
+        echo "STALE     Codex side: $CODEX_SKILL_LINK exists but is not a symlink to $ROOT/skills/secondopinion-request; run install.sh or install.sh --skills" >&2; status=1
+    else echo "MISSING   Codex side: neither the Codex plugin $PLUGIN_ID nor the skill symlink $CODEX_SKILL_LINK; run install.sh (plugin) or install.sh --skills" >&2; status=1
     fi
+    # Claude side: OPTIONAL — absent is fine (headless ask needs only the claude CLI);
+    # anything that IS present must be current and unique.
     if plugin_current && { [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; }; then
-        echo "DUPLICATE both the plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
+        echo "DUPLICATE both the Claude plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh --claude or install.sh --skills --claude to pick one" >&2; status=1
     elif plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /secondopinion:secondopinion-respond)"
-    elif [ -L "$CLAUDE_SKILL_LINK" ]; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /secondopinion-respond)"
-    elif plugin_present; then echo "STALE     plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$(plugin_state)', marketplace='$(marketplace_path)'); run install.sh --plugin" >&2; status=1
+    elif link_ok "$CLAUDE_SKILL_LINK" "$ROOT/skills/secondopinion-respond"; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /secondopinion-respond)"
+    elif plugin_present; then echo "STALE     Claude plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$(plugin_state)', marketplace='$(marketplace_path)'); run install.sh --claude (or plain install.sh to remove it)" >&2; status=1
+    elif [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; then
+        echo "STALE     Claude side: $CLAUDE_SKILL_LINK exists but is not a symlink to $ROOT/skills/secondopinion-respond; run install.sh (retires it) or install.sh --skills --claude" >&2; status=1
+    else echo "ok        Claude side: nothing installed (optional — headless ask needs only the claude CLI on PATH)"
     fi
 fi
 
@@ -478,6 +508,6 @@ esac
 if [ "$CHECK" = 1 ]; then
     [ "$status" = 0 ] && echo "installed=yes" || echo "installed=no"
 else
-    echo "done: restart Claude Code / Codex sessions to load the skills"
+    echo "done: restart Codex sessions to load the plugin/skill (and Claude Code, if --claude was used)"
 fi
 exit "$status"

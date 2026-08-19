@@ -9,17 +9,19 @@ Answer second-opinion exchanges held in the global `secondopinion` store
 (`~/.secondopinion`; tool `secondopinion` on PATH; one directory per exchange,
 any number open at once across repositories and sessions).
 
-Use when the user invokes `/secondopinion-respond [ID]` (skill-mode install) or
-`/secondopinion:secondopinion-respond [ID]` (plugin-mode install), asks to
+Use when the user invokes `/secondopinion:secondopinion-respond [ID]` (Claude
+plugin install) or `/secondopinion-respond [ID]` (skill install), asks to
 process pending second-opinion requests, or when you are running headlessly
-because `secondopinion ask` started you with `-p "/secondopinion-respond <ID>"`
-— in that case there is no user: never wait for input, follow this workflow to
-the end, and treat the request as read-only unless it says otherwise.
+because `secondopinion ask` handed you these instructions inline (no Claude-side
+install exists in that case) — then there is no user: never wait for input,
+follow this workflow to the end, and treat the request as read-only unless it
+says otherwise.
 
 ## Workflow
 
 1. **Preflight**: `command -v secondopinion`. If missing, tell the user to run
-   `~/tools/secondopinion/scripts/install.sh` and stop.
+   `plugins/secondopinion/scripts/install.sh` from the secondopinion checkout
+   and stop.
 2. **Find work**
    - With an ID: `secondopinion status <ID>`. Proceed only if `state=published`
      and `prompt_ok=yes`. If `state=claimed`: proceed only if THIS session still

@@ -13,7 +13,7 @@ the answer.
 ## Preconditions
 
 - `command -v secondopinion` must succeed. If not, tell the user to run
-  `~/tools/secondopinion/scripts/install.sh` and stop.
+  `plugins/secondopinion/scripts/install.sh` from the secondopinion checkout and stop.
 - Run it from the checkout the request is about: the exchange records that
   checkout's `Repo`, `Git-Common-Dir`, `Branch`, `Commit`, `Dirty-State` and
   your `CODEX_THREAD_ID`, and Claude works in exactly that path.

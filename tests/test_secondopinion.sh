@@ -615,7 +615,7 @@ cat > "$STUB_DIR/claude" <<'STUB'
 printf '%s\n' "$@" > "${STUB_ARGV_FILE:?}"
 printf '%s\n' "$PWD" > "${STUB_CWD_FILE:?}"
 [ -t 0 ] && echo "stdin-is-tty" >> "${STUB_ARGV_FILE}"
-id=""; prev=""; for a in "$@"; do if [ "$prev" = "-p" ]; then id="${a#/secondopinion-respond }"; fi; prev="$a"; done
+id=""; prev=""; for a in "$@"; do if [ "$prev" = "-p" ]; then id="$(printf '%s\n' "$a" | sed -n 's/^Exchange-ID: //p' | head -1)"; fi; prev="$a"; done
 case "${STUB_MODE:-answer}" in
   answer)
     tok="$("$STUB_AM" claim "$id" --owner stub 2>/dev/null | awk -F= '/^claim_token=/{print $2}')"
@@ -639,7 +639,12 @@ assert_eq "$("$AM" status "$IDASK" | val state)" "answered"
 assert_grep "Please check the thing." "$("$AM" path "$IDASK")/prompt.md"          # request text became the Task section
 assert_not_grep "Replace this section" "$("$AM" path "$IDASK")/prompt.md"
 assert_eq "$(cat "$STUB_CWD_FILE")" "$TMP/repoA-wt" "(responder cwd = the checkout the request was made from)"
-grep -q -- "^/secondopinion-respond $IDASK$" "$STUB_ARGV_FILE" && ok || fail "responder was not invoked with the skill + id: $(cat "$STUB_ARGV_FILE" | tr '\n' ' ')"
+# The prompt must be SELF-CONTAINED (mirror of the Claude->Codex plugin, which installs
+# nothing in Codex): the full respond workflow inline + the id; no Claude-side skill/plugin.
+grep -q -- "^Exchange-ID: $IDASK$" "$STUB_ARGV_FILE" && ok || fail "prompt must end by naming the exchange: 'Exchange-ID: $IDASK'"
+grep -q -- "secondopinion claim" "$STUB_ARGV_FILE" && ok || fail "prompt must inline the respond workflow (self-contained; nothing installed in Claude)"
+grep -q -- "^/secondopinion-respond" "$STUB_ARGV_FILE" && fail "prompt must not invoke a Claude-side slash command" || ok
+grep -q -- "^---$" "$STUB_ARGV_FILE" && fail "skill frontmatter must be stripped from the inline prompt" || ok
 grep -q -- "^dontAsk$" "$STUB_ARGV_FILE" && ok || fail "default (review) profile must use --permission-mode dontAsk"
 grep -q -- "^--no-session-persistence$" "$STUB_ARGV_FILE" && ok || fail "responder must not persist sessions"
 grep -q "stdin-is-tty" "$STUB_ARGV_FILE" && fail "responder stdin must be /dev/null" || ok
@@ -677,6 +682,14 @@ out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$TMP/does-not-exist" "$AM" as
 assert_eq "$rc" 1
 assert_grep "claude" <(echo "$out")
 assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count"
+
+t "ask: refuses when the respond instructions are missing next to the CLI, creates no exchange"
+mkdir -p "$TMP/lonely/bin"; cp "$AM" "$TMP/lonely/bin/secondopinion"; chmod +x "$TMP/lonely/bin/secondopinion"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$TMP/lonely/bin/secondopinion" ask --topic "no skill" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc without the skill file)"
+assert_grep "secondopinion-respond/SKILL.md" <(echo "$out")
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange created)"
 
 t "ask: task text via --task and via stdin (-)"
 out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask task" --task "Inline task text" --timeout 60 2>/dev/null)"; rc=$?

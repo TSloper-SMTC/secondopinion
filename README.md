@@ -4,8 +4,12 @@ Sealed, verifiable second-opinion exchanges between AI coding agents — today
 Codex → Claude Code — with **no human relay**: from Codex, one command publishes
 a hash-bound request recorded against the exact checkout, runs a headless
 Claude Code responder that never prompts, and returns the validated answer.
-Works across repositories, git worktrees and sessions. Ships as a bash CLI, a
-Claude Code plugin and a Codex plugin (this repo is a marketplace for both).
+Works across repositories, git worktrees and sessions. Ships as a **true Codex
+plugin** plus a bash CLI; **nothing is installed in Claude** — the responder
+prompt is self-contained and needs only the `claude` CLI on PATH, the exact
+mirror of the Claude→Codex plugin, which installs nothing in Codex. (An
+optional Claude Code plugin exists for interactive responding; this repo is a
+marketplace for both.)
 
 ```
 ~/.secondopinion/
@@ -34,17 +38,21 @@ section and publishes it (prompt frozen by SHA-256); (2) starts a headless
 Claude Code in that checkout:
 
 ```
-claude -p "/secondopinion-respond <ID>" --permission-mode dontAsk \
+claude -p "<the full secondopinion-respond workflow, inlined>\n…\nExchange-ID: <ID>" \
+       --permission-mode dontAsk \
        --allowedTools Bash,Read,Grep,Glob,Write --disallowedTools Edit,NotebookEdit,WebFetch,WebSearch \
        --no-session-persistence --max-turns 60 --output-format json
 ```
 
-`dontAsk` is the analogue of the Codex plugin's `approvalPolicy: never`: anything
-not on the allowlist is denied instead of asked. Claude runs the same
-`secondopinion-respond` skill a human would: verifies the checkout matches the
-header, reads that repository's `AGENTS.md`/`CLAUDE.md`, claims the exchange
-(atomic, one-use token), does the work, and publishes a write-once, hash-bound
-response from a temp file outside the repository. (3) `ask` waits, validates
+The prompt is **self-contained**: `ask` inlines the respond instructions shipped
+next to the CLI, so no skill, plugin or configuration has to exist in Claude —
+only the `claude` binary. `dontAsk` is the analogue of the Codex plugin's
+`approvalPolicy: never`: anything not on the allowlist is denied instead of
+asked. Claude follows the same `secondopinion-respond` workflow a human session
+would: verifies the checkout matches the header, reads that repository's
+`AGENTS.md`/`CLAUDE.md`, claims the exchange (atomic, one-use token), does the
+work, and publishes a write-once, hash-bound response from a temp file outside
+the repository. (3) `ask` waits, validates
 (Exchange-ID, prompt hash, response hash) and prints the answer. Exit `0`
 answered · `124` timeout · `1` error — in both failure cases the exchange stays
 published and can be retried (`secondopinion wait <ID>`, or a Claude session
@@ -61,39 +69,47 @@ of the Codex sandbox for all workspace-write commands; an explicit
 
 ```bash
 git clone https://github.com/tsloper/secondopinion ~/tools/secondopinion
-~/tools/secondopinion/plugins/secondopinion/scripts/install.sh            # skill mode (default)
-~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --plugin   # plugin mode
+~/tools/secondopinion/plugins/secondopinion/scripts/install.sh            # default: the Codex plugin; nothing in Claude
+~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --claude   # + the Claude Code plugin (optional)
+~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --skills   # symlink form instead of plugins
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --check    # verify; exit 0 = installed
 ```
 
 Prerequisites: bash, GNU coreutils/sed/grep/awk/flock, git, python3 (installer
-+ `ask`), the `claude` CLI (responder), and `codex` for the Codex plugin form.
++ `ask`), the `codex` CLI (default form), and the `claude` CLI on PATH for the
+headless responder (nothing is installed into Claude itself).
 
-Two mutually exclusive forms; a successful install leaves exactly one form per
-side, as `--check` verifies. Both create `~/.local/bin/secondopinion` (the
-checkout is the install — everything else is a symlink into it), the store
-(0700), the Codex sandbox settings above, and a deprecated `agent-mailbox` alias
-for 1.x scripts.
+Every form creates `~/.local/bin/secondopinion` (the checkout is the install —
+everything else is a symlink into it), the store (0700), the Codex sandbox
+settings above, and a deprecated `agent-mailbox` alias for 1.x scripts. Per
+side at most one form is active, as `--check` verifies.
 
-- **Skill mode** — `~/.claude/skills/secondopinion-respond` and
-  `~/.codex/skills/secondopinion-request` symlinks. Claude invokes
-  `/secondopinion-respond [ID]`.
-- **Plugin mode** — the repo is a marketplace for both agents:
-  `claude plugin marketplace add ~/tools/secondopinion && claude plugin install
-  secondopinion@secondopinion` and `codex plugin marketplace add
+- **Default** — the true Codex plugin: `codex plugin marketplace add
   ~/tools/secondopinion && codex plugin add secondopinion@secondopinion`
-  (both driven by `install.sh --plugin`; the skill symlinks are retired). Claude
-  invokes `/secondopinion:secondopinion-respond [ID]`. Re-running
-  `install.sh --plugin` repoints a stale marketplace, updates/reinstalls to the
-  checkout's version, re-enables a disabled plugin, and fails — before touching
-  anything — if `claude`/`python3` are missing, the plugin registries cannot be
-  inspected, or the store path cannot be written into TOML.
+  (driven by `install.sh`). The Claude side is left EMPTY — any earlier
+  secondopinion skill symlink or plugin there is retired — because
+  `secondopinion ask` carries its instructions inline. Re-running `install.sh`
+  repoints a stale marketplace, updates/reinstalls to the checkout's version,
+  re-enables a disabled plugin, and fails — before touching anything — if
+  `codex`/`python3` are missing, a plugin registry cannot be inspected, or the
+  store path cannot be written into TOML.
+- **`--claude`** — additionally installs the Claude Code plugin
+  (`claude plugin marketplace add` + `claude plugin install`), so a human
+  Claude session can run `/secondopinion:secondopinion-respond [ID]`
+  interactively. `--plugin` is a deprecated alias.
+- **`--skills`** — symlink form for setups without plugin support:
+  `~/.codex/skills/secondopinion-request` (and, with `--claude`,
+  `~/.claude/skills/secondopinion-respond`, invoked as
+  `/secondopinion-respond [ID]`); the plugins are removed.
 
 `install.sh --check` never modifies HOME (it does not start `claude`/`codex` on
-a pristine HOME) and fails on missing, stale, disabled, wrong-version, duplicate
-(a current plugin plus a skill symlink/dir) or uninspectable state, and requires
-the store as a real member of `[sandbox_workspace_write].writable_roots`
-(comments ignored, multiline arrays understood) plus `network_access = true`.
+a pristine HOME). The Codex side must be installed in exactly one current form;
+the Claude side may be absent, but if anything of ours is present it must be
+current and unique — stale, disabled, wrong-version, duplicate (a current
+plugin plus a skill symlink/dir) or uninspectable state fails on either side.
+It also requires the store as a real member of
+`[sandbox_workspace_write].writable_roots` (comments ignored, multiline arrays
+understood) plus `network_access = true`.
 Replaced files/dirs are moved without clobbering to
 `$HOME/.local/state/secondopinion/backups/` (`SECONDOPINION_BACKUP_DIR`).
 Upgrading from 1.x: `~/.agent-mailbox` is migrated once (old path left as a
