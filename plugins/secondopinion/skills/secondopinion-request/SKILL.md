@@ -41,6 +41,12 @@ the answer.
    state, age, responder liveness), `secondopinion wait <ID> --timeout 600`
    and `secondopinion result <ID>`; a stuck responder can be stopped with
    `secondopinion cancel <ID>` (the exchange stays published for a retry).
+   Size the turn budget to the request: the responder stops at `--max-turns`
+   (default 60) and an over-broad task can burn the whole budget without
+   publishing — split broad reviews into 2-3 focused asks, or raise the budget
+   (`--max-turns 150`) knowing cost rises with it. If an ask fails with
+   `error_max_turns` in its log, narrow the request or raise the budget before
+   retrying (archive the dead exchange first).
    Add `--write` only when Claude is meant to change files (responder runs
    with `acceptEdits` instead of deny-only). Optional controls:
    `--model M`, `--effort low|medium|high|xhigh|max` (validated against the

@@ -388,6 +388,23 @@ rr="$("$AM" review-result "$IDSJ" 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(tampered response refused)"
 echo "$rr" | grep -q "parse_ok=yes" && fail "tampered response still reported parsed" || ok
 
+t "ask --max-turns: first-class turn budget — default 60, env override, flag beats env, invalid values refused"
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "mt default" --file "$TMP/request.md" --timeout 60 >/dev/null 2>&1)
+grep -qx -- "--max-turns" "$STUB_ARGV_FILE" && grep -qx -- "60" "$STUB_ARGV_FILE" && ok || fail "default --max-turns 60 missing from argv"
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_MAX_TURNS=90 "$AM" ask --topic "mt env" --file "$TMP/request.md" --timeout 60 >/dev/null 2>&1)
+grep -qx -- "90" "$STUB_ARGV_FILE" && ok || fail "SECONDOPINION_MAX_TURNS env not honoured"
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_MAX_TURNS=90 "$AM" ask --topic "mt flag" --file "$TMP/request.md" --max-turns 137 --timeout 60 >/dev/null 2>&1)
+grep -qx -- "137" "$STUB_ARGV_FILE" && ok || fail "--max-turns flag does not override the env"
+grep -qx -- "90" "$STUB_ARGV_FILE" && fail "env value leaked into argv alongside the flag" || ok
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "mt zero" --file "$TMP/request.md" --max-turns 0
+assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "mt abc" --file "$TMP/request.md" --max-turns abc
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange for invalid --max-turns)"
+
+t "review --max-turns passes through"
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --task "mt review" --max-turns 141 --timeout 60 >/dev/null 2>&1)
+grep -qx -- "141" "$STUB_ARGV_FILE" && ok || fail "review did not pass --max-turns through"
+
 # ===========================================================================
 # Retention notice (stderr-only, transition-only)
 

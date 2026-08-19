@@ -78,7 +78,7 @@ Store: $STORE   (override: SECONDOPINION_DIR)
 
 Requester (Codex) side:
   ask --topic TOPIC (--file REQ.md | --file - | --task TEXT) [--timeout S] [--write]
-      [--background] [--model M] [--effort L] [--json] [--persist]
+      [--background] [--model M] [--effort L] [--max-turns N] [--json] [--persist]
       [--follow-up ID | --resume ID] [--fresh]
                           one call: create+publish the exchange, run a headless Claude Code
                           responder in this checkout (self-contained prompt, never prompts:
@@ -431,13 +431,13 @@ claude_effort_levels() { # bin -> space-separated levels from the live CLI's --h
 
 new_session_uuid() { python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || uuidgen 2>/dev/null; }
 
-build_responder_argv() { # arrayname id write_mode model effort session_mode session_arg
+build_responder_argv() { # arrayname id write_mode model effort session_mode session_arg max_turns
     # session_mode: "" (private: --no-session-persistence) | persist (--session-id ARG)
     #             | resume (--resume ARG, session stays persisted)
     local -n _argv="$1"
     local bin="${SECONDOPINION_CLAUDE:-claude}" prompt
     prompt="$(responder_prompt "$2")" || return 1
-    _argv=("$bin" -p "$prompt" --max-turns "${SECONDOPINION_MAX_TURNS:-60}" --output-format json)
+    _argv=("$bin" -p "$prompt" --max-turns "${8:-${SECONDOPINION_MAX_TURNS:-60}}" --output-format json)
     case "${6:-}" in
         persist) _argv+=(--session-id "$7");;
         resume)  _argv+=(--resume "$7");;
@@ -455,7 +455,7 @@ build_responder_argv() { # arrayname id write_mode model effort session_mode ses
 }
 cmd_ask() {
     local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 background=0 model="" json=""
-    local effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}"
+    local effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}" maxturns=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
@@ -464,6 +464,7 @@ cmd_ask() {
             --timeout) [ "$#" -ge 2 ] || die "--timeout requires seconds"; timeout="$2"; shift 2;;
             --model) [ "$#" -ge 2 ] || die "--model requires a value"; model="$2"; shift 2;;
             --effort) [ "$#" -ge 2 ] || die "--effort requires a level"; effort="$2"; shift 2;;
+            --max-turns) [ "$#" -ge 2 ] || die "--max-turns requires a count"; maxturns="$2"; shift 2;;
             --follow-up) [ "$#" -ge 2 ] || die "--follow-up requires a parent exchange ID"; followup="$2"; shift 2;;
             --resume) [ "$#" -ge 2 ] || die "--resume requires a parent exchange ID"; resume="$2"; shift 2;;
             --persist) persist=1; shift;;
@@ -480,6 +481,7 @@ cmd_ask() {
     timeout="$(parse_secs "--timeout" "$timeout")" || exit 1
     [ "$timeout" -gt 0 ] || die "ask --timeout must be at least 1 second (GNU timeout treats 0 as 'no limit'); no exchange was created"
     [ -z "$model" ] || safe_value "--model" "$model"
+    [ -z "$maxturns" ] || { maxturns="$(parse_count "--max-turns" "$maxturns")" || exit 1; }
     local bin="${SECONDOPINION_CLAUDE:-claude}"
     command -v -- "$bin" >/dev/null 2>&1 || die "responder binary '$bin' not found (install the 'claude' CLI so it is on PATH, or set SECONDOPINION_CLAUDE); no exchange was created"
     local skill_file; skill_file="$(respond_skill_file)" || die "cannot resolve this CLI's own path; no exchange was created"
@@ -560,7 +562,7 @@ $parent_resp_txt
     local repo; repo="$(meta_get "$dir" repo)"; [ -d "$repo" ] || repo="$PWD"
     mkdir -p "$STORE/responder-logs"; chmod 700 "$STORE/responder-logs"
     RESPONDER_LOG="$STORE/responder-logs/$id.log"
-    local argv=(); build_responder_argv argv "$id" "$write" "$model" "$effort" "$session_mode" "$session_arg" || die "could not build the responder command (respond instructions unreadable)"
+    local argv=(); build_responder_argv argv "$id" "$write" "$model" "$effort" "$session_mode" "$session_arg" "$maxturns" || die "could not build the responder command (respond instructions unreadable)"
     if [ -n "${SECONDOPINION_CLAUDE_ARGS:-}" ]; then
         # shellcheck disable=SC2206
         local extra=( ${SECONDOPINION_CLAUDE_ARGS} ); argv+=("${extra[@]}")
@@ -641,7 +643,7 @@ cmd_review() {
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
             --task) [ "$#" -ge 2 ] || die "--task requires a value"; focus="$2"; shift 2;;
             --write) die "reviews are read-only; --write is not available under 'review' (use plain 'ask --write' for a task that must edit)";;
-            --timeout|--model|--effort|--follow-up|--resume) [ "$#" -ge 2 ] || die "$1 requires a value"; pass+=("$1" "$2"); shift 2;;
+            --timeout|--model|--effort|--max-turns|--follow-up|--resume) [ "$#" -ge 2 ] || die "$1 requires a value"; pass+=("$1" "$2"); shift 2;;
             --background|--json|--persist|--fresh) pass+=("$1"); shift;;
             -h|--help) echo "usage: review [--adversarial] [--base REF | --scope working-tree] [--task FOCUS] [--topic T] [ask options: --timeout --model --effort --background --json --persist --follow-up ID --resume ID]"; exit 0;;
             *) die "unknown review option: $1";;
