@@ -12,10 +12,10 @@
 set -euo pipefail
 umask 077
 
-VERSION="2.0.0"
+VERSION="1.0.0"
 warn() { echo "WARNING: $*" >&2; }
 
-# ---- 1.x compatibility (the tool was called agent-mailbox until 2.0.0) -----------------------
+# ---- agent-mailbox compatibility (the tool's pre-release internal name) -----------------------
 # The old command name works as a deprecated alias, the old AGENT_MAILBOX_* variables are
 # honoured when the new SECONDOPINION_* ones are unset, and an un-migrated ~/.agent-mailbox
 # store is used (never duplicated) until install.sh moves it. Each case warns once per run.

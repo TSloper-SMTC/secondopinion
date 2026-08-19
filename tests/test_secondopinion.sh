@@ -562,7 +562,7 @@ assert_eq "$rc" 124 "(rc --timeout 00000000000 on a draft)"
 assert_rc 1 "$AM" wait "$IDZ" --timeout 04294967296
 
 # ===========================================================================
-# 2.0.0 rename: compatibility and migration
+# agent-mailbox rename: compatibility and migration
 
 t "compat: SECONDOPINION_DIR wins; a legacy AGENT_MAILBOX_DIR is honoured with one deprecation warning"
 LEG="$TMP/legacy-store"; NEW="$TMP/new-store"
@@ -605,7 +605,7 @@ out="$(env -u SECONDOPINION_DIR -u AGENT_MAILBOX_DIR HOME="$LH" "$AM" list 2>&1 
 assert_eq "$out" "" "(no warning when the new store exists)"
 
 # ===========================================================================
-# 2.0.0: `ask` — one command that publishes, spawns a headless responder, waits, and prints the answer
+# `ask` — one command that publishes, spawns a headless responder, waits, and prints the answer
 
 STUB_DIR="$TMP/claude-stub"; mkdir -p "$STUB_DIR"
 # A stand-in for the `claude` CLI: records its argv, extracts the exchange id from the -p prompt,

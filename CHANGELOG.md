@@ -1,9 +1,10 @@
 # Changelog
 
-## 2.0.0 — 2026-08-17
+## 1.0.0 — 2026-08-19
 
-Renamed from `agent-mailbox` to **secondopinion**; first version that needs no
-human relay.
+First public release. secondopinion gives one AI coding agent a sealed,
+verifiable second opinion from another — today Codex → Claude Code — with no
+human relay and nothing installed on the responding side.
 
 - `secondopinion ask`: one command creates and publishes the exchange, runs a
   headless Claude Code responder in the calling checkout, waits, validates and
@@ -37,33 +38,22 @@ human relay.
   `SECONDOPINION_STALE_CLAIM_SECS`, `SECONDOPINION_BACKUP_DIR`,
   `SECONDOPINION_CLAUDE`, `SECONDOPINION_CLAUDE_ARGS`,
   `SECONDOPINION_MAX_TURNS`, `SECONDOPINION_ASK_TIMEOUT`.
+- Release hardening (final Codex QA round): `ask` refuses unreadable respond
+  instructions before creating an exchange and rejects a zero timeout (GNU
+  `timeout 0` = no limit); a responder that claims and then dies is reported as
+  `state=claimed` with the `--takeover` path; `--background` reports the real
+  state; `archive` relocates the responder log into the archived exchange (no
+  orphan files); the installer backs up a real directory at the Codex skill
+  location, `--check` never lets a current skill symlink mask a stale plugin
+  and stays silent about sides it could not inspect; whitespace-form
+  `[ sandbox_workspace_write ]` headers are recognized (no duplicate tables).
 
-## 1.3.x — 2026-08-17
+## Prehistory (internal, as `agent-mailbox`)
 
-Plugin packaging (1.3.0: `.claude-plugin`, `.codex-plugin`, self-hosted
-marketplace, `install.sh --plugin`); installer hardening through eleven Codex
-QA rounds (1.3.1–1.3.6): EOF-safe 64-record header bound, TOML-safe store
-paths and semantic `writable_roots` membership, state-aware and side-effect-free
-`--check`, mutually exclusive skill/plugin modes with duplicate detection,
-fail-closed plugin inspection, overflow-safe seconds, non-clobbering backups
-outside the plugin source.
-
-## 1.2.x — 2026-08-17
-
-Header integrity: derived header/meta values validated before an exchange is
-reserved; strict `Responder:` value; header block bounded to the first blank
-line (max 64 records) and byte-checked (CRLF/TAB allowed, other control bytes
-refused); `publish` refuses an untouched Task placeholder; exactly one
-positional ID per command; `wait --timeout` parsed as decimal.
-
-## 1.1.0 — 2026-08-15
-
-Symlink containment everywhere, `respond` snapshot-then-validate, retry-safe
-claim/respond/archive, status exit codes, metadata/JSON sanitization, CRLF
-tolerance.
-
-## 1.0.0 — 2026-08-15
-
-Global file mailbox for Codex→Claude review exchanges: one directory per
-Exchange-ID, publish/claim/respond/read-response/archive, hash-bound prompt and
-response, atomic claim, worktree-aware matching.
+Before the public release the tool lived as `agent-mailbox` (internal versions
+1.0.0–1.3.6, git tags `agent-mailbox--v*`): the exchange store with
+publish/claim/respond/read-response/archive, hash-bound prompt and response,
+atomic claim, worktree-aware matching; symlink containment and retry-safe
+operations; validated bounded headers; plugin packaging and eleven Codex QA
+hardening rounds (semantic TOML handling, state-aware side-effect-free
+`--check`, fail-closed plugin inspection, non-clobbering backups).

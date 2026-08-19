@@ -49,7 +49,7 @@ PLUGIN_ID="secondopinion@secondopinion"
 MARKETPLACE="secondopinion"
 CLAUDE_SKILL_LINK="$HOME/.claude/skills/secondopinion-respond"
 STORE_DIR="${SECONDOPINION_DIR:-$HOME/.secondopinion}"
-OLD_STORE="$HOME/.agent-mailbox"                       # 1.x store; migrated once (see below)
+OLD_STORE="$HOME/.agent-mailbox"                       # legacy agent-mailbox store; migrated once (see below)
 CODEX_CFG="$HOME/.codex/config.toml"
 
 # ---- every precondition is checked BEFORE any mutation ------------------------------------
@@ -354,13 +354,13 @@ CODEX_SKILL_LINK="$(codex_home)/skills/secondopinion-request"
 if [ "$CHECK" = 0 ] && [ "$SKILLS" = 1 ]; then
     DESTS+=("$CODEX_SKILL_LINK"); SRCS+=("$ROOT/skills/secondopinion-request")
 fi
-# ~/.local/bin/agent-mailbox is the deprecated 1.x alias (same binary; prints a warning). It is
+# ~/.local/bin/agent-mailbox is the deprecated legacy alias (same binary; prints a warning). It is
 # created on install so old scripts/skills keep working, but --check does not require it.
 if [ "$CHECK" != 1 ]; then DESTS+=("$HOME/.local/bin/agent-mailbox"); SRCS+=("$ROOT/bin/secondopinion"); fi
-# 1.x skill links point at names that no longer exist; retire them (they are symlinks we made).
+# legacy agent-mailbox skill links point at names that no longer exist; retire them (they are symlinks we made).
 if [ "$CHECK" != 1 ]; then
     for old in "$HOME/.claude/skills/codex-mailbox" "$HOME/.codex/skills/claude-mailbox"; do
-        if [ -L "$old" ]; then rm -f -- "$old"; echo "retired   $old (1.x skill name)"; fi
+        if [ -L "$old" ]; then rm -f -- "$old"; echo "retired   $old (legacy agent-mailbox skill name)"; fi
     done
 fi
 # The Claude skill is a symlink only for --skills --claude; with --claude alone it comes
@@ -395,7 +395,7 @@ for i in "${!DESTS[@]}"; do
     echo "linked    $dest -> $src"
 done
 
-# --- 1.x store migration: move ~/.agent-mailbox to the new default once and leave the old
+# --- legacy store migration: move ~/.agent-mailbox to the new default once and leave the old
 # path as a symlink so running Codex/Claude sessions (and their sandbox roots) keep working.
 if [ "$CHECK" != 1 ] && [ -z "${SECONDOPINION_DIR:-}" ] && [ -d "$OLD_STORE" ] && [ ! -L "$OLD_STORE" ] && [ ! -e "$STORE_DIR" ]; then
     mv -T -- "$OLD_STORE" "$STORE_DIR" && ln -s -- "$STORE_DIR" "$OLD_STORE"
@@ -427,7 +427,7 @@ if [ -f "$CODEX_CFG" ] && grep -Eq "$SANDBOX_TBL_RE" "$CODEX_CFG"; then
                elif set_sandbox_network_true; then echo "config    $CODEX_CFG: set [sandbox_workspace_write] network_access = true (Codex commands may reach Claude; previous file backed up)"
                else echo "ACTION    $CODEX_CFG: could not set network_access = true in [sandbox_workspace_write]; add it by hand." >&2; fi;;
     esac
-    # A writable root that is itself a symlink (the migrated 1.x store path) breaks Codex's
+    # A writable root that is itself a symlink (the migrated legacy store path) breaks Codex's
     # bubblewrap sandbox: "cannot enforce sandbox read-only path .../.git because it crosses
     # writable symlink ...". The real store is already a root, so the legacy entry just goes.
     if [ -L "$OLD_STORE" ] && store_in_sandbox_roots "$OLD_STORE"; then

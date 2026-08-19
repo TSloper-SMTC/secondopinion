@@ -81,7 +81,8 @@ headless responder (nothing is installed into Claude itself).
 
 Every form creates `~/.local/bin/secondopinion` (the checkout is the install —
 everything else is a symlink into it), the store (0700), the Codex sandbox
-settings above, and a deprecated `agent-mailbox` alias for 1.x scripts. Per
+settings above, and a deprecated `agent-mailbox` alias for scripts from the tool's
+pre-release life as agent-mailbox. Per
 side at most one form is active, as `--check` verifies.
 
 - **Default** — the true Codex plugin: `codex plugin marketplace add
@@ -112,7 +113,7 @@ It also requires the store as a real member of
 understood) plus `network_access = true`.
 Replaced files/dirs are moved without clobbering to
 `$HOME/.local/state/secondopinion/backups/` (`SECONDOPINION_BACKUP_DIR`).
-Upgrading from 1.x: `~/.agent-mailbox` is migrated once (old path left as a
+Upgrading from a pre-release agent-mailbox install: `~/.agent-mailbox` is migrated once (old path left as a
 symlink, and REMOVED from `writable_roots` — Codex's bubblewrap sandbox cannot
 build with a symlinked writable root; the real store entry covers it), old
 skill links retired, `AGENT_MAILBOX_*` variables honoured with a warning.

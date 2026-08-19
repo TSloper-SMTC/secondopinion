@@ -167,7 +167,7 @@ DB="$TMP/home-defbak"; mkdir -p "$DB/.local/bin"; echo OLD > "$DB/.local/bin/sec
 [ -z "$(find "$ROOT/backups" -newer "$PLUGIN/scripts/install.sh" -type f 2>/dev/null)" ] && ok || fail "a backup was written inside $ROOT/backups"
 grep -rl OLD "$DB/.local/state/secondopinion/backups" >/dev/null 2>&1 && ok || fail "backup not found under \$HOME/.local/state/secondopinion/backups"
 
-t "2.0.0 migration: an old agent-mailbox layout is converted (store moved + old path symlinked, old links retired, compat alias, writable_roots extended)"
+t "agent-mailbox migration: an old layout is converted (store moved + old path symlinked, old links retired, compat alias, writable_roots extended)"
 MH="$TMP/home-migrate"; mkdir -p "$MH/.agent-mailbox/exchanges/2026-01-01T000000Z-keep" "$MH/.agent-mailbox/archive" "$MH/.local/bin" "$MH/.claude/skills" "$MH/.codex/skills" "$MH/.codex"
 echo "state=draft" > "$MH/.agent-mailbox/exchanges/2026-01-01T000000Z-keep/meta"
 ln -s "/nonexistent/old-repo/bin/agent-mailbox" "$MH/.local/bin/agent-mailbox"          # dangling old CLI link

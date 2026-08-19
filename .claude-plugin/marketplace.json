@@ -1,6 +1,6 @@
 {
   "name": "secondopinion",
-  "description": "Tim Sloper's agent tooling: the secondopinion Codex→Claude Code review-exchange plugin.",
+  "description": "Tim Sloper's agent tooling: the secondopinion Codex\u2192Claude Code review-exchange plugin.",
   "owner": {
     "name": "Tim Sloper",
     "email": "tim.sloper@outlook.com"
@@ -9,8 +9,8 @@
     {
       "name": "secondopinion",
       "source": "./plugins/secondopinion",
-      "version": "2.0.0",
-      "description": "Global file-based mailbox for Codex→Claude Code review exchanges (secondopinion-respond skill).",
+      "version": "1.0.0",
+      "description": "Global file-based mailbox for Codex\u2192Claude Code review exchanges (secondopinion-respond skill).",
       "author": {
         "name": "Tim Sloper"
       }

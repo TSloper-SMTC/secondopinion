@@ -86,9 +86,9 @@ if command -v claude >/dev/null 2>&1; then
 
   t "install.sh --claude repairs a stale marketplace/older plugin and verifies version + enabled; --check is state-aware"
   SH="$TMP/home-stale"; mkdir -p "$SH"; OLD="$TMP/old-copy"; cp -r "$ROOT" "$OLD"; rm -rf "$OLD/.git"
-  for f in plugins/secondopinion/bin/secondopinion plugins/secondopinion/.claude-plugin/plugin.json plugins/secondopinion/.codex-plugin/plugin.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do sed -i "s/$TOOL_VERSION/1.0.0/g" "$OLD/$f"; done
+  for f in plugins/secondopinion/bin/secondopinion plugins/secondopinion/.claude-plugin/plugin.json plugins/secondopinion/.codex-plugin/plugin.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do sed -i "s/$TOOL_VERSION/0.9.0/g" "$OLD/$f"; done
   ( cd "$SH" && HOME="$SH" claude plugin marketplace add "$OLD" >/dev/null 2>&1 && HOME="$SH" claude plugin install secondopinion@secondopinion >/dev/null 2>&1 ) && ok || fail "could not seed the older install"
-  assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list 2>&1 | sed -n 's/^ *Version: *//p' | head -1)" "1.0.0" "(seeded older version)"
+  assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list 2>&1 | sed -n 's/^ *Version: *//p' | head -1)" "0.9.0" "(seeded older version)"
   rm -rf "$OLD"                                                     # stale marketplace source
   ( cd "$SH" && HOME="$SH" CODEX_HOME="$SH/.codex" PATH="$SH/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ); rc=$?
   assert_eq "$rc" 1 "(--check must not accept a stale/older plugin)"
