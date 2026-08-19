@@ -1097,21 +1097,30 @@ cmd_prune() {
             IFS="$US" read -r b i rank <<< "$line"
             # An exchange another process holds locked is in an active transition: skip it.
             if [ -L "$ARCH/$i/.lock" ]; then echo "skipped=$i reason=symlinked-lock" >&2; skipped=$((skipped+1)); continue; fi
-            if ! ( exec 9>>"$ARCH/$i/.lock"; flock -n 9 ) 2>/dev/null; then
+            if [ "$apply" = 1 ]; then
+                # Acquire and HOLD the exchange lock through revalidation, tombstoning and
+                # removal — a probe-then-release would leave a window in which another
+                # process takes the lock while the directory is being deleted.
+                if ! exec 7>>"$ARCH/$i/.lock" 2>/dev/null; then echo "skipped=$i reason=unlockable"; skipped=$((skipped+1)); continue; fi
+                if ! flock -n 7; then exec 7>&-; echo "skipped=$i reason=locked"; skipped=$((skipped+1)); continue; fi
+            elif ! ( exec 9>>"$ARCH/$i/.lock"; flock -n 9 ) 2>/dev/null; then
                 echo "skipped=$i reason=locked"; skipped=$((skipped+1)); continue
             fi
             candidates=$((candidates+1))
             bytes="$(du -sb -- "$ARCH/$i" 2>/dev/null | cut -f1)"; [ -n "$bytes" ] || bytes=0
             printf 'prune=%s\tbucket=%s\trank=%s\trule=over-retain(keep %s newest per repository)\tbytes=%s\n' "$i" "$b" "$rank" "$retain" "$bytes"
             if [ "$apply" = 1 ]; then
-                ( umask 077; exec 8>>"$TOMB" ) 2>/dev/null || die "cannot open tombstones file: $TOMB"
+                [ -n "${SECONDOPINION_TEST_PRUNE_PAUSE:-}" ] && sleep "$SECONDOPINION_TEST_PRUNE_PAUSE"
+                if ! real_dir "$ARCH/$i"; then exec 7>&-; continue; fi   # re-verify under OUR lock
+                ( umask 077; exec 8>>"$TOMB" ) 2>/dev/null || { exec 7>&-; die "cannot open tombstones file: $TOMB"; }
                 exec 8>>"$TOMB"; flock 8; chmod 600 "$TOMB" 2>/dev/null || true
-                real_dir "$ARCH/$i" || { exec 8>&-; continue; }        # re-verify under the prune lock
                 grep -Fxq -- "$i" "$TOMB" || printf '%s\n' "$i" >> "$TOMB"
                 sync -- "$TOMB" 2>/dev/null || true
-                rm -rf -- "$ARCH/$i"
-                exec 8>&-
-                pruned=$((pruned+1))
+                rm -rf -- "$ARCH/$i" 2>/dev/null || true
+                exec 8>&-; exec 7>&-
+                # Count only VERIFIED removals; a survivor is reported, not miscounted.
+                if [ -e "$ARCH/$i" ]; then echo "skipped=$i reason=removal-failed" >&2; skipped=$((skipped+1))
+                else pruned=$((pruned+1)); fi
             fi
         done
         # Interrupted-apply repair: a tombstoned id whose directory still exists was caught
@@ -1119,12 +1128,16 @@ cmd_prune() {
         if [ "$apply" = 1 ] && [ -f "$TOMB" ]; then
             while IFS= read -r i; do
                 valid_id "$i" || continue
+                real_dir "$ARCH/$i" || continue
+                [ -L "$ARCH/$i/.lock" ] && { echo "skipped=$i reason=symlinked-lock" >&2; skipped=$((skipped+1)); continue; }
+                exec 7>>"$ARCH/$i/.lock" 2>/dev/null || { echo "skipped=$i reason=unlockable"; skipped=$((skipped+1)); continue; }
+                if ! flock -n 7; then exec 7>&-; echo "skipped=$i reason=locked"; skipped=$((skipped+1)); continue; fi
                 if real_dir "$ARCH/$i"; then
-                    if ( exec 9>>"$ARCH/$i/.lock"; flock -n 9 ) 2>/dev/null; then
-                        printf 'prune=%s\trule=completing-interrupted-prune\n' "$i"
-                        rm -rf -- "$ARCH/$i"; pruned=$((pruned+1))
-                    else echo "skipped=$i reason=locked"; skipped=$((skipped+1)); fi
+                    printf 'prune=%s\trule=completing-interrupted-prune\n' "$i"
+                    rm -rf -- "$ARCH/$i" 2>/dev/null || true
+                    [ -e "$ARCH/$i" ] && { echo "skipped=$i reason=removal-failed" >&2; skipped=$((skipped+1)); } || pruned=$((pruned+1))
                 fi
+                exec 7>&-
             done < "$TOMB"
         fi
     fi
@@ -1132,6 +1145,23 @@ cmd_prune() {
     echo "pruned=$pruned"
     echo "skipped=$skipped"
     [ "$apply" = 1 ] || echo "note=dry run: nothing was removed; re-run with --apply to remove the targets above"
+    return 0
+}
+
+retention_note() { # git_common_dir -> stderr note when that archive bucket exceeds the bound
+    local want="$1" retain="${SECONDOPINION_RETAIN:-50}" n=0 d c
+    case "$retain" in ''|*[!0-9]*) return 0;; esac
+    { [ -n "$want" ] && [ "$want" != "(none)" ]; } || want="(none)"
+    for d in "$ARCH"/*/; do
+        d="${d%/}"; [ -e "$d" ] || continue
+        real_dir "$d" || continue
+        [ -f "$d/meta" ] && [ ! -L "$d/meta" ] || continue
+        c="$(meta_get "$d" git_common_dir)"; { [ -n "$c" ] && [ "$c" != "(none)" ]; } || c="(none)"
+        [ "$c" = "$want" ] && n=$((n+1))
+    done
+    if [ "$n" -gt "$retain" ]; then
+        echo "note=archive retention exceeded for this exchange's repository bucket ($n archived, retain $retain); run 'secondopinion prune' to review" >&2
+    fi
     return 0
 }
 
@@ -1209,6 +1239,7 @@ cmd_jobs() {
         rstate="$(responder_state "$d")"; [ -n "$rstate" ] || rstate="-"
         printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$state" "$age" "$rstate" "$(meta_get "$d" target)"
     done
+    [ -n "$want_common" ] && retention_note "$want_common"
     return 0
 }
 
@@ -1255,6 +1286,7 @@ cmd_archive() {
     fi
     unlock
     relocate_responder_log "$id"
+    retention_note "$(meta_get "$ARCH/$id" git_common_dir)"
     echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
 }
 

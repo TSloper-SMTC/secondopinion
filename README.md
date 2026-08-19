@@ -162,10 +162,12 @@ marketplace) and Codex's `plugin-creator/scripts/validate_plugin.py`.
 - `secondopinion prune` — bounded retention over `archive/` only, **per
   repository** (git common dir; separate non-git bucket; default keep newest
   50, `SECONDOPINION_RETAIN`/`--retain`). Dry-run by default with exact
-  targets, rules and bytes; `--apply` tombstones each ID before removal so IDs
-  are never reused and an interrupted prune completes on the next run. Drafts,
-  pending, claimed and answered-but-unconsumed exchanges are never candidates;
-  nothing prunes automatically.
+  targets, rules and bytes; `--apply` holds each exchange's lock through a
+  tombstone-first removal (IDs are never reused; an interrupted prune completes
+  on the next run; only verified removals are counted). Drafts, pending,
+  claimed and answered-but-unconsumed exchanges are never candidates; nothing
+  prunes automatically — when a repository's bucket goes over the bound,
+  `archive` and `jobs` print a one-line note on stderr pointing at `prune`.
 
 ## Manual flow (any two sessions, no headless responder)
 

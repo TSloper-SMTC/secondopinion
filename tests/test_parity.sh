@@ -107,6 +107,27 @@ echo "$out" | grep -q "skipped=$OLDL" && ok || fail "held exchange not reported 
 [ -d "$SECONDOPINION_DIR/archive/$NEWL" ] && ok || fail "retained exchange was removed"
 wait "$HOLDER" 2>/dev/null
 
+t "prune --apply: a candidate locked AFTER selection is never removed while locked (lock is held through removal)"
+RSTORE="$TMP/store-race"; mkrepo "$TMP/repoE"
+OLDR="$( (cd "$TMP/repoE" && PATH="$DSTUB:$PATH" SECONDOPINION_DIR="$RSTORE" "$AM" new --topic "race old") | val exchange_id )"
+PATH="$DSTUB:$PATH" SECONDOPINION_DIR="$RSTORE" "$AM" archive "$OLDR" --force >/dev/null
+NEWR="$( (cd "$TMP/repoE" && SECONDOPINION_DIR="$RSTORE" "$AM" new --topic "race new") | val exchange_id )"
+SECONDOPINION_DIR="$RSTORE" "$AM" archive "$NEWR" --force >/dev/null
+SECONDOPINION_DIR="$RSTORE" SECONDOPINION_TEST_PRUNE_PAUSE=2 "$AM" prune --retain 1 --apply >/dev/null 2>&1 &
+PRUNER=$!
+sleep 0.7                                  # inside the pause window, after target selection
+GRABBED=0
+exec 6>>"$RSTORE/archive/$OLDR/.lock" 2>/dev/null && flock -n 6 && GRABBED=1
+wait "$PRUNER"
+if [ "$GRABBED" = 1 ]; then
+  [ -d "$RSTORE/archive/$OLDR" ] && ok || fail "exchange was removed WHILE another process held its lock (probe/removal race)"
+  exec 6>&-
+else
+  # the fixed implementation holds the lock through removal, so the grab must fail and the target goes
+  [ ! -d "$RSTORE/archive/$OLDR" ] && ok || fail "lock grab failed but the candidate also survived"
+  exec 6>&- 2>/dev/null || true
+fi
+
 t "prune: an interrupted apply (tombstone written, directory left) completes on re-run"
 VICT="$(arch_in "$TMP/repoB" "victim zz")"; sleep 1.1; KEEP="$(arch_in "$TMP/repoB" "keeper zz")"
 printf '%s\n' "$VICT" >> "$SECONDOPINION_DIR/tombstones"     # simulate the crash window
@@ -366,6 +387,29 @@ d="$("$AM" path "$IDSJ")"; printf 'x' >> "$d/response.md"
 rr="$("$AM" review-result "$IDSJ" 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(tampered response refused)"
 echo "$rr" | grep -q "parse_ok=yes" && fail "tampered response still reported parsed" || ok
+
+# ===========================================================================
+# Retention notice (stderr-only, transition-only)
+
+t "archive: an over-bound bucket prints a retention note on STDERR only; stdout stays parseable; idempotent re-archive is silent"
+NSTORE="$TMP/store-notice"; mkrepo "$TMP/repoF"
+N1="$( (cd "$TMP/repoF" && SECONDOPINION_DIR="$NSTORE" "$AM" new --topic n1) | val exchange_id )"
+N2="$( (cd "$TMP/repoF" && SECONDOPINION_DIR="$NSTORE" "$AM" new --topic n2) | val exchange_id )"
+N3="$( (cd "$TMP/repoF" && SECONDOPINION_DIR="$NSTORE" "$AM" new --topic n3) | val exchange_id )"
+SECONDOPINION_DIR="$NSTORE" SECONDOPINION_RETAIN=2 "$AM" archive "$N1" --force >/dev/null 2>"$TMP/n.err"
+[ -s "$TMP/n.err" ] && fail "note printed although the bucket is under the bound: $(cat "$TMP/n.err")" || ok
+SECONDOPINION_DIR="$NSTORE" SECONDOPINION_RETAIN=2 "$AM" archive "$N2" --force >/dev/null 2>/dev/null
+out="$(SECONDOPINION_DIR="$NSTORE" SECONDOPINION_RETAIN=2 "$AM" archive "$N3" --force 2>"$TMP/n.err")"
+grep -q "retention" "$TMP/n.err" && grep -q "prune" "$TMP/n.err" && ok || fail "no retention note on stderr for an over-bound bucket: $(cat "$TMP/n.err")"
+echo "$out" | grep -q "retention" && fail "retention note leaked into archive stdout" || ok
+assert_eq "$(echo "$out" | tail -1)" "archive_dir=$NSTORE/archive/$N3" "(stdout record shape unchanged)"
+out="$(SECONDOPINION_DIR="$NSTORE" SECONDOPINION_RETAIN=2 "$AM" archive "$N3" 2>"$TMP/n.err")"
+[ -s "$TMP/n.err" ] && fail "idempotent re-archive printed a note: $(cat "$TMP/n.err")" || ok
+
+t "jobs: repo-scoped listing appends the retention note on STDERR when the bucket is over the bound"
+out="$(cd "$TMP/repoF" && SECONDOPINION_DIR="$NSTORE" SECONDOPINION_RETAIN=2 "$AM" jobs 2>"$TMP/n.err")"
+grep -q "retention" "$TMP/n.err" && grep -q "prune" "$TMP/n.err" && ok || fail "no jobs retention note: $(cat "$TMP/n.err")"
+echo "$out" | grep -q "retention" && fail "retention note leaked into the jobs table" || ok
 
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
