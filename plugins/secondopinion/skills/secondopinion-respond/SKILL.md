@@ -1,22 +1,25 @@
 ---
 name: secondopinion-respond
-description: Use when the user invokes /secondopinion-respond (optionally with an Exchange-ID) or asks to process, answer, or check pending Codex mailbox exchanges held in the global secondopinion store.
+description: Use when the user invokes /secondopinion-respond (optionally with an Exchange-ID), asks to process, answer, or check pending second-opinion requests from Codex in the global secondopinion store, or when this session was started headlessly by `secondopinion ask` to answer one exchange.
 ---
 
-# Codex Mailbox (global)
+# Second opinion — respond (Claude Code side)
 
-Answer Codex→Claude review exchanges held in the global `secondopinion` store
+Answer second-opinion exchanges held in the global `secondopinion` store
 (`~/.secondopinion`; tool `secondopinion` on PATH; one directory per exchange,
 any number open at once across repositories and sessions).
 
-Use only when the user invokes `/secondopinion-respond [ID]` (skill-mode install) or
-`/secondopinion:secondopinion-respond [ID]` (plugin-mode install), or asks to process
-the Codex mailbox.
+Use when the user invokes `/secondopinion-respond [ID]` (skill-mode install) or
+`/secondopinion:secondopinion-respond [ID]` (plugin-mode install), asks to
+process pending second-opinion requests, or when you are running headlessly
+because `secondopinion ask` started you with `-p "/secondopinion-respond <ID>"`
+— in that case there is no user: never wait for input, follow this workflow to
+the end, and treat the request as read-only unless it says otherwise.
 
 ## Workflow
 
 1. **Preflight**: `command -v secondopinion`. If missing, tell the user to run
-   `~/tools/secondopinion/install.sh` and stop.
+   `~/tools/secondopinion/scripts/install.sh` and stop.
 2. **Find work**
    - With an ID: `secondopinion status <ID>`. Proceed only if `state=published`
      and `prompt_ok=yes`. If `state=claimed`: proceed only if THIS session still

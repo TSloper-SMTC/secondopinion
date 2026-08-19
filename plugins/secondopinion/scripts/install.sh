@@ -12,7 +12,8 @@ if [ -z "${HOME:-}" ]; then
     echo "ERROR: HOME is not set; cannot locate ~/.local/bin, ~/.claude/skills or ~/.codex/skills." >&2
     exit 1
 fi
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"          # plugin root (plugins/secondopinion)
+REPO_ROOT="$(cd "$ROOT/../.." && pwd)"                               # marketplace root (the git checkout)
 VERSION="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$ROOT/bin/secondopinion")"
 # Backups of replaced real dirs/files go OUTSIDE the skills trees (a backed-up SKILL.md would be
 # discovered as a duplicate skill) and OUTSIDE the plugin source (a plugin install copies the tree).
@@ -128,6 +129,16 @@ open(path, "w", encoding="utf-8").write("\n".join(lines))
 PY
 }
 
+sandbox_network_setting() { # -> true | false | "" (absent) inside [sandbox_workspace_write]
+    [ -f "$CODEX_CFG" ] || { echo ""; return 0; }
+    awk '/^\[/{f=($0 ~ /^\[sandbox_workspace_write\]/)} f && /^[[:space:]]*network_access[[:space:]]*=/ {sub(/#.*/,""); gsub(/[[:space:]]|network_access|=/,""); print; exit}' "$CODEX_CFG"
+}
+set_sandbox_network_true() { # insert `network_access = true` right after the table header (backup first)
+    mkdir -p "$BACKUP_DIR"; local bak; bak="$(backup_path config.toml)"
+    cp -p -- "$CODEX_CFG" "$bak" || return 1
+    awk 'BEGIN{done=0} {print} /^\[sandbox_workspace_write\]/ && !done {print "network_access = true"; done=1}' "$CODEX_CFG" > "$CODEX_CFG.tmp.$$" && mv -f -- "$CODEX_CFG.tmp.$$" "$CODEX_CFG"
+}
+
 # ---- plugin state (JSON, never text grep; tri-state: present / absent / error) --------------
 # Running the claude CLI creates ~/.claude.json etc. on a pristine HOME, so it is consulted only
 # when a plugin registry already exists. If the registry exists but cannot be inspected (CLI
@@ -196,10 +207,64 @@ if [ "$PLUGIN_INSPECT" = "error" ]; then
     fi
 fi
 plugin_present() { [ "$PLUGIN_INSPECT" = "ok" ] && [ -n "$PLUGIN_STATE" ]; }
-plugin_current() { plugin_present && [ "$MARKET_PATH" = "$ROOT" ] && [ "$PLUGIN_STATE" = "$VERSION true" ]; }
+plugin_current() { plugin_present && [ "$MARKET_PATH" = "$REPO_ROOT" ] && [ "$PLUGIN_STATE" = "$VERSION true" ]; }
 marketplace_path() { echo "$MARKET_PATH"; }
 plugin_state() { echo "$PLUGIN_STATE"; }
 refresh_plugins() { PLUGIN_INSPECT="absent"; PLUGIN_STATE=""; MARKET_PATH=""; inspect_plugins; }
+
+# ---- Codex plugin state (JSON; tri-state) --------------------------------------------------
+have_codex() { command -v codex >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; }
+CODEX_STATE=""; CODEX_MARKET_ROOT=""; CODEX_INSPECT="absent"
+codex_home() { echo "${CODEX_HOME:-$HOME/.codex}"; }
+inspect_codex() {
+    [ -e "$(codex_home)/plugins" ] || { CODEX_INSPECT="absent"; return 0; }
+    have_codex || { CODEX_INSPECT="error"; return 0; }
+    local out
+    out="$( { codex plugin list --json 2>/dev/null; echo "RC=$?"; } | python3 -c '
+import json, sys
+data = sys.stdin.read()
+body, _, rc = data.rpartition("RC=")
+try:
+    if rc.strip() != "0": raise ValueError("cli")
+    d = json.loads(body)
+    if not isinstance(d, dict) or not isinstance(d.get("installed"), list): raise ValueError("shape")
+    hits = [p for p in d["installed"] if isinstance(p, dict) and p.get("pluginId") == sys.argv[1]]
+    if len(hits) > 1: raise ValueError("duplicate ids")
+    if hits:
+        p = hits[0]
+        if not isinstance(p.get("version"), str) or not isinstance(p.get("enabled"), bool): raise ValueError("schema")
+        src = (p.get("marketplaceSource") or {}).get("source", "")
+        if not isinstance(src, str): raise ValueError("schema")
+        print("OK", p["version"], "true" if p["enabled"] else "false", src)
+    else:
+        print("OK")
+except Exception:
+    print("ERR")' "$PLUGIN_ID" 2>/dev/null )" || out="ERR"
+    case "$out" in
+        OK) CODEX_STATE=""; CODEX_MARKET_ROOT="";;
+        OK\ *) CODEX_STATE="$(printf '%s' "${out#OK }" | cut -d' ' -f1,2)"; CODEX_MARKET_ROOT="$(printf '%s' "${out#OK }" | cut -d' ' -f3-)";;
+        *) CODEX_INSPECT="error"; return 0;;
+    esac
+    CODEX_INSPECT="ok"
+}
+inspect_codex
+if [ "$CODEX_INSPECT" = "error" ]; then
+    if [ "$CHECK" = 1 ]; then echo "UNINSPECTABLE  $(codex_home)/plugins exists but 'codex plugin list --json' could not be read; cannot approve the Codex side" >&2; INSPECT_FAILED=1
+    else echo "ERROR: $(codex_home)/plugins exists but the Codex plugin state cannot be inspected; refusing to change install mode." >&2; exit 1; fi
+fi
+codex_plugin_present() { [ "$CODEX_INSPECT" = "ok" ] && [ -n "$CODEX_STATE" ]; }
+codex_plugin_current() { codex_plugin_present && [ "$CODEX_MARKET_ROOT" = "$REPO_ROOT" ] && [ "$CODEX_STATE" = "$VERSION true" ]; }
+refresh_codex() { CODEX_INSPECT="absent"; CODEX_STATE=""; CODEX_MARKET_ROOT=""; inspect_codex; }
+codex_marketplace_root() { # -> root of our marketplace in codex, or ""
+    codex plugin marketplace list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for m in json.load(sys.stdin).get("marketplaces", []):
+        if m.get("name") == sys.argv[1]: print(m.get("root", "")); break
+except Exception:
+    pass' "$MARKETPLACE" 2>/dev/null || true
+}
+
 
 # --- skill mode: the plugin form must not stay active alongside the user-level skill --------
 # Done BEFORE any symlink is created: the skill symlink is only added once the plugin is
@@ -213,11 +278,25 @@ if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && plugin_present; then
     fi
     echo "removed   plugin $PLUGIN_ID (skill mode uses the user-level /secondopinion-respond skill instead)"
 fi
+if [ "$PLUGIN" = 0 ] && [ "$CHECK" = 0 ] && codex_plugin_present; then
+    codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 || { echo "ERROR: could not remove the Codex plugin $PLUGIN_ID; skill mode would duplicate the Codex skill. Run: codex plugin remove $PLUGIN_ID" >&2; exit 1; }
+    refresh_codex
+    if [ "$CODEX_INSPECT" != "ok" ] || codex_plugin_present; then
+        echo "ERROR: could not confirm that the Codex plugin $PLUGIN_ID is absent after removal (inspection=$CODEX_INSPECT, state='$CODEX_STATE'); refusing to create the Codex skill symlink." >&2; exit 1
+    fi
+    echo "removed   Codex plugin $PLUGIN_ID (skill mode uses the ~/.codex/skills symlink instead)"
+fi
 
 # ---- symlinks -----------------------------------------------------------------------------
 # Parallel arrays (a delimiter inside HOME must not be able to split a tuple).
-DESTS=("$HOME/.local/bin/secondopinion" "$HOME/.codex/skills/secondopinion-request")
-SRCS=("$ROOT/bin/secondopinion" "$ROOT/skills/codex/secondopinion-request")
+DESTS=("$HOME/.local/bin/secondopinion")
+SRCS=("$ROOT/bin/secondopinion")
+CODEX_SKILL_LINK="$HOME/.codex/skills/secondopinion-request"
+# The Codex skill is a symlink in skill mode (and in plugin mode when the codex CLI is absent);
+# otherwise it comes from the Codex plugin. --check accepts either form.
+if ! { [ "$PLUGIN" = 1 ] && have_codex; } && ! { [ "$CHECK" = 1 ] && codex_plugin_current; }; then
+    DESTS+=("$CODEX_SKILL_LINK"); SRCS+=("$ROOT/skills/secondopinion-request")
+fi
 # ~/.local/bin/agent-mailbox is the deprecated 1.x alias (same binary; prints a warning). It is
 # created on install so old scripts/skills keep working, but --check does not require it.
 if [ "$CHECK" != 1 ]; then DESTS+=("$HOME/.local/bin/agent-mailbox"); SRCS+=("$ROOT/bin/secondopinion"); fi
@@ -230,7 +309,7 @@ fi
 # The Claude skill is a symlink in skill mode; in plugin mode it comes from the plugin.
 # --check accepts either form.
 if [ "$PLUGIN" = 0 ] && ! { [ "$CHECK" = 1 ] && plugin_current; }; then
-    DESTS+=("$CLAUDE_SKILL_LINK"); SRCS+=("$ROOT/skills/claude/secondopinion-respond")
+    DESTS+=("$CLAUDE_SKILL_LINK"); SRCS+=("$ROOT/skills/secondopinion-respond")
 fi
 link_ok() { # dest src -> both resolve and to the same target
     local d s
@@ -280,12 +359,23 @@ if [ -f "$CODEX_CFG" ] && grep -q '^\[sandbox_workspace_write\]' "$CODEX_CFG"; t
         echo "ACTION    $CODEX_CFG already has a [sandbox_workspace_write] table whose writable_roots could not be extended automatically; add \"$STORE_DIR\" to that array by hand." >&2
         [ "$CHECK" = 1 ] && status=1
     fi
+    # `secondopinion ask` runs Claude Code from inside a Codex command; Codex's workspace-write
+    # sandbox has no network unless network_access = true. Set it once when absent; an explicit
+    # `false` is the user's decision and is reported, never flipped.
+    case "$(sandbox_network_setting)" in
+        true)  echo "ok        $CODEX_CFG: [sandbox_workspace_write] network_access = true (Codex commands may reach Claude)";;
+        false) echo "ACTION    $CODEX_CFG: [sandbox_workspace_write] network_access = false; 'secondopinion ask' cannot reach Claude from inside Codex until it is true (left unchanged: your choice)." >&2
+               [ "$CHECK" = 1 ] && status=1;;
+        *)     if [ "$CHECK" = 1 ]; then echo "MISSING   $CODEX_CFG: [sandbox_workspace_write] network_access = true (needed by 'secondopinion ask' from inside Codex)"; status=1
+               elif set_sandbox_network_true; then echo "config    $CODEX_CFG: set [sandbox_workspace_write] network_access = true (Codex commands may reach Claude; previous file backed up)"
+               else echo "ACTION    $CODEX_CFG: could not set network_access = true in [sandbox_workspace_write]; add it by hand." >&2; fi;;
+    esac
 elif [ "$CHECK" = 1 ]; then
     echo "MISSING   $CODEX_CFG: [sandbox_workspace_write] writable_roots for $STORE_DIR"; status=1
 else
     mkdir -p "$(dirname "$CODEX_CFG")"
-    { [ -f "$CODEX_CFG" ] && [ -n "$(tail -c1 "$CODEX_CFG")" ] && echo; printf '\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\n' "$STORE_DIR"; } >> "$CODEX_CFG"
-    echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] (Codex sandbox may write the store)"
+    { [ -f "$CODEX_CFG" ] && [ -n "$(tail -c1 "$CODEX_CFG")" ] && echo; printf '\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\nnetwork_access = true\n' "$STORE_DIR"; } >> "$CODEX_CFG"
+    echo "config    $CODEX_CFG: added [sandbox_workspace_write] writable_roots = [\"$STORE_DIR\"] and network_access = true (Codex sandbox may write the store and reach Claude)"
 fi
 
 # --- plugin mode: Claude side through the plugin system ------------------------------------
@@ -297,17 +387,17 @@ if [ "$PLUGIN" = 1 ]; then
         mv -T -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
     fi
     mp="$(marketplace_path)"
-    if [ -n "$mp" ] && [ "$mp" != "$ROOT" ]; then
+    if [ -n "$mp" ] && [ "$mp" != "$REPO_ROOT" ]; then
         # A marketplace of our name pointing elsewhere (moved or stale checkout): replace it.
         claude plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 || true
         echo "removed   stale marketplace $MARKETPLACE -> $mp"; mp=""
     fi
     if [ -z "$mp" ]; then
-        claude plugin marketplace add "$ROOT" >/dev/null || { echo "ERROR: claude plugin marketplace add $ROOT failed" >&2; exit 1; }
-        echo "added     marketplace $MARKETPLACE -> $ROOT"
+        claude plugin marketplace add "$REPO_ROOT" >/dev/null || { echo "ERROR: claude plugin marketplace add $REPO_ROOT failed" >&2; exit 1; }
+        echo "added     marketplace $MARKETPLACE -> $REPO_ROOT"
     else
         claude plugin marketplace update "$MARKETPLACE" >/dev/null || { echo "ERROR: claude plugin marketplace update $MARKETPLACE failed" >&2; exit 1; }
-        echo "ok        marketplace $MARKETPLACE ($ROOT) refreshed"
+        echo "ok        marketplace $MARKETPLACE ($REPO_ROOT) refreshed"
     fi
     state="$(plugin_state)"
     if [ -z "$state" ]; then
@@ -333,18 +423,49 @@ if [ "$PLUGIN" = 1 ]; then
     fi
     refresh_plugins
     if plugin_current; then
-        echo "ok        plugin $PLUGIN_ID $VERSION enabled from $ROOT (skill: /secondopinion:secondopinion-respond; restart Claude Code to apply)"
+        echo "ok        plugin $PLUGIN_ID $VERSION enabled from $REPO_ROOT (skill: /secondopinion:secondopinion-respond; restart Claude Code to apply)"
     else
-        echo "ERROR: plugin verification failed: state='$(plugin_state)' marketplace='$(marketplace_path)' (want '$VERSION true' from $ROOT)" >&2; exit 1
+        echo "ERROR: plugin verification failed: state='$(plugin_state)' marketplace='$(marketplace_path)' (want '$VERSION true' from $REPO_ROOT)" >&2; exit 1
+    fi
+    # Codex side: same marketplace repo through `codex plugin`; skill symlink retired.
+    if have_codex; then
+        if [ -L "$CODEX_SKILL_LINK" ]; then rm -f -- "$CODEX_SKILL_LINK"; echo "retired   $CODEX_SKILL_LINK (Codex skill now comes from the plugin)"; fi
+        cmr="$(codex_marketplace_root)"
+        if [ -n "$cmr" ] && [ "$cmr" != "$REPO_ROOT" ]; then
+            codex plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 || true; echo "removed   stale Codex marketplace $MARKETPLACE -> $cmr"; cmr=""
+        fi
+        if [ -z "$cmr" ]; then
+            codex plugin marketplace add "$REPO_ROOT" >/dev/null 2>&1 || { echo "ERROR: codex plugin marketplace add $REPO_ROOT failed" >&2; exit 1; }
+            echo "added     Codex marketplace $MARKETPLACE -> $REPO_ROOT"
+        fi
+        refresh_codex
+        if ! codex_plugin_current; then
+            codex_plugin_present && { codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 || true; }
+            codex plugin add "$PLUGIN_ID" >/dev/null 2>&1 || { echo "ERROR: codex plugin add $PLUGIN_ID failed" >&2; exit 1; }
+            refresh_codex
+        fi
+        if codex_plugin_current; then
+            echo "ok        Codex plugin $PLUGIN_ID $VERSION enabled from $REPO_ROOT (restart Codex to apply)"
+        else
+            echo "ERROR: Codex plugin verification failed: state='$CODEX_STATE' marketplace='$CODEX_MARKET_ROOT' (want '$VERSION true' from $REPO_ROOT)" >&2; exit 1
+        fi
+    else
+        echo "note      'codex' CLI not on PATH: the Codex skill was symlinked instead of installed as a plugin"
     fi
 fi
 if [ "$CHECK" = 1 ]; then
     [ "${INSPECT_FAILED:-0}" = 1 ] && status=1
+    if codex_plugin_current && { [ -e "$CODEX_SKILL_LINK" ] || [ -L "$CODEX_SKILL_LINK" ]; }; then
+        echo "DUPLICATE both the Codex plugin $PLUGIN_ID and the skill symlink $CODEX_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
+    elif codex_plugin_current; then echo "ok        Codex side: plugin $PLUGIN_ID $VERSION"
+    elif [ -L "$CODEX_SKILL_LINK" ]; then echo "ok        Codex side: skill symlink $CODEX_SKILL_LINK"
+    elif codex_plugin_present; then echo "STALE     Codex plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$CODEX_STATE', marketplace='$CODEX_MARKET_ROOT'); run install.sh --plugin" >&2; status=1
+    fi
     if plugin_current && { [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; }; then
         echo "DUPLICATE both the plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh (skill mode) or install.sh --plugin to pick one" >&2; status=1
     elif plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /secondopinion:secondopinion-respond)"
     elif [ -L "$CLAUDE_SKILL_LINK" ]; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /secondopinion-respond)"
-    elif plugin_present; then echo "STALE     plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $ROOT' (state='$(plugin_state)', marketplace='$(marketplace_path)'); run install.sh --plugin" >&2; status=1
+    elif plugin_present; then echo "STALE     plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$(plugin_state)', marketplace='$(marketplace_path)'); run install.sh --plugin" >&2; status=1
     fi
 fi
 

@@ -71,6 +71,14 @@ secondopinion $VERSION — sealed, verifiable second-opinion exchanges between c
 Store: $STORE   (override: SECONDOPINION_DIR)
 
 Requester (Codex) side:
+  ask --topic TOPIC (--file REQ.md | --file - | --task TEXT) [--timeout S] [--write]
+      [--background] [--model M] [--json]
+                          one call: create+publish the exchange, run a headless Claude Code
+                          responder in this checkout (/secondopinion-respond ID, never prompts:
+                          --permission-mode dontAsk + tool allowlist; --write = acceptEdits),
+                          wait, validate and print the answer. exit 0 answered | 124 timeout |
+                          1 error (exchange stays published for a retry). --background returns
+                          the ID at once; then: wait ID / read-response ID.
   new --topic TOPIC [--target NAME] [--requester NAME]   create a draft exchange, print its ID
   publish ID              freeze prompt.md (records SHA-256); makes it visible as pending
   wait ID [--timeout S]   block until a valid response exists (default timeout $DEFAULT_WAIT_TIMEOUT s)
@@ -92,7 +100,10 @@ Both:
   help | --help
 
 Environment: SECONDOPINION_DIR, SECONDOPINION_OWNER (default claim owner),
-             SECONDOPINION_STALE_CLAIM_SECS (default 1800; --takeover allowed after this)
+             SECONDOPINION_STALE_CLAIM_SECS (default 1800; --takeover allowed after this),
+             SECONDOPINION_CLAUDE (responder binary, default: claude), SECONDOPINION_CLAUDE_ARGS
+             (extra flags appended to the responder command), SECONDOPINION_MAX_TURNS (default 60),
+             SECONDOPINION_ASK_TIMEOUT (default 1800)
 EOF
 }
 
@@ -259,7 +270,7 @@ ensure_store() {
         echo "ERROR: cannot create mailbox store $STORE (read-only or no permission)." >&2
         echo "       Under a Codex workspace-write sandbox the store must be a writable root:" >&2
         echo "       ~/.codex/config.toml -> [sandbox_workspace_write] writable_roots = [\"$STORE\"]" >&2
-        echo "       (~/tools/secondopinion/install.sh adds it; or set SECONDOPINION_DIR to a writable path)." >&2
+        echo "       (~/tools/secondopinion/scripts/install.sh adds it; or set SECONDOPINION_DIR to a writable path)." >&2
         exit 1
     fi
     chmod 700 "$STORE" "$EXCH" "$ARCH" 2>/dev/null || true
@@ -351,6 +362,97 @@ EOF
     echo "prompt_path=$dir/prompt.md"
     echo "state=draft"
     echo "next=edit prompt.md, then: secondopinion publish $id"
+}
+
+# ---- ask: the no-intervention path -------------------------------------------------------
+# Mirrors the Codex plugin's shape from the other side: one command publishes the exchange and
+# runs a headless Claude Code responder that never prompts (deny-instead-of-ask), in the exact
+# checkout the request was made from, then returns the validated answer.
+RESPONDER_LOG=""
+responder_cmd() { # id write_mode model -> prints the argv (NUL-free, one arg per line)
+    local bin="${SECONDOPINION_CLAUDE:-claude}"
+    printf '%s\n' "$bin" -p "/secondopinion-respond $1" --no-session-persistence \
+        --max-turns "${SECONDOPINION_MAX_TURNS:-60}" --output-format json
+    if [ "$2" = 1 ]; then
+        printf '%s\n' --permission-mode acceptEdits --allowedTools Bash
+    else
+        printf '%s\n' --permission-mode dontAsk --allowedTools "Bash,Read,Grep,Glob,Write" \
+            --disallowedTools "Edit,NotebookEdit,WebFetch,WebSearch"
+    fi
+    [ -n "$3" ] && printf '%s\n' --model "$3"
+    return 0
+}
+cmd_ask() {
+    local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 background=0 model="" json=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
+            --file) [ "$#" -ge 2 ] || die "--file requires a value"; file="$2"; shift 2;;
+            --task) [ "$#" -ge 2 ] || die "--task requires a value"; task="$2"; shift 2;;
+            --timeout) [ "$#" -ge 2 ] || die "--timeout requires seconds"; timeout="$2"; shift 2;;
+            --model) [ "$#" -ge 2 ] || die "--model requires a value"; model="$2"; shift 2;;
+            --write) write=1; shift;;
+            --background) background=1; shift;;
+            --json) json=1; shift;;
+            -h|--help) usage; exit 0;;
+            *) die "unknown ask option: $1";;
+        esac
+    done
+    [ -n "$topic" ] || die "ask requires --topic TOPIC"
+    { [ -n "$file" ] && [ -z "$task" ]; } || { [ -z "$file" ] && [ -n "$task" ]; } || die "ask requires exactly one of --file REQ.md (or --file -) or --task TEXT"
+    timeout="$(parse_secs "--timeout" "$timeout")" || exit 1
+    [ -z "$model" ] || safe_value "--model" "$model"
+    local bin="${SECONDOPINION_CLAUDE:-claude}"
+    command -v -- "$bin" >/dev/null 2>&1 || die "responder binary '$bin' not found (install the 'claude' CLI so it is on PATH, or set SECONDOPINION_CLAUDE); no exchange was created"
+    # Read the request text before creating anything.
+    local request
+    if [ -n "$task" ]; then request="$task"
+    elif [ "$file" = "-" ]; then request="$(cat)"
+    else regular "$file" || die "request file missing or not a regular file: $file"; request="$(cat -- "$file")"; fi
+    [ -n "$(trim "$request")" ] || die "the request text is empty"
+    # Create + fill + publish.
+    local created id dir prompt
+    created="$(cmd_new --topic "$topic")" || exit 1
+    id="$(printf '%s\n' "$created" | awk -F= '$1=="exchange_id"{print $2; exit}')"
+    dir="$(active_dir "$id")"; prompt="$dir/prompt.md"
+    # Replace the placeholder block with the request (kept as a private temp, then moved).
+    local tmp; tmp="$(mktemp "$dir/.prompt.tmp.XXXXXX")"
+    awk -v req="$request" '
+        BEGIN{skip=0}
+        /^<!-- Replace this section with the focused request for /{skip=1; print req; next}
+        skip==1 { if ($0 ~ /-->$/) {skip=0}; next }
+        {print}' "$prompt" > "$tmp" && mv -f -- "$tmp" "$prompt"
+    chmod 600 "$prompt"
+    cmd_publish "$id" >/dev/null || exit 1
+    # Responder in the checkout the exchange records (or the cwd for non-git requests).
+    local repo; repo="$(meta_get "$dir" repo)"; [ -d "$repo" ] || repo="$PWD"
+    mkdir -p "$STORE/responder-logs"; chmod 700 "$STORE/responder-logs"
+    RESPONDER_LOG="$STORE/responder-logs/$id.log"
+    local argv=(); mapfile -t argv < <(responder_cmd "$id" "$write" "$model")
+    if [ -n "${SECONDOPINION_CLAUDE_ARGS:-}" ]; then
+        # shellcheck disable=SC2206
+        local extra=( ${SECONDOPINION_CLAUDE_ARGS} ); argv+=("${extra[@]}")
+    fi
+    lock "$dir"; meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" ask_started_utc "$(now_utc)"; unlock
+    if [ "$background" = 1 ]; then
+        ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
+        echo "exchange_id=$id"; echo "state=published"; echo "responder=background"; echo "responder_log=$RESPONDER_LOG"
+        echo "next=secondopinion wait $id  &&  secondopinion read-response $id"
+        return 0
+    fi
+    local rc=0
+    ( cd -- "$repo" && exec timeout --kill-after=10 "$timeout" "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) || rc=$?
+    local state; state="$(meta_get "$dir" state)"
+    if [ "$state" = "answered" ] && [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
+        if [ -n "$json" ]; then emit_status "$dir" json; echo; else cat "$dir/response.md"; fi
+        return 0
+    fi
+    echo "exchange_id=$id" >&2; echo "state=$state" >&2; echo "responder_log=$RESPONDER_LOG" >&2
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        echo "result=timeout after ${timeout}s; the exchange stays published (run: secondopinion wait $id, or a Claude session: /secondopinion-respond $id)" >&2
+        return 124
+    fi
+    die "responder exited $rc without a valid answer; see the log above (the exchange stays published for a retry)"
 }
 
 cmd_publish() {
@@ -660,6 +762,7 @@ main() {
     local cmd="$1"; shift
     case "$cmd" in
         new) cmd_new "$@";;
+        ask) cmd_ask "$@";;
         publish) cmd_publish "$@";;
         list) cmd_list "$@";;
         status) cmd_status "$@";;

@@ -1,0 +1,40 @@
+{
+  "name": "secondopinion",
+  "version": "2.0.0",
+  "description": "Global file-based mailbox for Codex→Claude Code review exchanges: the secondopinion-request skill creates, publishes, waits for and reads exchanges in the ~/.secondopinion store (requires the secondopinion CLI on PATH; see install.sh).",
+  "author": {
+    "name": "Tim Sloper",
+    "email": "tim.sloper@outlook.com",
+    "url": "https://github.com/tsloper"
+  },
+  "homepage": "https://github.com/tsloper/secondopinion",
+  "repository": "https://github.com/tsloper/secondopinion",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "claude-code",
+    "second-opinion",
+    "review",
+    "multi-agent"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Second Opinion",
+    "shortDescription": "Hands-free second opinions from Claude Code, right from Codex",
+    "longDescription": "secondopinion lets Codex ask Claude Code for an independent review, red-team, verification or diagnosis and get the answer back without any user intervention. One command publishes a hash-bound request recorded against the exact checkout, runs a headless Claude Code responder that never prompts, and returns the validated answer. Works across repositories, git worktrees and sessions.",
+    "developerName": "Tim Sloper",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Get a second opinion from Claude on this change.",
+      "Ask Claude to red-team this design.",
+      "Have Claude verify these findings."
+    ],
+    "websiteURL": "https://github.com/tsloper/secondopinion",
+    "brandColor": "#2563EB"
+  }
+}

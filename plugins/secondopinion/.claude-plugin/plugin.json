@@ -3,8 +3,19 @@
   "name": "secondopinion",
   "version": "2.0.0",
   "description": "Global file-based mailbox for Codex→Claude Code review exchanges: the secondopinion-respond skill answers pending exchanges held in the ~/.secondopinion store (requires the secondopinion CLI on PATH; see install.sh).",
-  "author": { "name": "Tim Sloper", "email": "tim.sloper@outlook.com" },
+  "author": {
+    "name": "Tim Sloper",
+    "email": "tim.sloper@outlook.com",
+    "url": "https://github.com/tsloper"
+  },
   "license": "MIT",
-  "keywords": ["codex", "claude-code", "review", "mailbox", "multi-agent"],
-  "skills": ["./skills/claude"]
+  "keywords": [
+    "codex",
+    "claude-code",
+    "review",
+    "mailbox",
+    "multi-agent"
+  ],
+  "repository": "https://github.com/tsloper/secondopinion",
+  "homepage": "https://github.com/tsloper/secondopinion"
 }

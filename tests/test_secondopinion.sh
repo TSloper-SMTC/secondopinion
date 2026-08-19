@@ -4,7 +4,7 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AM="$HERE/../bin/secondopinion"
+AM="$HERE/../plugins/secondopinion/bin/secondopinion"
 PASS=0; FAIL=0; CURRENT=""
 
 # --- tiny harness -----------------------------------------------------------
@@ -21,6 +21,7 @@ val() { awk -v k="$1" -F= '$1==k{sub(/^[^=]*=/,""); print; exit}' ; }  # key=val
 
 # --- fixtures ---------------------------------------------------------------
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+export HOME="$TMP/home"; mkdir -p "$HOME"     # never let any fallback path touch the real HOME
 export SECONDOPINION_DIR="$TMP/store"
 export SECONDOPINION_STALE_CLAIM_SECS=3600
 unset CODEX_THREAD_ID
@@ -602,6 +603,88 @@ assert_grep "install.sh" <(echo "$out")
 mkdir -p "$LH/.secondopinion"
 out="$(env -u SECONDOPINION_DIR -u AGENT_MAILBOX_DIR HOME="$LH" "$AM" list 2>&1 >/dev/null)"
 assert_eq "$out" "" "(no warning when the new store exists)"
+
+# ===========================================================================
+# 2.0.0: `ask` — one command that publishes, spawns a headless responder, waits, and prints the answer
+
+STUB_DIR="$TMP/claude-stub"; mkdir -p "$STUB_DIR"
+# A stand-in for the `claude` CLI: records its argv, extracts the exchange id from the -p prompt,
+# and answers through the real tool exactly like the headless skill would.
+cat > "$STUB_DIR/claude" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$@" > "${STUB_ARGV_FILE:?}"
+printf '%s\n' "$PWD" > "${STUB_CWD_FILE:?}"
+[ -t 0 ] && echo "stdin-is-tty" >> "${STUB_ARGV_FILE}"
+id=""; prev=""; for a in "$@"; do if [ "$prev" = "-p" ]; then id="${a#/secondopinion-respond }"; fi; prev="$a"; done
+case "${STUB_MODE:-answer}" in
+  answer)
+    tok="$("$STUB_AM" claim "$id" --owner stub 2>/dev/null | awk -F= '/^claim_token=/{print $2}')"
+    printf 'Exchange-ID: %s\nResponder: Stub Claude\n\nverdict: PROVEN stub-answer\n' "$id" > "$STUB_DIR/resp.md"
+    "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1; echo '{"is_error":false}';;
+  slow)   sleep 30;;
+  fail)   echo "boom" >&2; exit 1;;
+esac
+STUB
+chmod +x "$STUB_DIR/claude"
+export STUB_DIR STUB_AM="$AM" STUB_ARGV_FILE="$TMP/stub-argv" STUB_CWD_FILE="$TMP/stub-cwd"
+printf 'Please check the thing.\nSecond line.\n' > "$TMP/request.md"
+
+t "ask: publishes, spawns the responder in the checkout, waits, prints the validated answer, exit 0"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask one" --file "$TMP/request.md" --timeout 60 2>"$TMP/ask.err")"; rc=$?
+assert_eq "$rc" 0 "(ask rc)"
+IDASK="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+[ -n "$IDASK" ] && ok || fail "answer not printed (out: $(echo "$out" | head -3))"
+assert_grep "verdict: PROVEN stub-answer" <(echo "$out")
+assert_eq "$("$AM" status "$IDASK" | val state)" "answered"
+assert_grep "Please check the thing." "$("$AM" path "$IDASK")/prompt.md"          # request text became the Task section
+assert_not_grep "Replace this section" "$("$AM" path "$IDASK")/prompt.md"
+assert_eq "$(cat "$STUB_CWD_FILE")" "$TMP/repoA-wt" "(responder cwd = the checkout the request was made from)"
+grep -q -- "^/secondopinion-respond $IDASK$" "$STUB_ARGV_FILE" && ok || fail "responder was not invoked with the skill + id: $(cat "$STUB_ARGV_FILE" | tr '\n' ' ')"
+grep -q -- "^dontAsk$" "$STUB_ARGV_FILE" && ok || fail "default (review) profile must use --permission-mode dontAsk"
+grep -q -- "^--no-session-persistence$" "$STUB_ARGV_FILE" && ok || fail "responder must not persist sessions"
+grep -q "stdin-is-tty" "$STUB_ARGV_FILE" && fail "responder stdin must be /dev/null" || ok
+
+t "ask --write: uses the write profile (acceptEdits) instead of dontAsk"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask write" --file "$TMP/request.md" --write --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0
+grep -q -- "^acceptEdits$" "$STUB_ARGV_FILE" && ok || fail "--write must select acceptEdits"
+
+t "ask: responder failure -> exit 1, exchange stays published (retryable), log path reported"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=fail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask fail" --file "$TMP/request.md" --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc on responder failure)"
+IDF="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+assert_eq "$("$AM" status "$IDF" | val state)" "published"
+assert_grep "log" <(echo "$out")
+
+t "ask --timeout: a slow responder is killed, exit 124, exchange still pending for a later responder"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask slow" --file "$TMP/request.md" --timeout 2 2>&1)"; rc=$?
+assert_eq "$rc" 124 "(ask rc on timeout)"
+IDS="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+assert_eq "$("$AM" status "$IDS" | val state)" "published"
+sleep 1; pgrep -f "STUB_MODE=slow" >/dev/null 2>&1 && fail "slow responder still running after timeout" || ok
+
+t "ask --background: returns immediately with the id; wait/read-response complete later"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask bg" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0
+IDB="$(echo "$out" | val exchange_id)"
+[ -n "$IDB" ] && ok || fail "no exchange_id printed"
+assert_rc 0 "$AM" wait "$IDB" --timeout 30
+assert_grep "stub-answer" <("$AM" read-response "$IDB")
+
+t "ask: refuses to start without a claude binary and creates no exchange"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$TMP/does-not-exist" "$AM" ask --topic "no claude" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1
+assert_grep "claude" <(echo "$out")
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count"
+
+t "ask: task text via --task and via stdin (-)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask task" --task "Inline task text" --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0
+IDT="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"; assert_grep "Inline task text" "$("$AM" path "$IDT")/prompt.md"
+out="$(cd "$TMP/repoA-wt" && printf 'Piped task\n' | SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask stdin" --file - --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0
+IDP="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"; assert_grep "Piped task" "$("$AM" path "$IDP")/prompt.md"
 
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"
