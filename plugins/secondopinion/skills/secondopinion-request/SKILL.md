@@ -37,7 +37,15 @@ the answer.
    ```
 
    For a long or open-ended request use `--background`; it prints the ID at
-   once. Keep working, then check `secondopinion jobs` (repository-scoped:
+   once. IMPORTANT under Codex: your commands run in a PID-namespaced sandbox
+   that is torn down when the launching exec finishes — a detached background
+   responder is killed with it (`ask` prints a WARNING when it detects this).
+   Either run the ask in the FOREGROUND inside a persistent exec session, or
+   keep the launching session alive until the answer lands. If a background
+   responder died this way (state=published, responder=exited, empty log),
+   re-launch one for the same exchange with `secondopinion ask --attach <ID>`
+   instead of creating a new exchange. `ask --background` exits nonzero with
+   `responder=startup-failed` when the responder dies within seconds. Keep working, then check `secondopinion jobs` (repository-scoped:
    state, age, responder liveness), `secondopinion wait <ID> --timeout 600`
    and `secondopinion result <ID>`; a stuck responder can be stopped with
    `secondopinion cancel <ID>` (the exchange stays published for a retry).

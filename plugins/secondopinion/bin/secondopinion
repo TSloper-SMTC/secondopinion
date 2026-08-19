@@ -80,6 +80,9 @@ Requester (Codex) side:
   ask --topic TOPIC (--file REQ.md | --file - | --task TEXT) [--timeout S] [--write]
       [--background] [--model M] [--effort L] [--max-turns N] [--json] [--persist]
       [--follow-up ID | --resume ID] [--fresh]
+  ask --attach ID [--write] [--model M] [--effort L] [--max-turns N] [--timeout S] [--background]
+                          re-launch a headless responder for an EXISTING published exchange
+                          (e.g. after a background responder died with its sandbox)
                           one call: create+publish the exchange, run a headless Claude Code
                           responder in this checkout (self-contained prompt, never prompts:
                           --permission-mode dontAsk + tool allowlist; --write = acceptEdits),
@@ -455,7 +458,7 @@ build_responder_argv() { # arrayname id write_mode model effort session_mode ses
 }
 cmd_ask() {
     local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 background=0 model="" json=""
-    local effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}" maxturns=""
+    local effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}" maxturns="" attach=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
@@ -465,6 +468,7 @@ cmd_ask() {
             --model) [ "$#" -ge 2 ] || die "--model requires a value"; model="$2"; shift 2;;
             --effort) [ "$#" -ge 2 ] || die "--effort requires a level"; effort="$2"; shift 2;;
             --max-turns) [ "$#" -ge 2 ] || die "--max-turns requires a count"; maxturns="$2"; shift 2;;
+            --attach) [ "$#" -ge 2 ] || die "--attach requires an exchange ID"; attach="$2"; shift 2;;
             --follow-up) [ "$#" -ge 2 ] || die "--follow-up requires a parent exchange ID"; followup="$2"; shift 2;;
             --resume) [ "$#" -ge 2 ] || die "--resume requires a parent exchange ID"; resume="$2"; shift 2;;
             --persist) persist=1; shift;;
@@ -476,8 +480,14 @@ cmd_ask() {
             *) die "unknown ask option: $1";;
         esac
     done
-    [ -n "$topic" ] || die "ask requires --topic TOPIC"
-    { [ -n "$file" ] && [ -z "$task" ]; } || { [ -z "$file" ] && [ -n "$task" ]; } || die "ask requires exactly one of --file REQ.md (or --file -) or --task TEXT"
+    if [ -n "$attach" ]; then
+        require_id "$attach"
+        { [ -z "$topic$file$task$followup$resume" ] && [ "$persist" = 0 ]; } \
+            || die "--attach re-launches a responder for an EXISTING published exchange; it cannot be combined with --topic/--file/--task/--follow-up/--resume/--persist"
+    else
+        [ -n "$topic" ] || die "ask requires --topic TOPIC"
+        { [ -n "$file" ] && [ -z "$task" ]; } || { [ -z "$file" ] && [ -n "$task" ]; } || die "ask requires exactly one of --file REQ.md (or --file -) or --task TEXT"
+    fi
     timeout="$(parse_secs "--timeout" "$timeout")" || exit 1
     [ "$timeout" -gt 0 ] || die "ask --timeout must be at least 1 second (GNU timeout treats 0 as 'no limit'); no exchange was created"
     [ -z "$model" ] || safe_value "--model" "$model"
@@ -525,12 +535,28 @@ cmd_ask() {
         session_mode="persist"; session_arg="$(new_session_uuid)"
         printf '%s' "$session_arg" | grep -Eq '^[0-9a-f-]{36}$' || die "could not generate a session id (python3 or uuidgen required for --persist)"
     fi
+    local id dir
+    if [ -n "$attach" ]; then
+        [ -L "$EXCH/$attach" ] && die "refusing symlinked exchange directory: $attach"
+        is_active "$attach" || { is_archived "$attach" && die "exchange $attach is archived: secondopinion result $attach"; die "unknown exchange: $attach"; }
+        dir="$EXCH/$attach"; check_components "$dir"
+        local astate; astate="$(meta_get "$dir" state)"
+        case "$astate" in
+            published) ;;
+            claimed)  die "exchange $attach is claimed by '$(meta_get "$dir" claimed_by)'; a second responder cannot attach — wait for it, or after SECONDOPINION_STALE_CLAIM_SECS a responder may claim $attach --takeover";;
+            answered|archived) die "exchange $attach is already $astate: secondopinion result $attach";;
+            *) die "exchange $attach is not published (state=$astate); publish it first";;
+        esac
+        [ "$(prompt_ok "$dir")" = "yes" ] || die "exchange $attach prompt failed validation; refusing to attach a responder"
+        id="$attach"
+    fi
     # Read the request text before creating anything.
-    local request
-    if [ -n "$task" ]; then request="$task"
+    local request=""
+    if [ -n "$attach" ]; then :
+    elif [ -n "$task" ]; then request="$task"
     elif [ "$file" = "-" ]; then request="$(cat)"
     else regular "$file" || die "request file missing or not a regular file: $file"; request="$(cat -- "$file")"; fi
-    [ -n "$(trim "$request")" ] || die "the request text is empty"
+    [ -n "$attach" ] || [ -n "$(trim "$request")" ] || die "the request text is empty"
     if [ -n "$parent" ]; then
         request="$request
 
@@ -543,8 +569,9 @@ $parent_prompt_txt
 $parent_resp_txt
 --- end of parent context ---"
     fi
-    # Create + fill + publish.
-    local created id dir prompt
+    # Create + fill + publish (skipped for --attach: the exchange already exists).
+    local created prompt
+    if [ -z "$attach" ]; then
     local new_args=(--topic "$topic"); [ -n "$parent" ] && new_args+=(--parent "$parent")
     created="$(cmd_new "${new_args[@]}")" || exit 1
     id="$(printf '%s\n' "$created" | awk -F= '$1=="exchange_id"{print $2; exit}')"
@@ -558,6 +585,7 @@ $parent_resp_txt
         {print}' "$prompt" > "$tmp" && mv -f -- "$tmp" "$prompt"
     chmod 600 "$prompt"
     cmd_publish "$id" >/dev/null || exit 1
+    fi
     # Responder in the checkout the exchange records (or the cwd for non-git requests).
     local repo; repo="$(meta_get "$dir" repo)"; [ -d "$repo" ] || repo="$PWD"
     mkdir -p "$STORE/responder-logs"; chmod 700 "$STORE/responder-logs"
@@ -578,11 +606,33 @@ $parent_resp_txt
     esac
     unlock
     if [ "$background" = 1 ]; then
+        local sandbox_init
+        if sandbox_init="$(in_ephemeral_sandbox)"; then
+            echo "WARNING: this shell runs inside a PID-namespaced sandbox (init='$sandbox_init'). A --background responder is detached from the shell but CANNOT survive the sandbox: it will be KILLED when the launching command's sandbox is torn down. Keep this session alive until the exchange is answered, use a foreground ask, or re-launch later with: secondopinion ask --attach $id" >&2
+        fi
         ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
         local bgpid=$! bgstart
         bgstart="$(proc_start "$bgpid")"
         lock "$dir"; meta_set "$dir" responder_pid "$bgpid" responder_starttime "${bgstart:-unknown}"; unlock
-        echo "exchange_id=$id"; echo "state=$(meta_get "$dir" state)"; echo "responder=background"; echo "responder_pid=$bgpid"; echo "responder_log=$RESPONDER_LOG"
+        # Startup handshake (up to 2s): a responder that dies immediately without claiming
+        # or answering is a startup failure and must be reported as one, not as success.
+        local hs="running" hi=0 hstate
+        while [ "$hi" -lt 20 ]; do
+            if [ -z "$bgstart" ] || [ "$(proc_start "$bgpid")" != "$bgstart" ]; then
+                hstate="$(meta_get "$dir" state)"
+                case "$hstate" in answered|claimed) hs="finished";; *) hs="dead";; esac
+                break
+            fi
+            if [ -s "$RESPONDER_LOG" ] || [ "$(meta_get "$dir" state)" != "published" ]; then break; fi
+            sleep 0.1; hi=$((hi+1))
+        done
+        echo "exchange_id=$id"; echo "state=$(meta_get "$dir" state)"
+        if [ "$hs" = "dead" ]; then
+            echo "responder=startup-failed"; echo "responder_pid=$bgpid"; echo "responder_log=$RESPONDER_LOG"
+            echo "result=the responder exited within seconds without claiming or answering; inspect the log, then retry with: secondopinion ask --attach $id" >&2
+            return 1
+        fi
+        echo "responder=background"; echo "responder_pid=$bgpid"; echo "responder_log=$RESPONDER_LOG"
         echo "next=secondopinion wait $id  &&  secondopinion read-response $id"
         return 0
     fi
@@ -1030,6 +1080,11 @@ cmd_wait() {
         local remain=$(( deadline - now )); local nap=$POLL_SECS; [ "$remain" -lt "$nap" ] && nap="$remain"
         sleep "$nap"
     done
+}
+
+in_ephemeral_sandbox() { # prints /proc/1/comm and succeeds when PID 1 is not a real init
+    local c; c="$(cat /proc/1/comm 2>/dev/null)" || return 1
+    case "$c" in systemd|init) return 1;; "") return 1;; *) printf '%s\n' "$c"; return 0;; esac
 }
 
 proc_start() { # pid -> kernel start time in clock ticks, or "" if no such process

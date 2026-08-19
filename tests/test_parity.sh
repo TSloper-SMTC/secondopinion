@@ -428,5 +428,54 @@ out="$(cd "$TMP/repoF" && SECONDOPINION_DIR="$NSTORE" SECONDOPINION_RETAIN=2 "$A
 grep -q "retention" "$TMP/n.err" && grep -q "prune" "$TMP/n.err" && ok || fail "no jobs retention note: $(cat "$TMP/n.err")"
 echo "$out" | grep -q "retention" && fail "retention note leaked into the jobs table" || ok
 
+# ===========================================================================
+# Sandbox fixes: startup handshake, ask --attach, PID-namespace warning
+
+t "ask --background: a responder that dies at startup is reported startup-failed (exit 1); the exchange stays published"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=fail "$AM" ask --topic "hs fail" --file "$TMP/request.md" --background 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(startup failure must be nonzero)"
+echo "$out" | grep -q "responder=startup-failed" && ok || fail "no startup-failed report: $out"
+IDHF="$(echo "$out" | val exchange_id)"
+assert_eq "$("$AM" status "$IDHF" | val state)" "published" "(exchange stays recoverable)"
+echo "$out" | grep -q "responder_log=" && ok || fail "startup failure does not point at the log"
+
+t "ask --background: healthy slow and fast responders still report background/answered with exit 0"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$AM" ask --topic "hs slow" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(slow responder)"
+echo "$out" | grep -q "responder=background" && ok || fail "healthy background not reported: $out"
+IDHS="$(echo "$out" | val exchange_id)"; "$AM" cancel "$IDHS" >/dev/null 2>&1
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "hs fast" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(fast responder)"
+IDHA="$(echo "$out" | val exchange_id)"
+assert_rc 0 "$AM" wait "$IDHA" --timeout 30
+
+t "ask --attach: re-launches a responder for an existing published exchange; refuses claimed/answered/mixed arguments"
+res="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHF" --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(attach to the startup-failed exchange)"
+echo "$res" | grep -q "stub-answer" && ok || fail "attach did not return the validated answer: $res"
+assert_eq "$("$AM" status "$IDHF" | val state)" "answered"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHF" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach to an answered exchange)"
+echo "$out" | grep -q "result" && ok || fail "answered-attach refusal lacks the result hint: $out"
+CLID="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=fail "$AM" ask --topic "attach claimed" --file "$TMP/request.md" --background 2>/dev/null | val exchange_id)"
+"$AM" claim "$CLID" --owner someone-else >/dev/null 2>&1
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$CLID" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach to a claimed exchange)"
+echo "$out" | grep -qi "claim" && ok || fail "claimed-attach refusal does not explain the claim: $out"
+assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHF" --task "extra"
+
+t "sandbox: --background inside a PID namespace prints a teardown warning; the post-mortem is honest"
+if unshare -Ur -pf true 2>/dev/null; then
+  out="$(env SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow unshare -Ur -pf --mount-proc bash -c "cd '$TMP/repoA' && '$AM' ask --topic sbx --file '$TMP/request.md' --background" 2>&1)"; rc=$?
+  echo "$out" | grep -qi "sandbox" && echo "$out" | grep -qi "killed\|will not survive" && ok || fail "no sandbox teardown warning: $out"
+  IDSB="$(echo "$out" | val exchange_id)"
+  sleep 1
+  assert_eq "$("$AM" status "$IDSB" | val responder_status)" "exited" "(responder died with the namespace)"
+  assert_rc 1 "$AM" result "$IDSB"
+  "$AM" archive "$IDSB" --force >/dev/null 2>&1
+else
+  echo "note: unprivileged user+pid namespaces unavailable; sandbox reproduction skipped"
+fi
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

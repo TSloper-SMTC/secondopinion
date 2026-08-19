@@ -46,7 +46,11 @@ human relay and nothing installed on the responding side.
   `--effort`, requested/realized model recording, and bounded per-repository
   archive retention with a tombstoned, dry-run-first `prune` that holds each
   exchange's lock through removal, plus a stderr retention notice from
-  `archive`/`jobs` when a bucket goes over its bound.
+  `archive`/`jobs` when a bucket goes over its bound. `ask --background`
+  handshakes startup (nonzero `responder=startup-failed`), warns inside
+  PID-namespaced sandboxes whose teardown kills detached responders, and
+  `ask --attach ID` re-launches a responder for an existing published
+  exchange; `ask`/`review --max-turns` sizes the responder turn budget.
 - Release hardening (final Codex QA round): `ask` refuses unreadable respond
   instructions before creating an exchange and rejects a zero timeout (GNU
   `timeout 0` = no limit); a responder that claims and then dies is reported as

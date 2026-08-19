@@ -138,6 +138,12 @@ marketplace) and Codex's `plugin-creator/scripts/validate_plugin.py`.
 
 ## Beyond ask: jobs, result, cancel, review, follow-up, prune
 
+- `ask --background` records a verified responder identity (pid + kernel start
+  time), performs a 2 s startup handshake (`responder=startup-failed`, exit 1,
+  when the responder dies at once), and warns when the shell runs inside a
+  PID-namespaced sandbox (e.g. Codex's) whose teardown would kill a detached
+  responder. `ask --attach <ID>` re-launches a headless responder for an
+  existing published exchange — the recovery for exactly that case.
 - `secondopinion jobs` — repository-scoped table (id, state, age, responder
   liveness). `secondopinion result <ID>` prints the validated answer or an
   honest status + responder log path. `secondopinion cancel <ID>` stops a
