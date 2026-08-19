@@ -37,10 +37,27 @@ the answer.
    ```
 
    For a long or open-ended request use `--background`; it prints the ID at
-   once. Keep working, then `secondopinion wait <ID> --timeout 600` (yields a
-   handle under unified exec; poll it) and `secondopinion read-response <ID>`.
+   once. Keep working, then check `secondopinion jobs` (repository-scoped:
+   state, age, responder liveness), `secondopinion wait <ID> --timeout 600`
+   and `secondopinion result <ID>`; a stuck responder can be stopped with
+   `secondopinion cancel <ID>` (the exchange stays published for a retry).
    Add `--write` only when Claude is meant to change files (responder runs
-   with `acceptEdits` instead of deny-only).
+   with `acceptEdits` instead of deny-only). Optional controls:
+   `--model M`, `--effort low|medium|high|xhigh|max` (validated against the
+   live claude CLI), `--follow-up <ID>` for a linked follow-up that embeds the
+   validated parent exchange, and `--persist` / `--resume <ID>` to opt into
+   continuing a native Claude session.
+
+   For a code review, prefer the dedicated interface:
+
+   ```bash
+   secondopinion review [--adversarial] [--base <ref>] --task "<focus>" --timeout 900
+   secondopinion review-result <ID>    # structured verdict/findings; exit 3 = parse failed, raw preserved
+   ```
+
+   Reviews are read-only; `--adversarial` challenges design choices and
+   assumptions rather than only hunting defects. Judge a schema-valid verdict
+   on its merits — parsing is not correctness.
 3. Exit codes: `0` — the printed text is Claude's validated answer (it starts
    with `Exchange-ID:` and `Responder:` lines); `124` — timeout, the exchange
    stays published (retry `secondopinion wait <ID>`, or ask the user to run
@@ -56,6 +73,9 @@ the answer.
   exchange instead.
 - Exchange files are scratch, not durable evidence: promote conclusions into
   tracked docs, proposals or ledgers where the repository requires it.
+- The archive is bounded per repository: `secondopinion prune` (dry-run) shows
+  what an `--apply` would remove (default: keep the newest 50 archived
+  exchanges per repository). Nothing prunes automatically.
 - Manual path (no headless responder available): `secondopinion new --topic …`,
   edit the prompt's `Task:` section, `secondopinion publish <ID>`, tell the
   user to run `/secondopinion-respond <ID>` in Claude Code, then `wait` /

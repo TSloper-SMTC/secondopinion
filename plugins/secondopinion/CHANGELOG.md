@@ -38,6 +38,13 @@ human relay and nothing installed on the responding side.
   `SECONDOPINION_STALE_CLAIM_SECS`, `SECONDOPINION_BACKUP_DIR`,
   `SECONDOPINION_CLAUDE`, `SECONDOPINION_CLAUDE_ARGS`,
   `SECONDOPINION_MAX_TURNS`, `SECONDOPINION_ASK_TIMEOUT`.
+- Operational parity with the Claude→Codex companion plugin: `jobs`, `result`,
+  `cancel` (verified pid + start time, race-safe with answer publication),
+  `review`/`review-result` (read-only, adversarial profile, structured JSON
+  with an honest parse-failure path), `ask --follow-up` (immutable linked
+  exchanges), opt-in `--persist`/`--resume` native sessions, validated
+  `--effort`, requested/realized model recording, and bounded per-repository
+  archive retention with a tombstoned, dry-run-first `prune`.
 - Release hardening (final Codex QA round): `ask` refuses unreadable respond
   instructions before creating an exchange and rejects a zero timeout (GNU
   `timeout 0` = no limit); a responder that claims and then dies is reported as

@@ -136,6 +136,37 @@ tests/                                    bash suites (run: tests/run.sh)
 Both official validators pass: `claude plugin validate --strict` (plugin +
 marketplace) and Codex's `plugin-creator/scripts/validate_plugin.py`.
 
+## Beyond ask: jobs, result, cancel, review, follow-up, prune
+
+- `secondopinion jobs` — repository-scoped table (id, state, age, responder
+  liveness). `secondopinion result <ID>` prints the validated answer or an
+  honest status + responder log path. `secondopinion cancel <ID>` stops a
+  background responder — it verifies the recorded pid *and* process start time
+  (no PID-reuse kills), never demotes an answered exchange, and leaves the
+  exchange published for another responder.
+- `secondopinion review [--adversarial] [--base REF]` — dedicated read-only
+  review of the working tree (or `REF...HEAD`) with a structured JSON contract;
+  `--adversarial` challenges design choices and assumptions, not just defects.
+  `secondopinion review-result <ID>` parses the fenced JSON verdict/findings
+  (exit 3 with the full raw response preserved when parsing fails — a
+  schema-valid response is still not automatically correct).
+- `ask --follow-up <ID>` — a NEW exchange linked to its parent
+  (`Parent-Exchange:` header), embedding the hash-validated parent prompt and
+  response; published exchanges are never mutated. `ask --persist` opts into a
+  stored Claude session id so `ask --resume <ID>` can continue that native
+  session later; the default stays `--no-session-persistence`.
+- `ask --effort low|medium|high|xhigh|max` — validated against the *live*
+  `claude --help`; unsupported CLIs are refused, never silently ignored.
+  Requested and (when the responder output proves them) realized models are
+  recorded in `status`.
+- `secondopinion prune` — bounded retention over `archive/` only, **per
+  repository** (git common dir; separate non-git bucket; default keep newest
+  50, `SECONDOPINION_RETAIN`/`--retain`). Dry-run by default with exact
+  targets, rules and bytes; `--apply` tombstones each ID before removal so IDs
+  are never reused and an interrupted prune completes on the next run. Drafts,
+  pending, claimed and answered-but-unconsumed exchanges are never candidates;
+  nothing prunes automatically.
+
 ## Manual flow (any two sessions, no headless responder)
 
 Requester (Codex, any checkout):

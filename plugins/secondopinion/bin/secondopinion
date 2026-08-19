@@ -65,6 +65,12 @@ POLL_SECS=2
 TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"
 MAX_HEADER_LINES=64
 
+parse_count() { # name value -> positive integer (reuses parse_secs, then requires >= 1)
+    local v; v="$(parse_secs "$1" "$2")" || return 1
+    [ "$v" -ge 1 ] || { echo "ERROR: $1 must be at least 1" >&2; return 1; }
+    printf '%s\n' "$v"
+}
+
 usage() {
     cat <<EOF
 secondopinion $VERSION — sealed, verifiable second-opinion exchanges between coding agents (Codex→Claude Code)
@@ -72,14 +78,35 @@ Store: $STORE   (override: SECONDOPINION_DIR)
 
 Requester (Codex) side:
   ask --topic TOPIC (--file REQ.md | --file - | --task TEXT) [--timeout S] [--write]
-      [--background] [--model M] [--json]
+      [--background] [--model M] [--effort L] [--json] [--persist]
+      [--follow-up ID | --resume ID] [--fresh]
                           one call: create+publish the exchange, run a headless Claude Code
                           responder in this checkout (self-contained prompt, never prompts:
                           --permission-mode dontAsk + tool allowlist; --write = acceptEdits),
                           wait, validate and print the answer. exit 0 answered | 124 timeout |
                           1 error (exchange stays published for a retry). --background returns
-                          the ID at once; then: wait ID / read-response ID.
-  new --topic TOPIC [--target NAME] [--requester NAME]   create a draft exchange, print its ID
+                          the ID at once; then: jobs / wait ID / result ID / cancel ID.
+                          --effort is validated against the live claude CLI. --follow-up ID
+                          embeds the validated parent exchange in a NEW linked exchange
+                          (stateless). --persist opts into a stored Claude session id so a
+                          later ask --resume ID can continue that native session; the default
+                          stays private (--no-session-persistence). --fresh is the default.
+  review [--adversarial] [--base REF | --scope working-tree] [--task FOCUS] [--topic T]
+         [+ ask options]  read-only code review of this checkout's working tree (or
+                          REF...HEAD) with a structured verdict/findings JSON contract;
+                          --adversarial challenges design choices and assumptions.
+  review-result ID        parse the review's fenced JSON: exit 0 parse_ok=yes (verdict,
+                          findings, canonical JSON) | 3 parse_ok=no with the full raw
+                          response preserved | 1 validation error.
+  jobs [--all|--repo P]   repository-scoped table: id, state, age, responder liveness
+  result ID               validated answer (read-response), or an honest status + log path
+  cancel ID               stop a background responder (verified pid+start time; the exchange
+                          stays recoverable; a valid answer is never demoted)
+  prune [--apply] [--retain N]
+                          bounded retention over archive/ per repository (default keep
+                          newest ${SECONDOPINION_RETAIN:-50}; dry-run unless --apply; pruned
+                          IDs are tombstoned and never reused)
+  new --topic TOPIC [--target NAME] [--requester NAME] [--parent ID]   create a draft exchange, print its ID
   publish ID              freeze prompt.md (records SHA-256); makes it visible as pending
   wait ID [--timeout S]   block until a valid response exists (default timeout $DEFAULT_WAIT_TIMEOUT s)
                           exit 0 answered | 124 timeout | 2 archived | 1 error
@@ -103,7 +130,7 @@ Environment: SECONDOPINION_DIR, SECONDOPINION_OWNER (default claim owner),
              SECONDOPINION_STALE_CLAIM_SECS (default 1800; --takeover allowed after this),
              SECONDOPINION_CLAUDE (responder binary, default: claude), SECONDOPINION_CLAUDE_ARGS
              (extra flags appended to the responder command), SECONDOPINION_MAX_TURNS (default 60),
-             SECONDOPINION_ASK_TIMEOUT (default 1800)
+             SECONDOPINION_ASK_TIMEOUT (default 1800), SECONDOPINION_RETAIN (prune bound, default 50)
 EOF
 }
 
@@ -276,18 +303,24 @@ ensure_store() {
     chmod 700 "$STORE" "$EXCH" "$ARCH" 2>/dev/null || true
 }
 
+# ---- tombstones: durable reservation of pruned exchange IDs ---------------
+TOMB="$STORE/tombstones"
+tombstoned() { [ -f "$TOMB" ] && [ ! -L "$TOMB" ] && grep -Fxq -- "$1" "$TOMB" 2>/dev/null; }
+
 # ---- commands --------------------------------------------------------------
 cmd_new() {
-    local topic="" target="Claude Code" requester="Codex"
+    local topic="" target="Claude Code" requester="Codex" parent=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
             --target) [ "$#" -ge 2 ] || die "--target requires a value"; target="$2"; shift 2;;
             --requester) [ "$#" -ge 2 ] || die "--requester requires a value"; requester="$2"; shift 2;;
+            --parent) [ "$#" -ge 2 ] || die "--parent requires an exchange ID"; parent="$2"; shift 2;;
             -h|--help) usage; exit 0;;
             *) die "unknown new option: $1";;
         esac
     done
+    [ -z "$parent" ] || require_id "$parent"
     [ -n "$topic" ] || die "new requires --topic TOPIC"
     safe_value "--topic" "$topic"; safe_value "--target" "$target"; safe_value "--requester" "$requester"
     local slug
@@ -316,7 +349,7 @@ cmd_new() {
     local base id n=1
     base="$(date -u +%Y-%m-%dT%H%M%SZ)-$slug"; id="$base"
     while :; do
-        if [ -e "$ARCH/$id" ] || ! mkdir "$EXCH/$id" 2>/dev/null; then
+        if [ -e "$ARCH/$id" ] || tombstoned "$id" || ! mkdir "$EXCH/$id" 2>/dev/null; then
             n=$((n+1)); id="$base-$n"; [ "$n" -le 1000 ] || die "could not reserve an exchange id"; continue
         fi
         break
@@ -333,7 +366,8 @@ Branch: $branch
 Commit: $commit
 Dirty-State: $dirty
 Created-UTC: $created
-Codex-Thread: $thread
+Codex-Thread: $thread${parent:+
+Parent-Exchange: $parent}
 
 Task:
 <!-- $TASK_PLACEHOLDER_MARK $target.
@@ -356,6 +390,7 @@ EOF
     meta_set "$dir" exchange_id "$id" state draft created_utc "$created" created_epoch "$(epoch)" \
         requester "$requester" target "$target" repo "$repo" git_common_dir "$common" \
         branch "$branch" commit "$commit" dirty_state "$dirty" codex_thread "$thread"
+    [ -n "$parent" ] && meta_set "$dir" parent_exchange "$parent"
     unlock
     echo "exchange_id=$id"
     echo "exchange_dir=$dir"
@@ -389,12 +424,25 @@ responder_prompt() { # id -> the self-contained headless prompt on stdout.
         "Exchange-ID: $1"
 }
 
-build_responder_argv() { # arrayname id write_mode model
+claude_effort_levels() { # bin -> space-separated levels from the live CLI's --help, or ""
+    "$1" --help 2>/dev/null | grep -A2 -- '--effort' | grep -oE '\(([a-z]+(, [a-z]+)*)\)' | head -1 | tr -d '(),' || true
+    return 0
+}
+
+new_session_uuid() { python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || uuidgen 2>/dev/null; }
+
+build_responder_argv() { # arrayname id write_mode model effort session_mode session_arg
+    # session_mode: "" (private: --no-session-persistence) | persist (--session-id ARG)
+    #             | resume (--resume ARG, session stays persisted)
     local -n _argv="$1"
     local bin="${SECONDOPINION_CLAUDE:-claude}" prompt
     prompt="$(responder_prompt "$2")" || return 1
-    _argv=("$bin" -p "$prompt" --no-session-persistence \
-        --max-turns "${SECONDOPINION_MAX_TURNS:-60}" --output-format json)
+    _argv=("$bin" -p "$prompt" --max-turns "${SECONDOPINION_MAX_TURNS:-60}" --output-format json)
+    case "${6:-}" in
+        persist) _argv+=(--session-id "$7");;
+        resume)  _argv+=(--resume "$7");;
+        *)       _argv+=(--no-session-persistence);;
+    esac
     if [ "$3" = 1 ]; then
         _argv+=(--permission-mode acceptEdits --allowedTools Bash)
     else
@@ -402,10 +450,12 @@ build_responder_argv() { # arrayname id write_mode model
             --disallowedTools "Edit,NotebookEdit,WebFetch,WebSearch")
     fi
     [ -n "$4" ] && _argv+=(--model "$4")
+    [ -n "${5:-}" ] && _argv+=(--effort "$5")
     return 0
 }
 cmd_ask() {
     local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 background=0 model="" json=""
+    local effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
@@ -413,6 +463,11 @@ cmd_ask() {
             --task) [ "$#" -ge 2 ] || die "--task requires a value"; task="$2"; shift 2;;
             --timeout) [ "$#" -ge 2 ] || die "--timeout requires seconds"; timeout="$2"; shift 2;;
             --model) [ "$#" -ge 2 ] || die "--model requires a value"; model="$2"; shift 2;;
+            --effort) [ "$#" -ge 2 ] || die "--effort requires a level"; effort="$2"; shift 2;;
+            --follow-up) [ "$#" -ge 2 ] || die "--follow-up requires a parent exchange ID"; followup="$2"; shift 2;;
+            --resume) [ "$#" -ge 2 ] || die "--resume requires a parent exchange ID"; resume="$2"; shift 2;;
+            --persist) persist=1; shift;;
+            --fresh) fresh=1; shift;;
             --write) write=1; shift;;
             --background) background=1; shift;;
             --json) json=1; shift;;
@@ -429,15 +484,67 @@ cmd_ask() {
     command -v -- "$bin" >/dev/null 2>&1 || die "responder binary '$bin' not found (install the 'claude' CLI so it is on PATH, or set SECONDOPINION_CLAUDE); no exchange was created"
     local skill_file; skill_file="$(respond_skill_file)" || die "cannot resolve this CLI's own path; no exchange was created"
     { [ -f "$skill_file" ] && [ -r "$skill_file" ]; } || die "respond instructions missing or unreadable: $skill_file — the CLI must run from (or be symlinked into) its checkout; re-run plugins/secondopinion/scripts/install.sh. No exchange was created"
+    if [ -n "$effort" ]; then
+        safe_value "--effort" "$effort"
+        local levels; levels="$(claude_effort_levels "$bin")"
+        [ -n "$levels" ] || die "the responder CLI '$bin' does not support --effort; no exchange was created"
+        case " $levels " in *" $effort "*) ;; *) die "invalid --effort '$effort' (this claude CLI supports: ${levels// /, }); no exchange was created";; esac
+    fi
+    [ -n "$followup" ] && [ -n "$resume" ] && die "use either --follow-up or --resume, not both"
+    [ "$fresh" = 1 ] && [ -n "$resume" ] && die "--fresh and --resume are mutually exclusive (--fresh is the default)"
+    # Parent validation happens BEFORE anything is created: the parent must be answered (or
+    # archived), hash-valid, and belong to THIS repository. Its text is captured as a
+    # validated snapshot (what is embedded is exactly what was hashed).
+    local parent="" parent_prompt_txt="" parent_resp_txt="" resume_sid=""
+    parent="${followup:-$resume}"
+    if [ -n "$parent" ]; then
+        require_id "$parent"
+        local pdir pstate pcommon curcommon
+        pdir="$(exdir "$parent")"
+        pstate="$(meta_get "$pdir" state)"
+        case "$pstate" in answered|archived) ;; *) die "parent exchange $parent is not answered (state=$pstate); nothing to follow up on. No exchange was created";; esac
+        pcommon="$(meta_get "$pdir" git_common_dir)"
+        curcommon="$(git_common_of "$PWD")"; [ -n "$curcommon" ] || curcommon="(none)"
+        [ "$pcommon" = "$curcommon" ] || die "parent exchange $parent belongs to another repository ($pcommon); run the follow-up from that checkout. No exchange was created"
+        [ "$(prompt_ok "$pdir")" = "yes" ] || die "parent prompt failed validation; refusing to build on it. No exchange was created"
+        [ "$(response_ok "$pdir")" = "yes" ] || die "parent response failed validation (hash or Exchange-ID mismatch); refusing to build on it. No exchange was created"
+        parent_prompt_txt="$(emit_validated "$pdir" prompt.md prompt_sha256)" || die "parent prompt snapshot failed validation. No exchange was created"
+        parent_resp_txt="$(emit_validated "$pdir" response.md response_sha256)" || die "parent response snapshot failed validation. No exchange was created"
+        if [ -n "$resume" ]; then
+            resume_sid="$(meta_get "$pdir" session_id)"
+            [ -n "$resume_sid" ] || die "parent exchange $parent has no persisted session (it was not asked with --persist); use --follow-up instead. No exchange was created"
+            printf '%s' "$resume_sid" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+                || die "stored session id for $parent is malformed; refusing to pass it to the responder. Use --follow-up instead"
+        fi
+    fi
+    local session_mode="" session_arg=""
+    if [ -n "$resume" ]; then session_mode="resume"; session_arg="$resume_sid"
+    elif [ "$persist" = 1 ]; then
+        session_mode="persist"; session_arg="$(new_session_uuid)"
+        printf '%s' "$session_arg" | grep -Eq '^[0-9a-f-]{36}$' || die "could not generate a session id (python3 or uuidgen required for --persist)"
+    fi
     # Read the request text before creating anything.
     local request
     if [ -n "$task" ]; then request="$task"
     elif [ "$file" = "-" ]; then request="$(cat)"
     else regular "$file" || die "request file missing or not a regular file: $file"; request="$(cat -- "$file")"; fi
     [ -n "$(trim "$request")" ] || die "the request text is empty"
+    if [ -n "$parent" ]; then
+        request="$request
+
+---
+Context: this exchange is a follow-up to exchange $parent. The validated parent
+prompt and response are below; do not re-answer them, build on them.
+--- parent prompt (validated snapshot) ---
+$parent_prompt_txt
+--- parent response (validated snapshot) ---
+$parent_resp_txt
+--- end of parent context ---"
+    fi
     # Create + fill + publish.
     local created id dir prompt
-    created="$(cmd_new --topic "$topic")" || exit 1
+    local new_args=(--topic "$topic"); [ -n "$parent" ] && new_args+=(--parent "$parent")
+    created="$(cmd_new "${new_args[@]}")" || exit 1
     id="$(printf '%s\n' "$created" | awk -F= '$1=="exchange_id"{print $2; exit}')"
     dir="$(active_dir "$id")"; prompt="$dir/prompt.md"
     # Replace the placeholder block with the request (kept as a private temp, then moved).
@@ -453,21 +560,34 @@ cmd_ask() {
     local repo; repo="$(meta_get "$dir" repo)"; [ -d "$repo" ] || repo="$PWD"
     mkdir -p "$STORE/responder-logs"; chmod 700 "$STORE/responder-logs"
     RESPONDER_LOG="$STORE/responder-logs/$id.log"
-    local argv=(); build_responder_argv argv "$id" "$write" "$model" || die "could not build the responder command (respond instructions unreadable)"
+    local argv=(); build_responder_argv argv "$id" "$write" "$model" "$effort" "$session_mode" "$session_arg" || die "could not build the responder command (respond instructions unreadable)"
     if [ -n "${SECONDOPINION_CLAUDE_ARGS:-}" ]; then
         # shellcheck disable=SC2206
         local extra=( ${SECONDOPINION_CLAUDE_ARGS} ); argv+=("${extra[@]}")
     fi
-    lock "$dir"; meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" ask_started_utc "$(now_utc)"; unlock
+    lock "$dir"
+    meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" ask_started_utc "$(now_utc)"
+    [ -n "$model" ] && meta_set "$dir" requested_model "$model"
+    [ -n "$effort" ] && meta_set "$dir" requested_effort "$effort"
+    [ -n "$review_mode" ] && meta_set "$dir" review_mode "$review_mode"
+    case "$session_mode" in
+        persist) meta_set "$dir" session_id "$session_arg" session_persist yes;;
+        resume)  meta_set "$dir" session_id "$session_arg" session_persist yes;;
+    esac
+    unlock
     if [ "$background" = 1 ]; then
         ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
-        echo "exchange_id=$id"; echo "state=$(meta_get "$dir" state)"; echo "responder=background"; echo "responder_log=$RESPONDER_LOG"
+        local bgpid=$! bgstart
+        bgstart="$(proc_start "$bgpid")"
+        lock "$dir"; meta_set "$dir" responder_pid "$bgpid" responder_starttime "${bgstart:-unknown}"; unlock
+        echo "exchange_id=$id"; echo "state=$(meta_get "$dir" state)"; echo "responder=background"; echo "responder_pid=$bgpid"; echo "responder_log=$RESPONDER_LOG"
         echo "next=secondopinion wait $id  &&  secondopinion read-response $id"
         return 0
     fi
     local rc=0
     ( cd -- "$repo" && exec timeout --kill-after=10 "$timeout" "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) || rc=$?
     local state; state="$(meta_get "$dir" state)"
+    if [ -n "$model" ] || [ -n "$effort" ]; then record_realized_model "$dir" "$RESPONDER_LOG"; fi
     if [ "$state" = "answered" ] && [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
         if [ -n "$json" ]; then emit_status "$dir" json; echo; else cat "$dir/response.md"; fi
         return 0
@@ -480,6 +600,126 @@ cmd_ask() {
         return 124
     fi
     die "responder exited $rc without a valid answer; see the log above; $retry_hint"
+}
+
+record_realized_model() { # dir log — record the model the responder PROVED using, else "unproven"
+    local m=""
+    if [ -f "$2" ] && [ ! -L "$2" ]; then
+        m="$(python3 - "$2" 2>/dev/null <<'PYEOF'
+import json, sys
+best = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    mu = d.get("modelUsage")
+    if isinstance(mu, dict) and mu:
+        best = sorted(mu.keys())[0]
+print(best)
+PYEOF
+)" || m=""
+    fi
+    lock "$1"; meta_set "$1" realized_model "${m:-unproven}"; unlock
+    return 0
+}
+
+REVIEW_CONTRACT='At the END of the response add a fenced ```json block with EXACTLY this shape (machine-parsed): {"verdict": "approve" | "needs-attention", "summary": "<one paragraph>", "findings": [{"severity": "critical|major|minor|info", "title": "...", "body": "...", "file": "<repo-relative path or empty>", "line_start": 0, "line_end": 0, "confidence": "high|medium|low", "recommendation": "..."}], "next_steps": ["..."]}. Keep the block valid JSON; the prose response above it remains the full answer.'
+
+cmd_review() {
+    # Dedicated review interface: composes a review charter + target scope + structured
+    # output contract, then delegates to `ask`. Reviews are strictly read-only.
+    local adversarial=0 base="" topic="" focus="" pass=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --adversarial) adversarial=1; shift;;
+            --base) [ "$#" -ge 2 ] || die "--base requires a git ref"; base="$2"; shift 2;;
+            --scope) [ "$#" -ge 2 ] || die "--scope requires working-tree"; [ "$2" = "working-tree" ] || die "unknown --scope '$2' (working-tree, or use --base REF)"; shift 2;;
+            --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
+            --task) [ "$#" -ge 2 ] || die "--task requires a value"; focus="$2"; shift 2;;
+            --write) die "reviews are read-only; --write is not available under 'review' (use plain 'ask --write' for a task that must edit)";;
+            --timeout|--model|--effort|--follow-up|--resume) [ "$#" -ge 2 ] || die "$1 requires a value"; pass+=("$1" "$2"); shift 2;;
+            --background|--json|--persist|--fresh) pass+=("$1"); shift;;
+            -h|--help) echo "usage: review [--adversarial] [--base REF | --scope working-tree] [--task FOCUS] [--topic T] [ask options: --timeout --model --effort --background --json --persist --follow-up ID --resume ID]"; exit 0;;
+            *) die "unknown review option: $1";;
+        esac
+    done
+    git -C "$PWD" rev-parse --git-dir >/dev/null 2>&1 || die "review must run inside the git checkout to be reviewed"
+    if [ -n "$base" ]; then
+        safe_value "--base" "$base"
+        git -C "$PWD" rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "--base ref not found in this repository: $base (no exchange was created)"
+    fi
+    local charter target
+    if [ "$adversarial" = 1 ]; then
+        charter="Perform an ADVERSARIAL review: challenge the implementation approach, the design choices, the tradeoffs and the assumptions behind this change — not just its line-level defects. Actively try to refute that the chosen approach is right; name the strongest alternative and what evidence would decide between them."
+        [ -n "$topic" ] || topic="adversarial review"
+    else
+        charter="Perform a focused code review: find real defects (correctness, concurrency, error handling, security, API misuse) with evidence. Judge what the change SHOULD do, not only what it does."
+        [ -n "$topic" ] || topic="code review"
+    fi
+    if [ -n "$base" ]; then
+        target="Target: the committed changes $base...HEAD — run: git diff $base...HEAD (with git log $base..HEAD for intent), plus any context files needed."
+    else
+        target="Target: the UNCOMMITTED working-tree changes of this checkout — run: git status --short; git diff; git diff --cached — plus any context files needed."
+    fi
+    local composed="$charter
+
+$target
+
+This review is READ-ONLY: you must not modify, fix, or format anything — report findings only.
+${focus:+Focus requested by the asker: $focus
+}
+$REVIEW_CONTRACT"
+    ASK_REVIEW_MODE="$([ "$adversarial" = 1 ] && echo adversarial || echo normal)"
+    cmd_ask --topic "$topic" --task "$composed" "${pass[@]+"${pass[@]}"}"
+}
+
+cmd_review_result() {
+    [ "$#" -eq 1 ] || die "usage: review-result ID"
+    local id="$1"; require_id "$id"
+    local raw; raw="$(cmd_read_response "$id")" || exit 1   # one validated snapshot; parsed below as-is
+    local parsed rc=0 rtmp; rtmp="$(mktemp)"; printf '%s\n' "$raw" > "$rtmp"
+    parsed="$(python3 - "$rtmp" 2>/dev/null <<'PYEOF'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+blocks = re.findall(r"```json\s*\n(.*?)(?:\n```|\Z)", raw, re.S)
+ok = False
+for cand in reversed(blocks):
+    try:
+        d = json.loads(cand)
+    except Exception:
+        continue
+    if not isinstance(d, dict): continue
+    if d.get("verdict") not in ("approve", "needs-attention"): continue
+    if not isinstance(d.get("summary"), str) or not d["summary"].strip(): continue
+    if not isinstance(d.get("findings"), list): continue
+    if not isinstance(d.get("next_steps"), list): continue
+    ok = True
+    print("parse_ok=yes")
+    print("verdict=" + d["verdict"])
+    print("findings=%d" % len(d["findings"]))
+    print("summary=" + " ".join(d["summary"].split())[:300])
+    print("---")
+    print(json.dumps(d, indent=2))
+    break
+if not ok:
+    sys.exit(3)
+PYEOF
+)" || rc=$?
+    rm -f -- "$rtmp"
+    if [ "$rc" = 0 ]; then
+        printf '%s\n' "$parsed"
+        return 0
+    fi
+    # Honest fallback: no schema-valid block — say so and hand over the full raw response.
+    echo "parse_ok=no"
+    echo "note=no schema-valid fenced json review block found; the full raw response follows"
+    echo "---"
+    printf '%s\n' "$raw"
+    return 3
 }
 
 cmd_publish() {
@@ -522,6 +762,9 @@ emit_status() { # dir [json]
         printf ',"exchange_dir":%s,"prompt_ok":%s,"response_ok":%s,"response_present":%s' \
             "$(json_str "$dir")" "$(json_str "$pok")" "$(json_str "$rok")" "$( [ -e "$dir/response.md" ] && echo '"yes"' || echo '"no"')"
         [ -n "$cage" ] && printf ',"claim_age_secs":%s' "$cage"
+        local ce rstate; ce="$(meta_get "$dir" created_epoch)"; rstate="$(responder_state "$dir")"
+        [ -n "$ce" ] && printf ',"elapsed_secs":%s' "$(json_str "$(( $(epoch) - ce ))")"
+        [ -n "$rstate" ] && printf ',"responder_status":%s' "$(json_str "$rstate")"
         printf '}'
     else
         cat "$dir/meta"
@@ -530,7 +773,27 @@ emit_status() { # dir [json]
         echo "response_present=$( [ -e "$dir/response.md" ] && echo yes || echo no)"
         echo "response_ok=$rok"
         [ -n "$cage" ] && echo "claim_age_secs=$cage"
+        status_extras "$dir" "$state"
     fi
+    return 0
+}
+
+status_extras() { # dir state -> elapsed, responder liveness, and a next-action hint
+    local dir="$1" state="$2" ce rstate id
+    ce="$(meta_get "$dir" created_epoch)"
+    [ -n "$ce" ] && echo "elapsed_secs=$(( $(epoch) - ce ))"
+    rstate="$(responder_state "$dir")"
+    [ -n "$rstate" ] && echo "responder_status=$rstate"
+    id="$(meta_get "$dir" exchange_id)"
+    case "$state" in
+        draft)     echo "next=edit the Task section of prompt.md, then: secondopinion publish $id";;
+        published) if [ "$rstate" = "running" ]; then echo "next=responder running: secondopinion wait $id  (or: secondopinion cancel $id)"
+                   elif [ "$rstate" = "exited" ] || [ "$rstate" = "cancelled" ]; then echo "next=responder $rstate without answering; inspect $(meta_get "$dir" responder_log); retry with any responder session, then: secondopinion wait $id"
+                   else echo "next=waiting for a responder: secondopinion wait $id"; fi;;
+        claimed)   echo "next=claimed by $(meta_get "$dir" claimed_by); if stale (>SECONDOPINION_STALE_CLAIM_SECS), another responder may run: secondopinion claim $id --takeover --owner ...";;
+        answered)  echo "next=secondopinion result $id   then: secondopinion archive $id";;
+        archived)  echo "next=archived (read: secondopinion result $id)";;
+    esac
     return 0
 }
 
@@ -712,6 +975,18 @@ cmd_respond() {
     echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
 }
 
+emit_validated() { # dir file meta-sha-key -> print a snapshot that MATCHES the recorded hash
+    # Snapshot first, hash the snapshot, print the snapshot: what is validated is exactly
+    # what is emitted (no validate-then-reread window).
+    local dir="$1" f="$2" key="$3" want tmp
+    want="$(meta_get "$dir" "$key")"; [ -n "$want" ] || return 1
+    regular "$dir/$f" || return 1
+    tmp="$(mktemp)" || return 1
+    if ! cp -- "$dir/$f" "$tmp" || [ "$(sha "$tmp")" != "$want" ]; then rm -f -- "$tmp"; return 1; fi
+    cat -- "$tmp"; rm -f -- "$tmp"
+    return 0
+}
+
 cmd_read_response() {
     [ "$#" -eq 1 ] || die "usage: read-response ID"
     local dir; dir="$(exdir "$1")"
@@ -719,7 +994,7 @@ cmd_read_response() {
     case "$state" in answered|archived) ;; *) die "no response yet (state=$state)";; esac
     [ "$(prompt_ok "$dir")" = "yes" ] || die "prompt.md does not match its published hash; response is not trustworthy"
     [ "$(response_ok "$dir")" = "yes" ] || die "response.md failed validation (hash or Exchange-ID mismatch)"
-    cat "$dir/response.md"
+    emit_validated "$dir" response.md response_sha256 || die "response.md failed validation (hash or Exchange-ID mismatch)"
 }
 
 cmd_wait() {
@@ -755,6 +1030,111 @@ cmd_wait() {
     done
 }
 
+proc_start() { # pid -> kernel start time in clock ticks, or "" if no such process
+    local st; st="$(cat "/proc/$1/stat" 2>/dev/null)" || { echo ""; return 0; }
+    st="${st##*) }"; # strip "pid (comm) " — comm may contain spaces/parens
+    # shellcheck disable=SC2086
+    set -- $st; printf '%s\n' "${20:-}"
+}
+
+responder_state() { # dir -> running|cancelled|exited|"" (no background responder recorded)
+    local pid st0 cur
+    pid="$(meta_get "$1" responder_pid)"; [ -n "$pid" ] || { echo ""; return 0; }
+    st0="$(meta_get "$1" responder_starttime)"
+    cur="$(proc_start "$pid")"
+    if [ -n "$cur" ] && [ "$cur" = "$st0" ]; then echo "running"
+    elif [ -n "$(meta_get "$1" responder_cancelled_utc)" ]; then echo "cancelled"
+    else echo "exited"; fi
+}
+
+US=$'\x1f'   # field separator for prune bookkeeping; control bytes cannot appear in meta values
+
+cmd_prune() {
+    # Bounded retention over the ARCHIVE only. Buckets are per canonical git common dir
+    # (plus one "(non-git)" bucket) so one busy repository cannot evict another's history.
+    # Dry-run by default; --apply removes. Drafts, published, claimed and answered
+    # exchanges all live under exchanges/ and are never candidates. Pruned IDs go to the
+    # tombstones file first (append -> remove), so an ID is never reused even after a crash
+    # between the two steps, and an interrupted apply completes on the next run.
+    local apply=0 retain="${SECONDOPINION_RETAIN:-50}"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --apply) apply=1;;
+            --retain) [ "$#" -ge 2 ] || die "--retain requires a count"; retain="$2"; shift;;
+            -h|--help) echo "usage: prune [--apply] [--retain N]   (default: dry run, keep newest ${SECONDOPINION_RETAIN:-50} archived exchanges per repository)"; exit 0;;
+            *) die "unknown prune option: $1";;
+        esac; shift
+    done
+    retain="$(parse_count "--retain" "$retain")" || exit 1
+    ensure_store
+    [ -L "$TOMB" ] && die "refusing symlinked tombstones file: $TOMB"
+    echo "mode=$([ "$apply" = 1 ] && echo apply || echo dry-run)"
+    echo "retain=$retain"
+    local rows=() d id common key
+    for d in "$ARCH"/*/; do
+        d="${d%/}"; [ -e "$d" ] || continue
+        real_dir "$d" || continue
+        [ -f "$d/meta" ] && [ ! -L "$d/meta" ] || continue
+        id="$(meta_get "$d" exchange_id)"; valid_id "$id" || continue
+        [ "$id" = "$(basename "$d")" ] || continue
+        common="$(meta_get "$d" git_common_dir)"
+        { [ -n "$common" ] && [ "$common" != "(none)" ]; } || common="(non-git)"
+        key="$(meta_get "$d" archived_utc)"; [ -n "$key" ] || key="$(meta_get "$d" created_utc)"; [ -n "$key" ] || key="0000-00-00T00:00:00Z"
+        rows+=("${common}${US}${key}${US}${id}")
+    done
+    local candidates=0 pruned=0 skipped=0
+    if [ "${#rows[@]}" -gt 0 ]; then
+        local sorted bucket="" rank=0 b k i targets=()
+        sorted="$(printf '%s\n' "${rows[@]}" | LC_ALL=C sort -t "$US" -k1,1 -k2,2r -k3,3r)"
+        while IFS="$US" read -r b k i; do
+            [ -n "$i" ] || continue
+            if [ "$b" != "$bucket" ]; then bucket="$b"; rank=0; fi
+            rank=$((rank+1))
+            [ "$rank" -gt "$retain" ] && targets+=("${b}${US}${i}${US}${rank}")
+        done <<< "$sorted"
+        local bytes
+        for line in "${targets[@]+"${targets[@]}"}"; do
+            IFS="$US" read -r b i rank <<< "$line"
+            # An exchange another process holds locked is in an active transition: skip it.
+            if [ -L "$ARCH/$i/.lock" ]; then echo "skipped=$i reason=symlinked-lock" >&2; skipped=$((skipped+1)); continue; fi
+            if ! ( exec 9>>"$ARCH/$i/.lock"; flock -n 9 ) 2>/dev/null; then
+                echo "skipped=$i reason=locked"; skipped=$((skipped+1)); continue
+            fi
+            candidates=$((candidates+1))
+            bytes="$(du -sb -- "$ARCH/$i" 2>/dev/null | cut -f1)"; [ -n "$bytes" ] || bytes=0
+            printf 'prune=%s\tbucket=%s\trank=%s\trule=over-retain(keep %s newest per repository)\tbytes=%s\n' "$i" "$b" "$rank" "$retain" "$bytes"
+            if [ "$apply" = 1 ]; then
+                ( umask 077; exec 8>>"$TOMB" ) 2>/dev/null || die "cannot open tombstones file: $TOMB"
+                exec 8>>"$TOMB"; flock 8; chmod 600 "$TOMB" 2>/dev/null || true
+                real_dir "$ARCH/$i" || { exec 8>&-; continue; }        # re-verify under the prune lock
+                grep -Fxq -- "$i" "$TOMB" || printf '%s\n' "$i" >> "$TOMB"
+                sync -- "$TOMB" 2>/dev/null || true
+                rm -rf -- "$ARCH/$i"
+                exec 8>&-
+                pruned=$((pruned+1))
+            fi
+        done
+        # Interrupted-apply repair: a tombstoned id whose directory still exists was caught
+        # mid-removal; finish the removal on --apply regardless of retention rank.
+        if [ "$apply" = 1 ] && [ -f "$TOMB" ]; then
+            while IFS= read -r i; do
+                valid_id "$i" || continue
+                if real_dir "$ARCH/$i"; then
+                    if ( exec 9>>"$ARCH/$i/.lock"; flock -n 9 ) 2>/dev/null; then
+                        printf 'prune=%s\trule=completing-interrupted-prune\n' "$i"
+                        rm -rf -- "$ARCH/$i"; pruned=$((pruned+1))
+                    else echo "skipped=$i reason=locked"; skipped=$((skipped+1)); fi
+                fi
+            done < "$TOMB"
+        fi
+    fi
+    echo "candidates=$candidates"
+    echo "pruned=$pruned"
+    echo "skipped=$skipped"
+    [ "$apply" = 1 ] || echo "note=dry run: nothing was removed; re-run with --apply to remove the targets above"
+    return 0
+}
+
 relocate_responder_log() { # id (archived) — move responder-logs/<id>.log into the archived
     # exchange and point meta at it. Idempotent repair: also called on re-archive. A log
     # problem must not fail the archive, but it is reported, never silent.
@@ -767,6 +1147,85 @@ relocate_responder_log() { # id (archived) — move responder-logs/<id>.log into
         echo "note=responder log could not be moved into the archive; it remains at $src" >&2
     fi
     return 0
+}
+
+cmd_cancel() {
+    [ "$#" -eq 1 ] || die "usage: cancel ID"
+    local id="$1"; require_id "$id"
+    local dir; dir="$(exdir "$id")"
+    local state pid st0
+    lock "$dir"; state="$(meta_get "$dir" state)"; pid="$(meta_get "$dir" responder_pid)"; st0="$(meta_get "$dir" responder_starttime)"; unlock
+    case "$state" in
+        answered|archived) echo "exchange_id=$id"; echo "state=$state"; echo "cancelled=no"; echo "reason=already-$state: a valid answer is never demoted"; return 0;;
+    esac
+    [ -n "$pid" ] || die "no background responder recorded for $id (only 'ask --background' responders can be cancelled)"
+    local cur; cur="$(proc_start "$pid")"
+    if [ -z "$cur" ]; then
+        echo "exchange_id=$id"; echo "state=$state"; echo "cancelled=no"; echo "reason=not-running (responder already exited)"; return 0
+    fi
+    [ "$cur" = "$st0" ] || die "refusing to kill pid $pid: recorded start time '$st0' does not match /proc ('$cur') — possible PID reuse"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM -- "$pid" 2>/dev/null || true
+    local i=0; while [ "$i" -lt 50 ] && [ -n "$(proc_start "$pid")" ]; do sleep 0.1; i=$((i+1)); done
+    if [ -n "$(proc_start "$pid")" ]; then kill -KILL -- "-$pid" 2>/dev/null || true; sleep 0.2; fi
+    lock "$dir"
+    state="$(meta_get "$dir" state)"
+    if [ "$state" = "answered" ]; then
+        unlock; echo "exchange_id=$id"; echo "state=answered"; echo "cancelled=no"; echo "reason=the answer arrived while cancelling; it remains valid"; return 0
+    fi
+    meta_set "$dir" responder_cancelled_utc "$(now_utc)"
+    unlock
+    echo "exchange_id=$id"; echo "cancelled=yes"; echo "state=$state"
+    echo "note=the exchange stays $state and can still be answered by another responder (or: secondopinion archive $id --force)"
+    return 0
+}
+
+cmd_jobs() {
+    # Repository-scoped job table (the comparator's status view): one line per exchange of
+    # this repository — id, state, age, responder liveness, requested target.
+    local want_common="" all=0 repo=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --all) all=1;;
+            --repo) [ "$#" -ge 2 ] || die "--repo requires a path"; repo="$2"; shift;;
+            -h|--help) echo "usage: jobs [--all | --repo PATH]   (default: exchanges of the current repository)"; exit 0;;
+            *) die "unknown jobs option: $1";;
+        esac; shift
+    done
+    if [ "$all" = 0 ]; then
+        [ -n "$repo" ] || repo="$PWD"
+        want_common="$(git_common_of "$repo")"
+        [ -n "$want_common" ] || die "not inside a git repository: $repo (use --all, or --repo PATH)"
+    fi
+    ensure_store
+    local d id state common age rstate now; now="$(epoch)"
+    for d in "$EXCH"/*/; do
+        d="${d%/}"; [ -e "$d" ] || continue
+        real_dir "$d" || continue
+        [ -f "$d/meta" ] && [ ! -L "$d/meta" ] || continue
+        id="$(meta_get "$d" exchange_id)"; valid_id "$id" || continue
+        state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
+        if [ -n "$want_common" ] && [ "$common" != "$want_common" ]; then continue; fi
+        age="$(human_age $(( now - $(meta_get "$d" created_epoch) )))"
+        rstate="$(responder_state "$d")"; [ -n "$rstate" ] || rstate="-"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$state" "$age" "$rstate" "$(meta_get "$d" target)"
+    done
+    return 0
+}
+
+cmd_result() {
+    [ "$#" -eq 1 ] || die "usage: result ID"
+    local id="$1"; require_id "$id"
+    local dir; dir="$(exdir "$id")"
+    local state; state="$(meta_get "$dir" state)"
+    case "$state" in
+        answered|archived) cmd_read_response "$id";;
+        *)
+            { echo "exchange_id=$id"; echo "state=$state"
+              local r lg; r="$(responder_state "$dir")"; [ -n "$r" ] && echo "responder=$r"
+              lg="$(meta_get "$dir" responder_log)"; [ -n "$lg" ] && echo "responder_log=$lg"
+            } >&2
+            die "no validated answer yet (state=$state); wait with: secondopinion wait $id";;
+    esac
 }
 
 cmd_archive() {
@@ -815,6 +1274,12 @@ main() {
         read-response) cmd_read_response "$@";;
         wait) cmd_wait "$@";;
         archive) cmd_archive "$@";;
+        prune) cmd_prune "$@";;
+        cancel) cmd_cancel "$@";;
+        jobs) cmd_jobs "$@";;
+        result) cmd_result "$@";;
+        review) cmd_review "$@";;
+        review-result) cmd_review_result "$@";;
         version|--version) echo "secondopinion $VERSION";;
         help|-h|--help) usage;;
         *) die "unknown command: $cmd (try --help)";;
