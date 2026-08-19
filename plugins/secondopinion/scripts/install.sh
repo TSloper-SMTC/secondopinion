@@ -172,14 +172,15 @@ open(path, "w", encoding="utf-8").write("\n".join(lines))
 PY
 }
 
+SANDBOX_TBL_RE='^[[:space:]]*\[[[:space:]]*sandbox_workspace_write[[:space:]]*\][[:space:]]*(#.*)?$'
 sandbox_network_setting() { # -> true | false | "" (absent) inside [sandbox_workspace_write]
     [ -f "$CODEX_CFG" ] || { echo ""; return 0; }
-    awk '/^\[/{f=($0 ~ /^\[sandbox_workspace_write\]/)} f && /^[[:space:]]*network_access[[:space:]]*=/ {sub(/#.*/,""); gsub(/[[:space:]]|network_access|=/,""); print; exit}' "$CODEX_CFG"
+    awk '/^[[:space:]]*\[/{f=($0 ~ /^[[:space:]]*\[[[:space:]]*sandbox_workspace_write[[:space:]]*\][[:space:]]*(#.*)?$/)} f && /^[[:space:]]*network_access[[:space:]]*=/ {sub(/#.*/,""); gsub(/[[:space:]]|network_access|=/,""); print; exit}' "$CODEX_CFG"
 }
 set_sandbox_network_true() { # insert `network_access = true` right after the table header (backup first)
     mkdir -p "$BACKUP_DIR"; local bak; bak="$(backup_path config.toml)"
     cp -p -- "$CODEX_CFG" "$bak" || return 1
-    awk 'BEGIN{done=0} {print} /^\[sandbox_workspace_write\]/ && !done {print "network_access = true"; done=1}' "$CODEX_CFG" > "$CODEX_CFG.tmp.$$" && mv -f -- "$CODEX_CFG.tmp.$$" "$CODEX_CFG"
+    awk 'BEGIN{done=0} {print} /^[[:space:]]*\[[[:space:]]*sandbox_workspace_write[[:space:]]*\][[:space:]]*(#.*)?$/ && !done {print "network_access = true"; done=1}' "$CODEX_CFG" > "$CODEX_CFG.tmp.$$" && mv -f -- "$CODEX_CFG.tmp.$$" "$CODEX_CFG"
 }
 
 # ---- plugin state (JSON, never text grep; tri-state: present / absent / error) --------------
@@ -406,7 +407,7 @@ fi
 if [ "$CHECK" != 1 ]; then
     mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
 fi
-if [ -f "$CODEX_CFG" ] && grep -q '^\[sandbox_workspace_write\]' "$CODEX_CFG"; then
+if [ -f "$CODEX_CFG" ] && grep -Eq "$SANDBOX_TBL_RE" "$CODEX_CFG"; then
     if store_in_sandbox_roots; then
         echo "ok        $CODEX_CFG: [sandbox_workspace_write] writable_roots includes $STORE_DIR"
     elif [ "$CHECK" != 1 ] && extend_sandbox_roots; then
@@ -448,7 +449,11 @@ fi
 
 # --- Codex side, default form: the true Codex plugin from this repo's marketplace ----------
 if [ "$CHECK" = 0 ] && [ "$SKILLS" = 0 ]; then
-    if [ -L "$CODEX_SKILL_LINK" ]; then rm -f -- "$CODEX_SKILL_LINK"; echo "retired   $CODEX_SKILL_LINK (the Codex skill now comes from the plugin)"; fi
+    if [ -L "$CODEX_SKILL_LINK" ]; then rm -f -- "$CODEX_SKILL_LINK"; echo "retired   $CODEX_SKILL_LINK (the Codex skill now comes from the plugin)"
+    elif [ -e "$CODEX_SKILL_LINK" ]; then
+        mkdir -p "$BACKUP_DIR"; bak="$(backup_path secondopinion-request)"
+        mv -T -- "$CODEX_SKILL_LINK" "$bak"; echo "backed-up $CODEX_SKILL_LINK -> $bak (the Codex skill now comes from the plugin)"
+    fi
     cmr="$(codex_marketplace_root)"
     if [ -n "$cmr" ] && [ "$cmr" != "$REPO_ROOT" ]; then
         codex plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 || true; echo "removed   stale Codex marketplace $MARKETPLACE -> $cmr"; cmr=""
@@ -516,23 +521,28 @@ if [ "$CHECK" = 0 ] && [ "$CLAUDE" = 1 ] && [ "$SKILLS" = 0 ]; then
 fi
 if [ "$CHECK" = 1 ]; then
     [ "${INSPECT_FAILED:-0}" = 1 ] && status=1
-    # Codex side: REQUIRED, in exactly one current form.
-    if codex_plugin_current && { [ -e "$CODEX_SKILL_LINK" ] || [ -L "$CODEX_SKILL_LINK" ]; }; then
-        echo "DUPLICATE both the Codex plugin $PLUGIN_ID and the skill symlink $CODEX_SKILL_LINK are active; run install.sh (plugin) or install.sh --skills to pick one" >&2; status=1
+    # Codex side: REQUIRED, in exactly one current form. A plugin in ANY state next to a
+    # skill link/dir is a duplicate; a stale plugin is reported even when a current skill
+    # symlink exists (the symlink must not mask it). An uninspectable registry was already
+    # reported as UNINSPECTABLE — say nothing contradictory for that side.
+    if [ "$CODEX_INSPECT" = "error" ]; then :
+    elif codex_plugin_present && { [ -e "$CODEX_SKILL_LINK" ] || [ -L "$CODEX_SKILL_LINK" ]; }; then
+        echo "DUPLICATE the Codex plugin $PLUGIN_ID (state='$CODEX_STATE') and the skill path $CODEX_SKILL_LINK are both present; run install.sh (plugin) or install.sh --skills to pick one" >&2; status=1
     elif codex_plugin_current; then echo "ok        Codex side: plugin $PLUGIN_ID $VERSION"
-    elif link_ok "$CODEX_SKILL_LINK" "$ROOT/skills/secondopinion-request"; then echo "ok        Codex side: skill symlink $CODEX_SKILL_LINK"
     elif codex_plugin_present; then echo "STALE     Codex plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$CODEX_STATE', marketplace='$CODEX_MARKET_ROOT'); run install.sh" >&2; status=1
+    elif link_ok "$CODEX_SKILL_LINK" "$ROOT/skills/secondopinion-request"; then echo "ok        Codex side: skill symlink $CODEX_SKILL_LINK"
     elif [ -e "$CODEX_SKILL_LINK" ] || [ -L "$CODEX_SKILL_LINK" ]; then
         echo "STALE     Codex side: $CODEX_SKILL_LINK exists but is not a symlink to $ROOT/skills/secondopinion-request; run install.sh or install.sh --skills" >&2; status=1
     else echo "MISSING   Codex side: neither the Codex plugin $PLUGIN_ID nor the skill symlink $CODEX_SKILL_LINK; run install.sh (plugin) or install.sh --skills" >&2; status=1
     fi
     # Claude side: OPTIONAL — absent is fine (headless ask needs only the claude CLI);
-    # anything that IS present must be current and unique.
-    if plugin_current && { [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; }; then
-        echo "DUPLICATE both the Claude plugin $PLUGIN_ID and the user-level skill $CLAUDE_SKILL_LINK are active; run install.sh --claude or install.sh --skills --claude to pick one" >&2; status=1
+    # anything that IS present must be current and unique, with the same masking rules.
+    if [ "$PLUGIN_INSPECT" = "error" ]; then :
+    elif plugin_present && { [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; }; then
+        echo "DUPLICATE the Claude plugin $PLUGIN_ID (state='$(plugin_state)') and the user-level skill path $CLAUDE_SKILL_LINK are both present; run install.sh --claude or install.sh --skills --claude to pick one" >&2; status=1
     elif plugin_current; then echo "ok        Claude side: plugin $PLUGIN_ID $VERSION (skill /secondopinion:secondopinion-respond)"
-    elif link_ok "$CLAUDE_SKILL_LINK" "$ROOT/skills/secondopinion-respond"; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /secondopinion-respond)"
     elif plugin_present; then echo "STALE     Claude plugin $PLUGIN_ID is installed but is not '$VERSION enabled from $REPO_ROOT' (state='$(plugin_state)', marketplace='$(marketplace_path)'); run install.sh --claude (or plain install.sh to remove it)" >&2; status=1
+    elif link_ok "$CLAUDE_SKILL_LINK" "$ROOT/skills/secondopinion-respond"; then echo "ok        Claude side: user-level skill $CLAUDE_SKILL_LINK (skill /secondopinion-respond)"
     elif [ -e "$CLAUDE_SKILL_LINK" ] || [ -L "$CLAUDE_SKILL_LINK" ]; then
         echo "STALE     Claude side: $CLAUDE_SKILL_LINK exists but is not a symlink to $ROOT/skills/secondopinion-respond; run install.sh (retires it) or install.sh --skills --claude" >&2; status=1
     else echo "ok        Claude side: nothing installed (optional — headless ask needs only the claude CLI on PATH)"

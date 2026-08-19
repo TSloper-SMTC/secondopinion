@@ -615,7 +615,7 @@ cat > "$STUB_DIR/claude" <<'STUB'
 printf '%s\n' "$@" > "${STUB_ARGV_FILE:?}"
 printf '%s\n' "$PWD" > "${STUB_CWD_FILE:?}"
 [ -t 0 ] && echo "stdin-is-tty" >> "${STUB_ARGV_FILE}"
-id=""; prev=""; for a in "$@"; do if [ "$prev" = "-p" ]; then id="$(printf '%s\n' "$a" | sed -n 's/^Exchange-ID: //p' | head -1)"; fi; prev="$a"; done
+id=""; prev=""; for a in "$@"; do if [ "$prev" = "-p" ]; then printf '%s\n' "$a" > "${STUB_PROMPT_FILE:?}"; id="$(printf '%s\n' "$a" | sed -n 's/^Exchange-ID: //p' | head -1)"; fi; prev="$a"; done
 case "${STUB_MODE:-answer}" in
   answer)
     tok="$("$STUB_AM" claim "$id" --owner stub 2>/dev/null | awk -F= '/^claim_token=/{print $2}')"
@@ -623,10 +623,12 @@ case "${STUB_MODE:-answer}" in
     "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1; echo '{"is_error":false}';;
   slow)   sleep 30;;
   fail)   echo "boom" >&2; exit 1;;
+  claimfail) "$STUB_AM" claim "$id" --owner stub >/dev/null 2>&1; echo "boom after claim" >&2; exit 1;;
+  claimslow) "$STUB_AM" claim "$id" --owner stub >/dev/null 2>&1; sleep 30;;
 esac
 STUB
 chmod +x "$STUB_DIR/claude"
-export STUB_DIR STUB_AM="$AM" STUB_ARGV_FILE="$TMP/stub-argv" STUB_CWD_FILE="$TMP/stub-cwd"
+export STUB_DIR STUB_AM="$AM" STUB_ARGV_FILE="$TMP/stub-argv" STUB_CWD_FILE="$TMP/stub-cwd" STUB_PROMPT_FILE="$TMP/stub-prompt"
 printf 'Please check the thing.\nSecond line.\n' > "$TMP/request.md"
 
 t "ask: publishes, spawns the responder in the checkout, waits, prints the validated answer, exit 0"
@@ -645,6 +647,15 @@ grep -q -- "^Exchange-ID: $IDASK$" "$STUB_ARGV_FILE" && ok || fail "prompt must 
 grep -q -- "secondopinion claim" "$STUB_ARGV_FILE" && ok || fail "prompt must inline the respond workflow (self-contained; nothing installed in Claude)"
 grep -q -- "^/secondopinion-respond" "$STUB_ARGV_FILE" && fail "prompt must not invoke a Claude-side slash command" || ok
 grep -q -- "^---$" "$STUB_ARGV_FILE" && fail "skill frontmatter must be stripped from the inline prompt" || ok
+assert_eq "$(tail -n1 "$STUB_PROMPT_FILE")" "Exchange-ID: $IDASK" "(the prompt's FINAL line is the assignment)"
+grep -qx -- "Bash,Read,Grep,Glob,Write" "$STUB_ARGV_FILE" && ok || fail "default allowlist wrong"
+grep -qx -- "Edit,NotebookEdit,WebFetch,WebSearch" "$STUB_ARGV_FILE" && ok || fail "default disallowed-tool list wrong"
+
+t "ask: --model and SECONDOPINION_CLAUDE_ARGS reach the responder argv"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_CLAUDE_ARGS="--fallback-model claude-x" "$AM" ask --topic "ask argv" --file "$TMP/request.md" --model claude-test-model --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0
+grep -qx -- "--model" "$STUB_ARGV_FILE" && grep -qx -- "claude-test-model" "$STUB_ARGV_FILE" && ok || fail "--model not passed through"
+grep -qx -- "--fallback-model" "$STUB_ARGV_FILE" && grep -qx -- "claude-x" "$STUB_ARGV_FILE" && ok || fail "SECONDOPINION_CLAUDE_ARGS not appended"
 grep -q -- "^dontAsk$" "$STUB_ARGV_FILE" && ok || fail "default (review) profile must use --permission-mode dontAsk"
 grep -q -- "^--no-session-persistence$" "$STUB_ARGV_FILE" && ok || fail "responder must not persist sessions"
 grep -q "stdin-is-tty" "$STUB_ARGV_FILE" && fail "responder stdin must be /dev/null" || ok
@@ -690,6 +701,50 @@ out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$TMP/lonel
 assert_eq "$rc" 1 "(ask rc without the skill file)"
 assert_grep "secondopinion-respond/SKILL.md" <(echo "$out")
 assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange created)"
+
+t "ask: an UNREADABLE respond-instructions file refuses before creating an exchange"
+mkdir -p "$TMP/unread/bin" "$TMP/unread/skills/secondopinion-respond"
+cp "$AM" "$TMP/unread/bin/secondopinion"; chmod +x "$TMP/unread/bin/secondopinion"
+cp "$HERE/../plugins/secondopinion/skills/secondopinion-respond/SKILL.md" "$TMP/unread/skills/secondopinion-respond/SKILL.md"
+chmod 000 "$TMP/unread/skills/secondopinion-respond/SKILL.md"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$TMP/unread/bin/secondopinion" ask --topic "unreadable" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc with unreadable instructions)"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange created for unreadable instructions)"
+chmod 644 "$TMP/unread/skills/secondopinion-respond/SKILL.md"
+
+t "ask: a zero timeout is refused (GNU timeout 0 would disable the limit), no exchange created"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "zero" --file "$TMP/request.md" --timeout 0 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc --timeout 0)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_ASK_TIMEOUT=0 "$AM" ask --topic "zero env" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc SECONDOPINION_ASK_TIMEOUT=0)"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange created for zero timeouts)"
+
+t "ask: responder that CLAIMS and then fails/times out is reported as claimed with the takeover path, not as published"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=claimfail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "claim fail" --file "$TMP/request.md" --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc on claim-then-fail)"
+IDCF="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+assert_eq "$("$AM" status "$IDCF" | val state)" "claimed"
+echo "$out" | grep -q "state=claimed" && ok || fail "claim-then-fail does not report state=claimed: $out"
+echo "$out" | grep -qi "takeover" && ok || fail "claim-then-fail does not mention the takeover path: $out"
+echo "$out" | grep -q "stays published" && fail "claim-then-fail still claims the exchange stays published" || ok
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=claimslow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "claim slow" --file "$TMP/request.md" --timeout 2 2>&1)"; rc=$?
+assert_eq "$rc" 124 "(ask rc on claim-then-timeout)"
+echo "$out" | grep -q "state=claimed" && ok || fail "claim-then-timeout does not report state=claimed: $out"
+echo "$out" | grep -qi "takeover" && ok || fail "claim-then-timeout does not mention the takeover path: $out"
+
+t "ask --background: the printed state is read from meta, not hardcoded"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "bg state" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0
+IDBS="$(echo "$out" | val exchange_id)"
+assert_eq "$(echo "$out" | val state)" "$("$AM" status "$IDBS" | val state)" "(reported state matches meta)"
+
+t "archive relocates the responder log into the archived exchange (no errant files left behind)"
+[ -f "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && ok || fail "fixture: responder log missing for $IDASK"
+assert_rc 0 "$AM" archive "$IDASK"
+[ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && ok || fail "responder log left orphaned in responder-logs/ after archive"
+[ -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log" ] && ok || fail "responder log not preserved inside the archived exchange"
 
 t "ask: task text via --task and via stdin (-)"
 out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask task" --task "Inline task text" --timeout 60 2>/dev/null)"; rc=$?

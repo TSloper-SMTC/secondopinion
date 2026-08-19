@@ -380,10 +380,10 @@ responder_prompt() { # id -> the self-contained headless prompt on stdout.
     # Claude — only the `claude` CLI itself, mirroring the Claude->Codex plugin,
     # which installs nothing in Codex.
     local skill; skill="$(respond_skill_file)" || return 1
-    [ -f "$skill" ] || return 1
+    [ -f "$skill" ] && [ -r "$skill" ] || return 1
     awk 'NR==1 && /^---[[:space:]]*$/ {infm=1; next}
          infm {if (/^---[[:space:]]*$/) infm=0; next}
-         {print}' "$skill"
+         {print}' "$skill" || return 1
     printf '\n%s\n\n%s\n' \
         "You are running headlessly: \`secondopinion ask\` started you to answer exactly one exchange. There is no user watching: never wait for input, follow the workflow above to the end, and treat the request as read-only unless its prompt says otherwise. Answer only the exchange named on the next line." \
         "Exchange-ID: $1"
@@ -423,11 +423,12 @@ cmd_ask() {
     [ -n "$topic" ] || die "ask requires --topic TOPIC"
     { [ -n "$file" ] && [ -z "$task" ]; } || { [ -z "$file" ] && [ -n "$task" ]; } || die "ask requires exactly one of --file REQ.md (or --file -) or --task TEXT"
     timeout="$(parse_secs "--timeout" "$timeout")" || exit 1
+    [ "$timeout" -gt 0 ] || die "ask --timeout must be at least 1 second (GNU timeout treats 0 as 'no limit'); no exchange was created"
     [ -z "$model" ] || safe_value "--model" "$model"
     local bin="${SECONDOPINION_CLAUDE:-claude}"
     command -v -- "$bin" >/dev/null 2>&1 || die "responder binary '$bin' not found (install the 'claude' CLI so it is on PATH, or set SECONDOPINION_CLAUDE); no exchange was created"
     local skill_file; skill_file="$(respond_skill_file)" || die "cannot resolve this CLI's own path; no exchange was created"
-    [ -f "$skill_file" ] || die "respond instructions missing: $skill_file — the CLI must run from (or be symlinked into) its checkout; re-run plugins/secondopinion/scripts/install.sh. No exchange was created"
+    { [ -f "$skill_file" ] && [ -r "$skill_file" ]; } || die "respond instructions missing or unreadable: $skill_file — the CLI must run from (or be symlinked into) its checkout; re-run plugins/secondopinion/scripts/install.sh. No exchange was created"
     # Read the request text before creating anything.
     local request
     if [ -n "$task" ]; then request="$task"
@@ -460,7 +461,7 @@ cmd_ask() {
     lock "$dir"; meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" ask_started_utc "$(now_utc)"; unlock
     if [ "$background" = 1 ]; then
         ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
-        echo "exchange_id=$id"; echo "state=published"; echo "responder=background"; echo "responder_log=$RESPONDER_LOG"
+        echo "exchange_id=$id"; echo "state=$(meta_get "$dir" state)"; echo "responder=background"; echo "responder_log=$RESPONDER_LOG"
         echo "next=secondopinion wait $id  &&  secondopinion read-response $id"
         return 0
     fi
@@ -472,11 +473,13 @@ cmd_ask() {
         return 0
     fi
     echo "exchange_id=$id" >&2; echo "state=$state" >&2; echo "responder_log=$RESPONDER_LOG" >&2
+    local retry_hint="the exchange stays published (retry with a longer --timeout via: secondopinion wait $id, while any responder session answers it)"
+    [ "$state" = "claimed" ] && retry_hint="state=claimed: the responder claimed the exchange before dying, and its claim token is lost; after SECONDOPINION_STALE_CLAIM_SECS (default 1800) another responder can run: secondopinion claim $id --takeover --owner ..."
     if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-        echo "result=timeout after ${timeout}s; the exchange stays published (retry with a longer --timeout via: secondopinion wait $id, while any responder session answers it)" >&2
+        echo "result=timeout after ${timeout}s; $retry_hint" >&2
         return 124
     fi
-    die "responder exited $rc without a valid answer; see the log above (the exchange stays published for a retry)"
+    die "responder exited $rc without a valid answer; see the log above; $retry_hint"
 }
 
 cmd_publish() {
@@ -778,6 +781,11 @@ cmd_archive() {
         unlock; die "failed to move exchange to archive; state restored to $prev"
     fi
     unlock
+    # Keep the store free of orphans: the headless responder log (if any) travels into the
+    # archived exchange. Best-effort — a log problem must not fail the archive.
+    if [ -f "$STORE/responder-logs/$id.log" ] && [ ! -L "$STORE/responder-logs/$id.log" ]; then
+        mv -f -- "$STORE/responder-logs/$id.log" "$ARCH/$id/responder.log" 2>/dev/null && chmod 600 "$ARCH/$id/responder.log" 2>/dev/null || true
+    fi
     echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
 }
 

@@ -240,5 +240,14 @@ out="$(cd "$LH2" && env -u SECONDOPINION_DIR HOME="$LH2" PATH="$LH2/.local/bin:$
 echo "$out" | grep -q "ACTION" && ok || fail "multi-line array with the symlinked root should produce ACTION, got: $out"
 grep -Fq "\"$LH2/.agent-mailbox\"" "$LH2/.codex/config.toml" && ok || fail "multi-line array was edited automatically"
 
+t "a whitespace-form TOML header '[ sandbox_workspace_write ]' is recognized: extended in place, never duplicated"
+WH="$TMP/home-wsheader"; mkdir -p "$WH/.codex" "$WH/.local/bin"
+printf 'model = "x"\n[ sandbox_workspace_write ]\nwritable_roots = ["/elsewhere"]\n' > "$WH/.codex/config.toml"
+( cd "$WH" && env -u SECONDOPINION_DIR HOME="$WH" PATH="$WH/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" --skills >/dev/null 2>&1 ) && ok || fail "--skills install failed on whitespace header"
+assert_eq "$(grep -c 'sandbox_workspace_write' "$WH/.codex/config.toml")" "1" "(no duplicate table appended)"
+grep -Fq "\"$WH/.secondopinion\"" "$WH/.codex/config.toml" && ok || fail "store not added to the whitespace-form table"
+grep -q 'network_access = true' "$WH/.codex/config.toml" && ok || fail "network_access not set in the whitespace-form table"
+( cd "$WH" && env -u SECONDOPINION_DIR HOME="$WH" PATH="$WH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check fails on the whitespace-form table"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -100,6 +100,12 @@ if command -v claude >/dev/null 2>&1; then
   ( cd "$SH" && HOME="$SH" claude plugin disable --scope user secondopinion@secondopinion >/dev/null 2>&1 )
   ( cd "$SH" && HOME="$SH" CODEX_HOME="$SH/.codex" PATH="$SH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ); rc=$?
   assert_eq "$rc" 1 "(--check must not accept a disabled Claude plugin)"
+  # a CURRENT skill symlink must not mask the stale/disabled plugin
+  mkdir -p "$SH/.claude/skills"; ln -sfn "$PLUGIN/skills/secondopinion-respond" "$SH/.claude/skills/secondopinion-respond"
+  out="$(cd "$SH" && HOME="$SH" CODEX_HOME="$SH/.codex" PATH="$SH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check 2>&1)"; rc=$?
+  assert_eq "$rc" 1 "(--check must not let a current skill symlink mask a stale plugin)"
+  echo "$out" | grep -qi "stale\|duplicate" && ok || fail "masked stale plugin not named: $out"
+  rm -f "$SH/.claude/skills/secondopinion-respond"
   ( cd "$SH" && HOME="$SH" CODEX_HOME="$SH/.codex" PATH="$SH/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" --claude >/dev/null 2>&1 ) && ok || fail "install.sh --claude failed on a disabled plugin"
   assert_eq "$(cd "$SH" && HOME="$SH" claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print([x["enabled"] for x in json.load(sys.stdin) if x["id"]=="secondopinion@secondopinion"][0])')" "True" "(re-enabled)"
 
@@ -130,9 +136,15 @@ if command -v claude >/dev/null 2>&1; then
   assert_eq "$(cd "$BH" && HOME="$BH" claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["id"]=="secondopinion@secondopinion"]))')" "1" "(Claude plugin untouched while uninspectable)"
   ( cd "$BH" && HOME="$BH" CODEX_HOME="$BH/.codex" PATH="$STUB:$BH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ); rc=$?
   assert_eq "$rc" 1 "(--check must fail when plugin state cannot be inspected)"
+  out="$(cd "$BH" && HOME="$BH" CODEX_HOME="$BH/.codex" PATH="$STUB:$BH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check 2>&1)"
+  echo "$out" | grep -q "nothing installed" && fail "uninspectable Claude side still classified as 'nothing installed': $out" || ok
   printf '#!/bin/bash\necho "not json"\n' > "$STUB/claude"      # malformed JSON variant
   ( cd "$BH" && HOME="$BH" CODEX_HOME="$BH/.codex" PATH="$STUB:$BH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ); rc=$?
   assert_eq "$rc" 1 "(--check must fail on malformed plugin JSON)"
+  CSTUB="$TMP/codex-broken"; mkdir -p "$CSTUB"; printf '#!/bin/bash\nexit 47\n' > "$CSTUB/codex"; chmod +x "$CSTUB/codex"
+  out="$(cd "$BH" && HOME="$BH" CODEX_HOME="$BH/.codex" PATH="$CSTUB:$BH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check 2>&1)"; rc=$?
+  assert_eq "$rc" 1 "(--check must fail when the Codex registry is uninspectable)"
+  echo "$out" | grep -q "MISSING   Codex side" && fail "uninspectable Codex side still classified MISSING: $out" || ok
   # with the real CLI back, the state is still a clean --claude install
   ( cd "$BH" && HOME="$BH" CODEX_HOME="$BH/.codex" PATH="$BH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "real CLI --check failed after the broken-cli attempts"
 
@@ -185,8 +197,11 @@ STUB
   assert_eq "$rc" 1 "(--check must not approve a non-list plugin JSON)"
 
   t "a fresh HOME never touches Claude: default install works with no ~/.claude at all; Codex duplicate is rejected"
-  CH="$TMP/home-codex"; mkdir -p "$CH"
+  CH="$TMP/home-codex"; mkdir -p "$CH/.codex/skills/secondopinion-request"
+  echo legacy > "$CH/.codex/skills/secondopinion-request/SKILL.md"    # real dir, not a symlink
   ( cd "$CH" && HOME="$CH" CODEX_HOME="$CH/.codex" PATH="$CH/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" >/dev/null 2>&1 ) && ok || fail "default install failed in codex fixture"
+  [ ! -e "$CH/.codex/skills/secondopinion-request" ] && ok || fail "a REAL Codex skill dir survived the default (plugin) install — duplicate state"
+  grep -rq legacy "$TMP/backups" 2>/dev/null && ok || fail "the real Codex skill dir was not backed up"
   st="$(cd "$CH" && HOME="$CH" CODEX_HOME="$CH/.codex" codex plugin list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=[x for x in d.get("installed",[]) if x.get("pluginId")=="secondopinion@secondopinion"]; print(p[0]["version"], p[0]["enabled"], p[0]["marketplaceSource"]["source"]) if p else print("absent")')"
   assert_eq "$st" "$TOOL_VERSION True $ROOT" "(codex plugin installed+enabled from the repo marketplace)"
   [ ! -e "$CH/.claude" ] && ok || fail "default install created something under ~/.claude on a fresh HOME"
@@ -201,6 +216,18 @@ STUB
   out="$(cd "$CH" && HOME="$CH" CODEX_HOME="$CH/.codex" PATH="$CH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check 2>&1)"; rc=$?
   assert_eq "$rc" 1 "(--check must reject Codex skill symlink + Codex plugin both active)"
   echo "$out" | grep -qi "duplicate" && ok || fail "--check does not name the Codex duplicate: $out"
+
+  t "a current Codex skill symlink must not mask a stale Codex plugin in --check"
+  CS="$TMP/home-codexstale"; mkdir -p "$CS/.codex"; OLD2="$TMP/old-copy2"; cp -r "$ROOT" "$OLD2"; rm -rf "$OLD2/.git"
+  for f in plugins/secondopinion/bin/secondopinion plugins/secondopinion/.claude-plugin/plugin.json plugins/secondopinion/.codex-plugin/plugin.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do sed -i "s/$TOOL_VERSION/0.9.0/g" "$OLD2/$f"; done
+  ( cd "$CS" && HOME="$CS" CODEX_HOME="$CS/.codex" codex plugin marketplace add "$OLD2" >/dev/null 2>&1 && HOME="$CS" CODEX_HOME="$CS/.codex" codex plugin add secondopinion@secondopinion >/dev/null 2>&1 ) && ok || fail "could not seed the older Codex plugin"
+  rm -rf "$OLD2"
+  mkdir -p "$CS/.codex/skills"; ln -sfn "$PLUGIN/skills/secondopinion-request" "$CS/.codex/skills/secondopinion-request"
+  mkdir -p "$CS/.local/bin"; ln -sfn "$PLUGIN/bin/secondopinion" "$CS/.local/bin/secondopinion"
+  printf '[sandbox_workspace_write]\nnetwork_access = true\nwritable_roots = ["%s/.secondopinion"]\n' "$CS" >> "$CS/.codex/config.toml"
+  out="$(cd "$CS" && HOME="$CS" CODEX_HOME="$CS/.codex" PATH="$CS/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check 2>&1)"; rc=$?
+  assert_eq "$rc" 1 "(--check must not let a current Codex skill symlink mask a stale Codex plugin)"
+  echo "$out" | grep -qi "stale\|duplicate" && ok || fail "masked stale Codex plugin not named: $out"
   else
     echo "note: 'codex' CLI not on PATH; install.sh mode tests skipped (default mode needs codex)"
   fi
