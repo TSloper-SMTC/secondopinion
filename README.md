@@ -113,8 +113,9 @@ understood) plus `network_access = true`.
 Replaced files/dirs are moved without clobbering to
 `$HOME/.local/state/secondopinion/backups/` (`SECONDOPINION_BACKUP_DIR`).
 Upgrading from 1.x: `~/.agent-mailbox` is migrated once (old path left as a
-symlink), old skill links retired, `AGENT_MAILBOX_*` variables honoured with a
-warning.
+symlink, and REMOVED from `writable_roots` — Codex's bubblewrap sandbox cannot
+build with a symlinked writable root; the real store entry covers it), old
+skill links retired, `AGENT_MAILBOX_*` variables honoured with a warning.
 
 ## Repository layout (standard plugin/marketplace shape)
 

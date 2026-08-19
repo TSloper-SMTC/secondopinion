@@ -25,7 +25,11 @@ human relay.
   `LICENSE`, `CHANGELOG.md`; both manifests use the default `skills/` scan.
 - Compatibility: `agent-mailbox` remains a deprecated alias, `AGENT_MAILBOX_*`
   variables are honoured with a warning, `~/.agent-mailbox` is migrated once by
-  `scripts/install.sh` (old path left as a symlink).
+  `scripts/install.sh` (old path left as a symlink). The legacy path is removed
+  from `[sandbox_workspace_write].writable_roots`: Codex's bubblewrap sandbox
+  fails fatally on a symlinked writable root ("cannot enforce sandbox read-only
+  path …/.git because it crosses writable symlink"); the real store entry covers
+  accesses through the symlink.
 - `scripts/install.sh` sets `[sandbox_workspace_write] network_access = true`
   in `~/.codex/config.toml` (needed for Codex-run commands to reach Claude);
   an explicit `false` is reported, never flipped.

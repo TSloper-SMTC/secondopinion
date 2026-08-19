@@ -69,9 +69,10 @@ fi
 
 # ---- Codex sandbox config: semantic membership of the store in
 # [sandbox_workspace_write].writable_roots (comments and multiline arrays handled) ------------
-store_in_sandbox_roots() {
+store_in_sandbox_roots() { # [path] -> is path (default: the store) a member of writable_roots?
+    local target="${1:-$STORE_DIR}"
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$CODEX_CFG" "$STORE_DIR" <<'PY'
+        python3 - "$CODEX_CFG" "$target" <<'PY'
 import re, sys
 path, store = sys.argv[1], sys.argv[2]
 def strip_comment(line):
@@ -112,8 +113,35 @@ except Exception:
     sys.exit(1)
 PY
     else  # degraded textual check when python3 is unavailable
-        awk '/^\[sandbox_workspace_write\]/{f=1; next} /^\[/{f=0} f' "$CODEX_CFG" | grep -E '^writable_roots *=' | grep -Fq "\"$STORE_DIR\""
+        awk '/^\[sandbox_workspace_write\]/{f=1; next} /^\[/{f=0} f' "$CODEX_CFG" | grep -E '^writable_roots *=' | grep -Fq "\"$target\""
     fi
+}
+
+# Remove one member from a SINGLE-LINE writable_roots array (backup first); multi-line or
+# odd formatting is left for the user (ACTION).
+remove_sandbox_root() { # path
+    command -v python3 >/dev/null 2>&1 || return 1
+    mkdir -p "$BACKUP_DIR"; local bak; bak="$(backup_path config.toml)"
+    cp -p -- "$CODEX_CFG" "$bak" || return 1
+    python3 - "$CODEX_CFG" "$1" <<'PY2' || { rm -f -- "$bak"; return 1; }
+import re, sys
+path, target = sys.argv[1], sys.argv[2]
+lines = open(path, encoding="utf-8").read().split("\n")
+table = None; done = False
+for i, line in enumerate(lines):
+    m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", line)
+    if m: table = m.group(1).strip(); continue
+    if table != "sandbox_workspace_write": continue
+    m = re.match(r'^(\s*writable_roots\s*=\s*\[)(.*)(\]\s*(#.*)?)$', line)
+    if not m: continue
+    vals = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2))
+    if target not in vals: continue
+    inner = ", ".join('"' + v + '"' for v in vals if v != target)
+    lines[i] = m.group(1) + inner + m.group(3)
+    done = True; break
+if not done: sys.exit(1)
+open(path, "w", encoding="utf-8").write("\n".join(lines))
+PY2
 }
 
 # Extend a SINGLE-LINE `writable_roots = [...]` in [sandbox_workspace_write] with the store
@@ -398,6 +426,18 @@ if [ -f "$CODEX_CFG" ] && grep -q '^\[sandbox_workspace_write\]' "$CODEX_CFG"; t
                elif set_sandbox_network_true; then echo "config    $CODEX_CFG: set [sandbox_workspace_write] network_access = true (Codex commands may reach Claude; previous file backed up)"
                else echo "ACTION    $CODEX_CFG: could not set network_access = true in [sandbox_workspace_write]; add it by hand." >&2; fi;;
     esac
+    # A writable root that is itself a symlink (the migrated 1.x store path) breaks Codex's
+    # bubblewrap sandbox: "cannot enforce sandbox read-only path .../.git because it crosses
+    # writable symlink ...". The real store is already a root, so the legacy entry just goes.
+    if [ -L "$OLD_STORE" ] && store_in_sandbox_roots "$OLD_STORE"; then
+        if [ "$CHECK" = 1 ]; then
+            echo "ACTION    $CODEX_CFG: writable_roots contains \"$OLD_STORE\", which is a symlink; codex cannot build its bubblewrap sandbox with a symlinked writable root — remove that entry (\"$STORE_DIR\" already covers it)." >&2; status=1
+        elif remove_sandbox_root "$OLD_STORE"; then
+            echo "config    $CODEX_CFG: removed symlinked legacy root \"$OLD_STORE\" from writable_roots (codex cannot sandbox a symlinked writable root; previous file backed up)"
+        else
+            echo "ACTION    $CODEX_CFG: could not remove \"$OLD_STORE\" from writable_roots automatically; remove it by hand — codex cannot build its sandbox while a symlinked root is listed." >&2
+        fi
+    fi
 elif [ "$CHECK" = 1 ]; then
     echo "MISSING   $CODEX_CFG: [sandbox_workspace_write] writable_roots for $STORE_DIR"; status=1
 else

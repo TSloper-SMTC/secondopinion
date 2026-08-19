@@ -184,7 +184,7 @@ assert_link "$MH/.local/bin/agent-mailbox" "$PLUGIN/bin/secondopinion"          
 assert_link "$MH/.claude/skills/secondopinion-respond" "$PLUGIN/skills/secondopinion-respond"
 assert_link "$MH/.codex/skills/secondopinion-request" "$PLUGIN/skills/secondopinion-request"
 grep -Fq "\"$MH/.secondopinion\"" "$MH/.codex/config.toml" && ok || fail "new store not added to writable_roots"
-grep -Fq "\"$MH/.agent-mailbox\"" "$MH/.codex/config.toml" && ok || fail "old store entry was dropped from writable_roots (running Codex sessions still use it)"
+grep -Fq "\"$MH/.agent-mailbox\"" "$MH/.codex/config.toml" && fail "symlinked legacy path left in writable_roots (codex bubblewrap cannot enforce .git protection across a symlinked writable root)" || ok
 ls "$TMP/backups"/config.toml* >/dev/null 2>&1 && ok || fail "config.toml was edited without a backup"
 ( cd "$MH" && env -u SECONDOPINION_DIR -u AGENT_MAILBOX_DIR HOME="$MH" PATH="$MH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check fails after migration"
 # idempotent second run
@@ -218,6 +218,27 @@ grep -q '^network_access = false$' "$NH4/.codex/config.toml" && ok || fail "expl
 echo "$out" | grep -q "ACTION" && ok || fail "no ACTION for explicit network_access = false"
 ( cd "$NH4" && env -u SECONDOPINION_DIR HOME="$NH4" PATH="$NH4/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ); rc=$?
 assert_eq "$rc" 1
+
+t "a symlinked legacy store path in writable_roots is removed on install and fails --check (bubblewrap cannot sandbox a symlinked root)"
+LH="$TMP/home-symroot"; mkdir -p "$LH/.codex" "$LH/.local/bin" "$LH/.codex/skills" "$LH/.secondopinion"
+ln -s "$LH/.secondopinion" "$LH/.agent-mailbox"
+ln -sfn "$PLUGIN/bin/secondopinion" "$LH/.local/bin/secondopinion"; ln -sfn "$PLUGIN/skills/secondopinion-request" "$LH/.codex/skills/secondopinion-request"
+printf '[sandbox_workspace_write]\nnetwork_access = true\nwritable_roots = ["%s/.agent-mailbox", "%s/.secondopinion"]\n' "$LH" "$LH" > "$LH/.codex/config.toml"
+out="$(cd "$LH" && env -u SECONDOPINION_DIR HOME="$LH" PATH="$LH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(--check must fail while the symlinked legacy root is listed)"
+echo "$out" | grep -q "agent-mailbox" && ok || fail "--check does not name the offending entry: $out"
+( cd "$LH" && env -u SECONDOPINION_DIR HOME="$LH" PATH="$LH/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" --skills >/dev/null 2>&1 ) && ok || fail "--skills install failed on the symlinked-root fixture"
+grep -Fq "\"$LH/.agent-mailbox\"" "$LH/.codex/config.toml" && fail "legacy symlinked root not removed from writable_roots" || ok
+grep -Fq "\"$LH/.secondopinion\"" "$LH/.codex/config.toml" && ok || fail "real store root lost while removing the legacy entry"
+( cd "$LH" && env -u SECONDOPINION_DIR HOME="$LH" PATH="$LH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check still fails after the legacy root was removed"
+# a multi-line array is never edited automatically: ACTION, and --check keeps failing
+LH2="$TMP/home-symroot2"; mkdir -p "$LH2/.codex" "$LH2/.local/bin" "$LH2/.codex/skills" "$LH2/.secondopinion"
+ln -s "$LH2/.secondopinion" "$LH2/.agent-mailbox"
+ln -sfn "$PLUGIN/bin/secondopinion" "$LH2/.local/bin/secondopinion"; ln -sfn "$PLUGIN/skills/secondopinion-request" "$LH2/.codex/skills/secondopinion-request"
+printf '[sandbox_workspace_write]\nnetwork_access = true\nwritable_roots = [\n  "%s/.agent-mailbox",\n  "%s/.secondopinion",\n]\n' "$LH2" "$LH2" > "$LH2/.codex/config.toml"
+out="$(cd "$LH2" && env -u SECONDOPINION_DIR HOME="$LH2" PATH="$LH2/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" --skills 2>&1)"
+echo "$out" | grep -q "ACTION" && ok || fail "multi-line array with the symlinked root should produce ACTION, got: $out"
+grep -Fq "\"$LH2/.agent-mailbox\"" "$LH2/.codex/config.toml" && ok || fail "multi-line array was edited automatically"
 
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
