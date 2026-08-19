@@ -99,7 +99,10 @@ try:
             if "]" in line: roots = buf; buf = None
             continue
         m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", line)
-        if m: table = m.group(1).strip(); continue
+        if m:
+            table = m.group(1).strip()
+            if len(table) >= 2 and table[0] == table[-1] and table[0] in "\"'": table = table[1:-1]
+            continue
         if table == "sandbox_workspace_write":
             m = re.match(r"^\s*writable_roots\s*=\s*(.*)$", line)
             if m:
@@ -130,7 +133,10 @@ lines = open(path, encoding="utf-8").read().split("\n")
 table = None; done = False
 for i, line in enumerate(lines):
     m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", line)
-    if m: table = m.group(1).strip(); continue
+    if m:
+        table = m.group(1).strip()
+        if len(table) >= 2 and table[0] == table[-1] and table[0] in "\"'": table = table[1:-1]
+        continue
     if table != "sandbox_workspace_write": continue
     m = re.match(r'^(\s*writable_roots\s*=\s*\[)(.*)(\]\s*(#.*)?)$', line)
     if not m: continue
@@ -158,7 +164,10 @@ lines = open(path, encoding="utf-8").read().split("\n")
 table = None; done = False
 for i, line in enumerate(lines):
     m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", line)
-    if m: table = m.group(1).strip(); continue
+    if m:
+        table = m.group(1).strip()
+        if len(table) >= 2 and table[0] == table[-1] and table[0] in "\"'": table = table[1:-1]
+        continue
     if table != "sandbox_workspace_write": continue
     m = re.match(r'^(\s*writable_roots\s*=\s*\[)(.*)(\]\s*(#.*)?)$', line)
     if not m: continue
@@ -172,15 +181,18 @@ open(path, "w", encoding="utf-8").write("\n".join(lines))
 PY
 }
 
-SANDBOX_TBL_RE='^[[:space:]]*\[[[:space:]]*sandbox_workspace_write[[:space:]]*\][[:space:]]*(#.*)?$'
+# TOML table headers may quote the key: [sandbox_workspace_write], [ sandbox_workspace_write ],
+# ["sandbox_workspace_write"], ['sandbox_workspace_write'] are all the same table.
+SANDBOX_TBL_RE="^[[:space:]]*\[[[:space:]]*[\"']?sandbox_workspace_write[\"']?[[:space:]]*\][[:space:]]*(#.*)?\$"
+export SANDBOX_TBL_RE
 sandbox_network_setting() { # -> true | false | "" (absent) inside [sandbox_workspace_write]
     [ -f "$CODEX_CFG" ] || { echo ""; return 0; }
-    awk '/^[[:space:]]*\[/{f=($0 ~ /^[[:space:]]*\[[[:space:]]*sandbox_workspace_write[[:space:]]*\][[:space:]]*(#.*)?$/)} f && /^[[:space:]]*network_access[[:space:]]*=/ {sub(/#.*/,""); gsub(/[[:space:]]|network_access|=/,""); print; exit}' "$CODEX_CFG"
+    awk '/^[[:space:]]*\[/{f=($0 ~ ENVIRON["SANDBOX_TBL_RE"])} f && /^[[:space:]]*network_access[[:space:]]*=/ {sub(/#.*/,""); gsub(/[[:space:]]|network_access|=/,""); print; exit}' "$CODEX_CFG"
 }
 set_sandbox_network_true() { # insert `network_access = true` right after the table header (backup first)
     mkdir -p "$BACKUP_DIR"; local bak; bak="$(backup_path config.toml)"
     cp -p -- "$CODEX_CFG" "$bak" || return 1
-    awk 'BEGIN{done=0} {print} /^[[:space:]]*\[[[:space:]]*sandbox_workspace_write[[:space:]]*\][[:space:]]*(#.*)?$/ && !done {print "network_access = true"; done=1}' "$CODEX_CFG" > "$CODEX_CFG.tmp.$$" && mv -f -- "$CODEX_CFG.tmp.$$" "$CODEX_CFG"
+    awk 'BEGIN{done=0} {print} $0 ~ ENVIRON["SANDBOX_TBL_RE"] && !done {print "network_access = true"; done=1}' "$CODEX_CFG" > "$CODEX_CFG.tmp.$$" && mv -f -- "$CODEX_CFG.tmp.$$" "$CODEX_CFG"
 }
 
 # ---- plugin state (JSON, never text grep; tri-state: present / absent / error) --------------

@@ -755,6 +755,20 @@ cmd_wait() {
     done
 }
 
+relocate_responder_log() { # id (archived) — move responder-logs/<id>.log into the archived
+    # exchange and point meta at it. Idempotent repair: also called on re-archive. A log
+    # problem must not fail the archive, but it is reported, never silent.
+    local id="$1" src="$STORE/responder-logs/$1.log" dst="$ARCH/$1/responder.log"
+    [ -f "$src" ] && [ ! -L "$src" ] || return 0
+    if mv -f -- "$src" "$dst" 2>/dev/null; then
+        chmod 600 "$dst" 2>/dev/null || true
+        lock "$ARCH/$id"; meta_set "$ARCH/$id" responder_log "$dst"; unlock
+    else
+        echo "note=responder log could not be moved into the archive; it remains at $src" >&2
+    fi
+    return 0
+}
+
 cmd_archive() {
     local id="" force=0
     while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; -h|--help) usage; exit 0;; *) positional id "$1";; esac; shift; done
@@ -762,7 +776,7 @@ cmd_archive() {
     require_id "$id"
     [ -L "$EXCH/$id" ] || [ -L "$ARCH/$id" ] && die "refusing symlinked exchange directory: $id"
     if ! is_active "$id"; then
-        is_archived "$id" && { echo "exchange_id=$id"; echo "state=archived"; echo "note=already archived"; return 0; }
+        is_archived "$id" && { relocate_responder_log "$id"; echo "exchange_id=$id"; echo "state=archived"; echo "note=already archived"; return 0; }
         die "unknown exchange: $id"
     fi
     local dir="$EXCH/$id"; check_components "$dir"
@@ -781,11 +795,7 @@ cmd_archive() {
         unlock; die "failed to move exchange to archive; state restored to $prev"
     fi
     unlock
-    # Keep the store free of orphans: the headless responder log (if any) travels into the
-    # archived exchange. Best-effort — a log problem must not fail the archive.
-    if [ -f "$STORE/responder-logs/$id.log" ] && [ ! -L "$STORE/responder-logs/$id.log" ]; then
-        mv -f -- "$STORE/responder-logs/$id.log" "$ARCH/$id/responder.log" 2>/dev/null && chmod 600 "$ARCH/$id/responder.log" 2>/dev/null || true
-    fi
+    relocate_responder_log "$id"
     echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
 }
 

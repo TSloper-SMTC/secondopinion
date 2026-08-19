@@ -745,6 +745,11 @@ t "archive relocates the responder log into the archived exchange (no errant fil
 assert_rc 0 "$AM" archive "$IDASK"
 [ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && ok || fail "responder log left orphaned in responder-logs/ after archive"
 [ -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log" ] && ok || fail "responder log not preserved inside the archived exchange"
+assert_eq "$("$AM" status "$IDASK" | val responder_log)" "$SECONDOPINION_DIR/archive/$IDASK/responder.log" "(meta responder_log updated to the relocated path)"
+# repair path: an orphan log for an ALREADY archived exchange is relocated by a re-archive
+echo "orphan" > "$SECONDOPINION_DIR/responder-logs/$IDASK.log"; rm -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log"
+assert_rc 0 "$AM" archive "$IDASK"
+[ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && [ -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log" ] && ok || fail "re-archive did not repair an orphaned responder log"
 
 t "ask: task text via --task and via stdin (-)"
 out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask task" --task "Inline task text" --timeout 60 2>/dev/null)"; rc=$?

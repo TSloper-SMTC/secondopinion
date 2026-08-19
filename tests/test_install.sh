@@ -249,5 +249,14 @@ grep -Fq "\"$WH/.secondopinion\"" "$WH/.codex/config.toml" && ok || fail "store 
 grep -q 'network_access = true' "$WH/.codex/config.toml" && ok || fail "network_access not set in the whitespace-form table"
 ( cd "$WH" && env -u SECONDOPINION_DIR HOME="$WH" PATH="$WH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check fails on the whitespace-form table"
 
+t "a QUOTED TOML header '[\"sandbox_workspace_write\"]' is recognized: extended in place, never duplicated"
+QT="$TMP/home-quoted"; mkdir -p "$QT/.codex" "$QT/.local/bin"
+printf '["sandbox_workspace_write"]\nwritable_roots = ["/elsewhere"]\n' > "$QT/.codex/config.toml"
+( cd "$QT" && env -u SECONDOPINION_DIR HOME="$QT" PATH="$QT/.local/bin:$PATH" SECONDOPINION_BACKUP_DIR="$TMP/backups" "$PLUGIN/scripts/install.sh" --skills >/dev/null 2>&1 ) && ok || fail "--skills install failed on quoted header"
+assert_eq "$(grep -c 'sandbox_workspace_write' "$QT/.codex/config.toml")" "1" "(no duplicate table appended for quoted header)"
+grep -Fq "\"$QT/.secondopinion\"" "$QT/.codex/config.toml" && ok || fail "store not added to the quoted-header table"
+grep -q 'network_access = true' "$QT/.codex/config.toml" && ok || fail "network_access not set in the quoted-header table"
+( cd "$QT" && env -u SECONDOPINION_DIR HOME="$QT" PATH="$QT/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check fails on the quoted-header table"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
