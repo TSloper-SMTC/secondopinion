@@ -258,19 +258,29 @@ grep -Fq "\"$QT/.secondopinion\"" "$QT/.codex/config.toml" && ok || fail "store 
 grep -q 'network_access = true' "$QT/.codex/config.toml" && ok || fail "network_access not set in the quoted-header table"
 ( cd "$QT" && env -u SECONDOPINION_DIR HOME="$QT" PATH="$QT/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check fails on the quoted-header table"
 
-t "--uninstall removes the skills-form install and config edits but KEEPS the store"
+t "--uninstall completely removes the install, the store, and the default state dir"
 UH="$TMP/home-uninstall"; mkdir -p "$UH"
-( cd "$UH" && env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --skills --claude >/dev/null 2>&1 ) && ok || fail "fixture install failed"
-mkdir -p "$UH/.secondopinion/archive"; echo keep > "$UH/.secondopinion/archive/marker"
-assert_rc 0 env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall
+( cd "$UH" && env -u SECONDOPINION_DIR -u SECONDOPINION_BACKUP_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --skills --claude >/dev/null 2>&1 ) && ok || fail "fixture install failed"
+mkdir -p "$UH/.secondopinion/archive"; echo data > "$UH/.secondopinion/archive/marker"
+out="$(env -u SECONDOPINION_DIR -u SECONDOPINION_BACKUP_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall 2>&1)"; rc=$?
+assert_eq "$rc" 0 "(--uninstall rc)"
 [ ! -e "$UH/.local/bin/secondopinion" ] && [ ! -L "$UH/.local/bin/secondopinion" ] && ok || fail "CLI symlink not removed"
 [ ! -e "$UH/.local/bin/agent-mailbox" ] && [ ! -L "$UH/.local/bin/agent-mailbox" ] && ok || fail "agent-mailbox alias not removed"
 [ ! -e "$UH/.codex/skills/secondopinion-request" ] && [ ! -L "$UH/.codex/skills/secondopinion-request" ] && ok || fail "Codex skill symlink not removed"
 [ ! -e "$UH/.claude/skills/secondopinion-respond" ] && [ ! -L "$UH/.claude/skills/secondopinion-respond" ] && ok || fail "Claude skill symlink not removed"
 grep -q secondopinion "$UH/.codex/config.toml" 2>/dev/null && fail "config.toml still references the store" || ok
-grep -q keep "$UH/.secondopinion/archive/marker" && ok || fail "store was not preserved"
-assert_rc 1 env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check
-assert_rc 0 env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall
+[ ! -e "$UH/.secondopinion" ] && ok || fail "store not removed"
+[ ! -e "$UH/.local/state/secondopinion" ] && ok || fail "default state dir (backups) not removed"
+echo "$out" | grep -qi "removed.*store\|store.*removed" && ok || fail "output does not state the store was removed: $out"
+assert_rc 1 env -u SECONDOPINION_DIR -u SECONDOPINION_BACKUP_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check
+assert_rc 0 env -u SECONDOPINION_DIR -u SECONDOPINION_BACKUP_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall
+
+t "--uninstall leaves a CUSTOM backups location alone (only the default state dir is ours to delete)"
+UB="$TMP/home-uninstall2"; mkdir -p "$UB" "$TMP/custom-backups"
+( cd "$UB" && env -u SECONDOPINION_DIR SECONDOPINION_BACKUP_DIR="$TMP/custom-backups" HOME="$UB" PATH="$UB/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --skills >/dev/null 2>&1 ) && ok || fail "fixture install failed"
+echo precious > "$TMP/custom-backups/user-file"
+assert_rc 0 env -u SECONDOPINION_DIR SECONDOPINION_BACKUP_DIR="$TMP/custom-backups" HOME="$UB" PATH="$UB/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall
+grep -q precious "$TMP/custom-backups/user-file" && ok || fail "custom backup location was deleted"
 
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

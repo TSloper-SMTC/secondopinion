@@ -37,7 +37,8 @@ human relay and nothing installed on the responding side.
 - Env vars: `SECONDOPINION_DIR`, `SECONDOPINION_OWNER`,
   `SECONDOPINION_STALE_CLAIM_SECS`, `SECONDOPINION_BACKUP_DIR`,
   `SECONDOPINION_CLAUDE`, `SECONDOPINION_CLAUDE_ARGS`,
-  `SECONDOPINION_MAX_TURNS`, `SECONDOPINION_ASK_TIMEOUT`.
+  `SECONDOPINION_MAX_TURNS`, `SECONDOPINION_ASK_TIMEOUT`,
+  `SECONDOPINION_AUTO_PRUNE`.
 - Operational parity with the Claude→Codex companion plugin: `jobs`, `result`,
   `cancel` (verified pid + start time, race-safe with answer publication),
   `review`/`review-result` (read-only, adversarial profile, structured JSON
@@ -64,22 +65,18 @@ human relay and nothing installed on the responding side.
   location, `--check` never lets a current skill symlink mask a stale plugin
   and stays silent about sides it could not inspect; whitespace-form
   `[ sandbox_workspace_write ]` headers are recognized (no duplicate tables).
-
-## Prehistory (internal, as `agent-mailbox`)
-
-Before the public release the tool lived as `agent-mailbox` (internal versions
-1.0.0–1.3.6, git tags `agent-mailbox--v*`): the exchange store with
-publish/claim/respond/read-response/archive, hash-bound prompt and response,
-atomic claim, worktree-aware matching; symlink containment and retry-safe
-operations; validated bounded headers; plugin packaging and eleven Codex QA
-hardening rounds (semantic TOML handling, state-aware side-effect-free
-`--check`, fail-closed plugin inspection, non-clobbering backups).
+- Opt-in auto-prune: `SECONDOPINION_AUTO_PRUNE=1` (or per call `archive
+  --prune`) makes an archive landing in an over-bound bucket prune THAT
+  repository's bucket only — fail-open (a prune failure never fails the
+  archive), reported as a parseable `auto_prune=...` stdout key. The
+  bucket-scoped run skips the store-wide crash-litter GC and repairs, which
+  stay with manual `prune --apply`.
 
 ### Hardening before release (2026-08-19/20)
 
 Reliability hardening from an exhaustive live + adversarial test campaign
 (all defects reproduced first; every fix carries a regression test — suite
-grows 309→389).
+grows 309→407).
 
 - **No more availability crashes on damaged meta.** An exchange whose
   `created_epoch`/`claimed_epoch` is empty (crash-torn or hand-edited meta)
@@ -145,11 +142,12 @@ Backlog round (same day):
   dot-dir and renames it into place; `prune` GCs day-old meta-less orphan
   dirs, `.new.*` staging and stale `.*.tmp.*` files (fresh litter and locked
   exchanges are skipped, exchanges are swept under their own lock).
-- **`install.sh --uninstall`** removes every installed piece on both sides —
-  plugins, marketplaces, skill symlinks, CLI symlinks, sandbox config edits
-  (config backed up first; the [sandbox_workspace_write] table is removed
-  only when it holds nothing but our settings) — and always keeps the store
-  and the backups directory.
+- **`install.sh --uninstall`** is a COMPLETE removal: plugins, marketplaces,
+  skill symlinks, CLI symlinks, sandbox config edits (the
+  [sandbox_workspace_write] table is removed only when it holds nothing but
+  our settings), the store with all exchanges/archives, the default state
+  dir and any leftover plugin cache. Only a custom SECONDOPINION_BACKUP_DIR
+  location is left alone.
 - **Platform preflight.** The CLI refuses to run without flock(1) and states
   its Linux+GNU-only requirement; the setsid pid-tracking invariant is
   documented at the launch site.
@@ -158,3 +156,13 @@ Backlog round (same day):
   refuses `--write` on review exchanges; an `ln` failure without an existing
   response is no longer misreported as write-once; `SECONDOPINION_CLAUDE_ARGS`
   is word-split but never glob-expanded.
+
+## Prehistory (internal, as `agent-mailbox`)
+
+Before the public release the tool lived as `agent-mailbox` (internal versions
+1.0.0–1.3.6, git tags `agent-mailbox--v*`): the exchange store with
+publish/claim/respond/read-response/archive, hash-bound prompt and response,
+atomic claim, worktree-aware matching; symlink containment and retry-safe
+operations; validated bounded headers; plugin packaging and eleven Codex QA
+hardening rounds (semantic TOML handling, state-aware side-effect-free
+`--check`, fail-closed plugin inspection, non-clobbering backups).

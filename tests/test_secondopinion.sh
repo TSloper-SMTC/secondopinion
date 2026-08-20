@@ -1000,6 +1000,60 @@ out="$(PATH="" "$AM" version 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc with empty PATH)"
 assert_grep "flock" <(echo "$out")
 
+# --- auto-prune: opt-in, bucket-only, fail-open --------------------------------------------
+SAP="$TMP/store-auto"
+ap_ex() { # ap_ex <repo> <topic> [archive-args...] -> archives one answered exchange; prints archive stdout
+  local repo="$1" topic="$2"; shift 2
+  local id tok
+  id="$(SECONDOPINION_DIR="$SAP" new_in "$repo" "$topic")"
+  SECONDOPINION_DIR="$SAP" publish_prompt "$id" "task"
+  tok="$(SECONDOPINION_DIR="$SAP" "$AM" claim "$id" --owner a | val claim_token)"
+  write_response "$id" "$TMP/ap.md"
+  SECONDOPINION_DIR="$SAP" "$AM" respond "$id" --token "$tok" --file "$TMP/ap.md" >/dev/null
+  SECONDOPINION_DIR="$SAP" "$AM" archive "$id" "$@" 2>"$TMP/ap.err"
+}
+ap_count() { ls -1 "$SAP/archive" 2>/dev/null | grep -c '^2'; }
+
+t "auto-prune: SECONDOPINION_AUTO_PRUNE keeps the bucket at the retention bound after archive"
+for i in 1 2 3; do SECONDOPINION_RETAIN=3 SECONDOPINION_AUTO_PRUNE=1 ap_ex "$TMP/repoA" "ap-fill-$i" >/dev/null; done
+assert_eq "$(ap_count)" "3" "(bucket at bound before overflow)"
+out="$(SECONDOPINION_RETAIN=3 SECONDOPINION_AUTO_PRUNE=1 ap_ex "$TMP/repoA" "ap-overflow")"; rc=$?
+assert_eq "$rc" 0 "(archive rc with auto-prune)"
+assert_eq "$(ap_count)" "3" "(bucket pruned back to bound)"
+assert_grep "^auto_prune=ok removed=1" <(echo "$out")
+
+t "auto-prune: archive --prune works without the env var"
+out="$(SECONDOPINION_RETAIN=3 ap_ex "$TMP/repoA" "ap-flag" --prune)"; rc=$?
+assert_eq "$rc" 0 "(archive --prune rc)"
+assert_eq "$(ap_count)" "3" "(bucket pruned by the flag)"
+assert_grep "^auto_prune=ok removed=1" <(echo "$out")
+
+t "auto-prune: OFF by default — plain archive lets the bucket grow and only prints the retention note"
+out="$(SECONDOPINION_RETAIN=3 ap_ex "$TMP/repoA" "ap-default-off")"; rc=$?
+assert_eq "$rc" 0 "(plain archive rc)"
+assert_eq "$(ap_count)" "4" "(bucket grew without opt-in)"
+assert_not_grep "auto_prune" <(echo "$out")
+assert_grep "prune" "$TMP/ap.err"
+
+t "auto-prune: fail-open — a failing prune never fails the archive"
+mv "$SAP/tombstones" "$SAP/tombstones.real" 2>/dev/null; ln -s /nonexistent "$SAP/tombstones"
+out="$(SECONDOPINION_RETAIN=3 SECONDOPINION_AUTO_PRUNE=1 ap_ex "$TMP/repoA" "ap-failopen")"; rc=$?
+rm -f "$SAP/tombstones"; mv "$SAP/tombstones.real" "$SAP/tombstones" 2>/dev/null
+assert_eq "$rc" 0 "(archive rc while prune fails)"
+assert_grep "^auto_prune=failed" <(echo "$out")
+SECONDOPINION_DIR="$SAP" "$AM" status "$(echo "$out" | val exchange_id)" >/dev/null 2>&1 && ok || fail "archived exchange unreadable after fail-open"
+
+t "auto-prune: bucket-only — other repositories' archives are never touched, and no GC runs"
+SAP="$TMP/store-auto2"
+for i in 1 2; do SECONDOPINION_RETAIN=9 ap_ex "$TMP/repoA" "apb-a$i" >/dev/null; done
+for i in 1 2; do SECONDOPINION_RETAIN=9 ap_ex "$TMP/repoB" "apb-b$i" >/dev/null; done
+mkdir -p "$SAP/exchanges/2020-01-01T000000Z-apb-orphan"; touch -d '2 days ago' "$SAP/exchanges/2020-01-01T000000Z-apb-orphan"
+out="$(SECONDOPINION_RETAIN=1 SECONDOPINION_AUTO_PRUNE=1 ap_ex "$TMP/repoA" "apb-a3")"; rc=$?
+assert_eq "$rc" 0 "(bucket-only archive rc)"
+assert_grep "^auto_prune=ok removed=2" <(echo "$out")
+assert_eq "$(ls -1 "$SAP/archive" | grep -c 'apb-b')" "2" "(repoB bucket untouched despite being over-retain)"
+[ -d "$SAP/exchanges/2020-01-01T000000Z-apb-orphan" ] && ok || fail "auto-prune ran the store-wide GC (orphan removed)"
+
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -119,7 +119,10 @@ Requester (Codex) side:
   wait ID [--timeout S]   block until a valid response exists (default timeout $DEFAULT_WAIT_TIMEOUT s)
                           exit 0 answered | 124 timeout | 2 archived | 1 error
   read-response ID        validate and print the response
-  archive ID [--force]    move a consumed exchange to archive/ (idempotent)
+  archive ID [--force] [--prune]  move a consumed exchange to archive/ (idempotent); --prune (or
+                          SECONDOPINION_AUTO_PRUNE=1) then prunes THIS repository's bucket to the
+                          retention bound — bucket-only, fail-open (a prune failure never fails
+                          the archive), reported as auto_prune=... on stdout
 
 Responder (Claude) side:
   list [--pending|--answered|--drafts|--all] [--repo PATH|--here] [--json]
@@ -139,7 +142,8 @@ Environment: SECONDOPINION_DIR, SECONDOPINION_OWNER (default claim owner),
              SECONDOPINION_LOCK_WAIT_SECS (default 30; error instead of waiting longer for a held exchange lock),
              SECONDOPINION_CLAUDE (responder binary, default: claude), SECONDOPINION_CLAUDE_ARGS
              (extra flags appended to the responder command), SECONDOPINION_MAX_TURNS (default 60),
-             SECONDOPINION_ASK_TIMEOUT (default 1800), SECONDOPINION_RETAIN (prune bound, default 50)
+             SECONDOPINION_ASK_TIMEOUT (default 1800), SECONDOPINION_RETAIN (prune bound, default 50),
+             SECONDOPINION_AUTO_PRUNE (nonempty and not 0/false/no: archive auto-prunes its own bucket)
 EOF
 }
 
@@ -1203,9 +1207,10 @@ cmd_prune() {
     [ -L "$TOMB" ] && die "refusing symlinked tombstones file: $TOMB"
     echo "mode=$([ "$apply" = 1 ] && echo apply || echo dry-run)"
     echo "retain=$retain"
-    if [ "$apply" = 1 ]; then
+    if [ "$apply" = 1 ] && [ -z "${PRUNE_ONLY_BUCKET:-}" ]; then
         # Sweep residue from removals interrupted after the rename below: a trash dir only
         # ever exists for an already-tombstoned exchange, so removing it is always safe.
+        # (Skipped in bucket-scoped auto-prune, which stays minimal; manual prune sweeps.)
         local trash_res
         for trash_res in "$ARCH"/.prune-trash.*; do
             [ -e "$trash_res" ] && [ ! -L "$trash_res" ] || continue
@@ -1214,8 +1219,9 @@ cmd_prune() {
     fi
     # GC crash litter in exchanges/: day-old meta-less orphan dirs and .new.* staging
     # (an interrupted `new`), plus day-old .*.tmp.* files inside live exchanges.
+    # Store-wide, so skipped in bucket-scoped auto-prune.
     local gc_cutoff=$(( $(epoch) - 86400 )) gcd gcm
-    for gcd in "$EXCH"/.new.* "$EXCH"/*/; do
+    [ -n "${PRUNE_ONLY_BUCKET:-}" ] || for gcd in "$EXCH"/.new.* "$EXCH"/*/; do
         gcd="${gcd%/}"; [ -e "$gcd" ] || continue; [ -L "$gcd" ] && continue
         case "$(basename "$gcd")" in
             .new.*) ;;
@@ -1225,7 +1231,7 @@ cmd_prune() {
         printf 'gc=%s\trule=crash-litter(no meta, older than one day)\n' "$(basename "$gcd")"
         if [ "$apply" = 1 ]; then rm -rf -- "$gcd" 2>/dev/null || true; fi
     done
-    if [ "$apply" = 1 ] && [ -d "$EXCH" ]; then
+    if [ "$apply" = 1 ] && [ -d "$EXCH" ] && [ -z "${PRUNE_ONLY_BUCKET:-}" ]; then
         for gcd in "$EXCH"/*/; do
             gcd="${gcd%/}"; [ -f "$gcd/meta" ] || continue; [ -L "$gcd/.lock" ] && continue
             # Non-blocking: an exchange another process holds locked is skipped, not waited on.
@@ -1253,6 +1259,8 @@ cmd_prune() {
             [ -n "$i" ] || continue
             if [ "$b" != "$bucket" ]; then bucket="$b"; rank=0; fi
             rank=$((rank+1))
+            # PRUNE_ONLY_BUCKET (auto-prune from archive): act on one repository's bucket only.
+            if [ -n "${PRUNE_ONLY_BUCKET:-}" ] && [ "$b" != "$PRUNE_ONLY_BUCKET" ]; then continue; fi
             [ "$rank" -gt "$retain" ] && targets+=("${b}${US}${i}${US}${rank}")
         done <<< "$sorted"
         local bytes
@@ -1293,7 +1301,8 @@ cmd_prune() {
         done
         # Interrupted-apply repair: a tombstoned id whose directory still exists was caught
         # mid-removal; finish the removal on --apply regardless of retention rank.
-        if [ "$apply" = 1 ] && [ -f "$TOMB" ]; then
+        # (Store-wide, so skipped in bucket-scoped auto-prune.)
+        if [ "$apply" = 1 ] && [ -f "$TOMB" ] && [ -z "${PRUNE_ONLY_BUCKET:-}" ]; then
             while IFS= read -r i; do
                 valid_id "$i" || continue
                 real_dir "$ARCH/$i" || continue
@@ -1438,10 +1447,26 @@ cmd_result() {
     esac
 }
 
+auto_prune_enabled() { case "${SECONDOPINION_AUTO_PRUNE:-}" in ""|0|false|no) return 1;; *) return 0;; esac; }
+
+auto_prune_after_archive() { # git_common_dir — bucket-only, fail-open: never fails the archive
+    local common="$1" out rc=0 removed
+    { [ -n "$common" ] && [ "$common" != "(none)" ]; } || common="(non-git)"
+    out="$(PRUNE_ONLY_BUCKET="$common" cmd_prune --apply 2>&1)" || rc=$?
+    if [ "$rc" != 0 ]; then
+        echo "auto_prune=failed (the archive itself succeeded); prune manually: secondopinion prune --apply"
+        printf '%s\n' "$out" | tail -2 | sed 's/^/auto_prune_detail: /' >&2
+        return 0
+    fi
+    removed="$(printf '%s\n' "$out" | sed -n 's/^pruned=//p' | head -1)"
+    echo "auto_prune=ok removed=${removed:-0} retain=${SECONDOPINION_RETAIN:-50}"
+    return 0
+}
+
 cmd_archive() {
-    local id="" force=0
-    while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; -h|--help) usage; exit 0;; *) positional id "$1";; esac; shift; done
-    [ -n "$id" ] || die "usage: archive ID [--force]"
+    local id="" force=0 auto_prune=0
+    while [ "$#" -gt 0 ]; do case "$1" in --force) force=1;; --prune) auto_prune=1;; -h|--help) usage; exit 0;; *) positional id "$1";; esac; shift; done
+    [ -n "$id" ] || die "usage: archive ID [--force] [--prune]"
     require_id "$id"
     [ -L "$EXCH/$id" ] || [ -L "$ARCH/$id" ] && die "refusing symlinked exchange directory: $id"
     if ! is_active "$id"; then
@@ -1470,8 +1495,10 @@ cmd_archive() {
     fi
     unlock
     relocate_responder_log "$id"
-    retention_note "$(meta_get "$ARCH/$id" git_common_dir)"
+    local acommon; acommon="$(meta_get "$ARCH/$id" git_common_dir)"
     echo "exchange_id=$id"; echo "state=archived"; echo "archive_dir=$ARCH/$id"
+    if [ "$auto_prune" = 1 ] || auto_prune_enabled; then auto_prune_after_archive "$acommon"; fi
+    retention_note "$acommon"
 }
 
 main() {

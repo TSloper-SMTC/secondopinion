@@ -14,9 +14,10 @@
 #   install.sh --plugin  deprecated alias for --claude.
 #   install.sh --check   report status; exit 0 if fully installed (the Codex side in exactly one
 #                        current form; the Claude side may be absent, but must be current if present).
-#   install.sh --uninstall  remove every installed piece on both sides (plugins, marketplaces,
-#                        skill symlinks, CLI symlinks, sandbox config edits). The store and the
-#                        backups directory are KEPT.
+#   install.sh --uninstall  COMPLETE removal: plugins, marketplaces, skill symlinks, CLI
+#                        symlinks, sandbox config edits, the store (all exchanges/archives),
+#                        the default state dir and any leftover plugin cache. Only a custom
+#                        SECONDOPINION_BACKUP_DIR location is left alone.
 set -euo pipefail
 
 if [ -z "${HOME:-}" ]; then
@@ -384,7 +385,24 @@ if [ "$UNINSTALL" = 1 ]; then
         remove_sandbox_root "$STORE_DIR" && echo "config    $CODEX_CFG: removed $STORE_DIR from [sandbox_workspace_write].writable_roots (backup in $BACKUP_DIR)" || true
         remove_empty_sandbox_section && echo "config    $CODEX_CFG: removed the now-empty [sandbox_workspace_write] table" || true
     fi
-    echo "uninstalled: the store ($STORE_DIR) and backups ($BACKUP_DIR) are KEPT; remove them manually if desired"
+    # Complete removal: the store (all exchanges/archives/logs), our default state dir,
+    # and any leftover plugin cache. A CUSTOM backups location is not ours to delete.
+    if { [ -e "$STORE_DIR" ] || [ -L "$STORE_DIR" ]; } && [ -n "$STORE_DIR" ] && [ "$STORE_DIR" != "/" ]; then
+        rm -rf -- "$STORE_DIR"; echo "removed   store $STORE_DIR (all exchanges, archives and responder logs)"
+    fi
+    UNINSTALL_STATE="$HOME/.local/state/secondopinion"
+    if [ -e "$UNINSTALL_STATE" ] || [ -L "$UNINSTALL_STATE" ]; then
+        rm -rf -- "$UNINSTALL_STATE"; echo "removed   $UNINSTALL_STATE (installer backups/state)"
+    fi
+    case "$BACKUP_DIR" in
+        "$UNINSTALL_STATE"|"$UNINSTALL_STATE"/*) ;;
+        *) if [ -e "$BACKUP_DIR" ]; then echo "kept      $BACKUP_DIR (custom SECONDOPINION_BACKUP_DIR location; not ours to delete)"; fi;;
+    esac
+    UNINSTALL_CACHE="$(codex_home)/plugins/cache/secondopinion"
+    if [ -e "$UNINSTALL_CACHE" ] || [ -L "$UNINSTALL_CACHE" ]; then
+        rm -rf -- "$UNINSTALL_CACHE"; echo "removed   $UNINSTALL_CACHE (leftover Codex plugin cache)"
+    fi
+    echo "uninstalled: nothing of secondopinion remains (install, config edits, store and state all removed)"
     exit 0
 fi
 

@@ -73,7 +73,7 @@ git clone https://github.com/tsloper/secondopinion ~/tools/secondopinion
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --claude   # + the Claude Code plugin (optional)
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --skills   # symlink form instead of plugins
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --check    # verify; exit 0 = installed
-~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --uninstall # remove everything installed (both sides); the store and backups are kept
+~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --uninstall # COMPLETE removal: both sides, config edits, the store and all state
 ```
 
 Prerequisites: bash, GNU coreutils/sed/grep/awk/flock, git, python3 (installer
@@ -172,9 +172,15 @@ marketplace) and Codex's `plugin-creator/scripts/validate_plugin.py`.
   targets, rules and bytes; `--apply` holds each exchange's lock through a
   tombstone-first removal (IDs are never reused; an interrupted prune completes
   on the next run; only verified removals are counted). Drafts, pending,
-  claimed and answered-but-unconsumed exchanges are never candidates; nothing
-  prunes automatically — when a repository's bucket goes over the bound,
-  `archive` and `jobs` print a one-line note on stderr pointing at `prune`.
+  claimed and answered-but-unconsumed exchanges are never candidates. By
+  default nothing prunes automatically — when a repository's bucket goes over
+  the bound, `archive` and `jobs` print a one-line note on stderr pointing at
+  `prune`. Opt in to auto-prune with `SECONDOPINION_AUTO_PRUNE=1` (or per call:
+  `archive --prune`): an archive that lands in an over-bound bucket then prunes
+  **that repository's bucket only**, fail-open (a prune failure never fails the
+  archive), reporting `auto_prune=ok removed=N` (or `auto_prune=failed`) as a
+  parseable stdout key. The bucket-scoped run skips the store-wide crash-litter
+  GC and repairs, which stay with manual `prune --apply`.
 
 ## Manual flow (any two sessions, no headless responder)
 
@@ -258,7 +264,9 @@ exchange lock within this many seconds fails with `exchange busy` instead of
 waiting forever), `SECONDOPINION_BACKUP_DIR`
 (installer backups), `SECONDOPINION_CLAUDE` (responder binary, default `claude`),
 `SECONDOPINION_CLAUDE_ARGS` (extra responder flags), `SECONDOPINION_MAX_TURNS`
-(default 60), `SECONDOPINION_ASK_TIMEOUT` (default 1800). Legacy `AGENT_MAILBOX_*`
+(default 60), `SECONDOPINION_ASK_TIMEOUT` (default 1800),
+`SECONDOPINION_AUTO_PRUNE` (nonempty and not `0`/`false`/`no`: `archive`
+auto-prunes its own repository bucket, see prune above). Legacy `AGENT_MAILBOX_*`
 names are honoured with a deprecation warning.
 
 ## Tests
