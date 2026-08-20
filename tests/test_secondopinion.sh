@@ -760,5 +760,132 @@ assert_eq "$rc" 0
 IDP="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"; assert_grep "Piped task" "$("$AM" path "$IDP")/prompt.md"
 
 # ===========================================================================
+# --- reliability hardening: empty meta values, orphans, lock waits, rollforward
+
+t "list: an exchange with an empty created_epoch lists with age '-' and never crashes or truncates the listing"
+IDRC="$(new_in "$TMP/repoA" "hardening corrupt epoch")"
+sed -i 's/^created_epoch=.*/created_epoch=/' "$("$AM" path "$IDRC")/meta"
+IDRH="$(new_in "$TMP/repoA" "hardening healthy after")"
+out="$("$AM" list --all 2>"$TMP/hard-list.err")"; rc=$?
+assert_eq "$rc" 0 "(list rc with empty created_epoch)"
+assert_not_grep "syntax error" "$TMP/hard-list.err"
+assert_grep "$IDRH" <(echo "$out")
+echo "$out" | grep "^$IDRC" | grep -q "	-	" && ok || fail "corrupt-epoch row missing or lacks '-' age"
+
+t "jobs: same corrupt exchange never crashes or truncates jobs output"
+out="$(cd "$TMP/repoA" && "$AM" jobs 2>"$TMP/hard-jobs.err")"; rc=$?
+assert_eq "$rc" 0 "(jobs rc with empty created_epoch)"
+assert_not_grep "syntax error" "$TMP/hard-jobs.err"
+assert_grep "$IDRH" <(echo "$out")
+
+t "claim: empty claimed_epoch refuses takeover cleanly (fail-safe, no arithmetic crash)"
+IDCE="$(new_in "$TMP/repoA" "hardening claimed epoch")"; publish_prompt "$IDCE" "task"
+"$AM" claim "$IDCE" --owner first >/dev/null
+sed -i 's/^claimed_epoch=.*/claimed_epoch=/' "$("$AM" path "$IDCE")/meta"
+out="$("$AM" claim "$IDCE" --owner second --takeover 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(claim rc on empty claimed_epoch)"
+assert_grep "already claimed" <(echo "$out")
+assert_not_grep "syntax error" <(echo "$out")
+
+t "status: claimed exchange with empty claimed_epoch stays reportable"
+out="$("$AM" status "$IDCE" 2>&1)"; rc=$?
+assert_eq "$rc" 0 "(status rc on empty claimed_epoch)"
+assert_not_grep "syntax error" <(echo "$out")
+
+t "status: meta-less exchange dir reports a clean error, not a raw cat failure"
+mkdir -p "$SECONDOPINION_DIR/exchanges/2026-01-01T000000Z-hardening-metaless"
+out="$("$AM" status 2026-01-01T000000Z-hardening-metaless 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(status rc on meta-less dir)"
+assert_grep "no meta" <(echo "$out")
+assert_not_grep "cat:" <(echo "$out")
+
+t "lock: a held exchange lock times out with a clear error instead of hanging forever"
+IDLK="$(new_in "$TMP/repoA" "hardening lock wait")"; publish_prompt "$IDLK" "task"
+( exec 9>>"$("$AM" path "$IDLK")/.lock"; flock 9; sleep 6 ) & HOLDER=$!
+sleep 0.3
+T0=$(date +%s)
+out="$(SECONDOPINION_LOCK_WAIT_SECS=1 "$AM" claim "$IDLK" --owner waiter 2>&1)"; rc=$?
+T1=$(date +%s)
+assert_eq "$rc" 1 "(claim rc on held lock)"
+[ $((T1 - T0)) -le 4 ] && ok || fail "lock wait did not time out (took $((T1-T0))s)"
+assert_grep "busy" <(echo "$out")
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+t "env: a non-integer SECONDOPINION_LOCK_WAIT_SECS is rejected with one clear error"
+out="$(SECONDOPINION_LOCK_WAIT_SECS=abc "$AM" status "$IDLK" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc bad LOCK_WAIT_SECS)"
+assert_grep "SECONDOPINION_LOCK_WAIT_SECS" <(echo "$out")
+
+t "wait: finalizes a valid on-disk response left by a responder that died before meta finalize"
+IDRF="$(new_in "$TMP/repoA" "hardening rollforward wait")"; publish_prompt "$IDRF" "task"
+"$AM" claim "$IDRF" --owner doomed >/dev/null
+write_response "$IDRF" "$TMP/rollforward.md"
+cp "$TMP/rollforward.md" "$("$AM" path "$IDRF")/response.md"; chmod 600 "$("$AM" path "$IDRF")/response.md"
+assert_eq "$("$AM" status "$IDRF" | val state)" "claimed" "(fixture: still claimed)"
+assert_rc 0 "$AM" wait "$IDRF" --timeout 5
+assert_eq "$("$AM" status "$IDRF" | val state)" "answered" "(state after wait rollforward)"
+assert_grep "PROVEN ok" <("$AM" read-response "$IDRF")
+
+t "result: performs the same roll-forward"
+IDRF2="$(new_in "$TMP/repoA" "hardening rollforward result")"; publish_prompt "$IDRF2" "task"
+"$AM" claim "$IDRF2" --owner doomed >/dev/null
+write_response "$IDRF2" "$TMP/rollforward2.md"
+cp "$TMP/rollforward2.md" "$("$AM" path "$IDRF2")/response.md"; chmod 600 "$("$AM" path "$IDRF2")/response.md"
+assert_grep "PROVEN ok" <("$AM" result "$IDRF2" 2>/dev/null)
+assert_eq "$("$AM" status "$IDRF2" | val state)" "answered" "(state after result rollforward)"
+
+t "wait: an INVALID on-disk response while claimed is never finalized"
+IDRB="$(new_in "$TMP/repoA" "hardening rollforward bad")"; publish_prompt "$IDRB" "task"
+"$AM" claim "$IDRB" --owner doomed >/dev/null
+printf 'not a valid response\n' > "$("$AM" path "$IDRB")/response.md"; chmod 600 "$("$AM" path "$IDRB")/response.md"
+assert_rc 124 "$AM" wait "$IDRB" --timeout 1
+assert_eq "$("$AM" status "$IDRB" | val state)" "claimed" "(invalid response must not finalize)"
+
+t "claim: state=claimed with claim/ missing is an orphaned takeover crash; immediately re-claimable"
+IDOC="$(new_in "$TMP/repoA" "hardening orphan claim")"; publish_prompt "$IDOC" "task"
+"$AM" claim "$IDOC" --owner victim >/dev/null
+rm -rf "$("$AM" path "$IDOC")/claim"
+out="$("$AM" claim "$IDOC" --owner rescuer 2>&1)"; rc=$?
+assert_eq "$rc" 0 "(re-claim rc on orphaned claim)"
+TOKOC="$(echo "$out" | val claim_token)"
+[ -n "$TOKOC" ] && ok || fail "no claim_token from orphan re-claim"
+write_response "$IDOC" "$TMP/orphanclaim.md"
+assert_rc 0 "$AM" respond "$IDOC" --token "$TOKOC" --file "$TMP/orphanclaim.md"
+
+t "ask --timeout: the killed responder leaves a non-empty log and the hint names ask --attach"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "hardening timeout log" --file "$TMP/request.md" --timeout 2 2>&1)"; rc=$?
+assert_eq "$rc" 124 "(ask rc on timeout)"
+assert_grep "ask --attach" <(echo "$out")
+IDTL="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+LOGTL="$SECONDOPINION_DIR/responder-logs/$IDTL.log"
+[ -s "$LOGTL" ] && ok || fail "responder log empty after timeout kill"
+assert_grep "killed by ask" "$LOGTL"
+
+t "ask --attach: refuses while the recorded background responder is still running (no log truncation)"
+IDAT="$(new_in "$TMP/repoA" "hardening attach running")"; publish_prompt "$IDAT" "task"
+sleep 60 & RPID=$!
+RSTAT="$(cat /proc/$RPID/stat)"; RSTAT="${RSTAT##*) }"; set -- $RSTAT; RSTART="${20}"
+printf 'responder_pid=%s\nresponder_starttime=%s\nresponder_log=%s\n' "$RPID" "$RSTART" "$SECONDOPINION_DIR/responder-logs/$IDAT.log" >> "$("$AM" path "$IDAT")/meta"
+mkdir -p "$SECONDOPINION_DIR/responder-logs"
+printf 'SENTINEL-DO-NOT-TRUNCATE\n' > "$SECONDOPINION_DIR/responder-logs/$IDAT.log"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDAT" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach rc while responder running)"
+assert_grep "still running" <(echo "$out")
+assert_grep "cancel" <(echo "$out")
+assert_grep "SENTINEL-DO-NOT-TRUNCATE" "$SECONDOPINION_DIR/responder-logs/$IDAT.log"
+kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null
+
+t "prune --apply: sweeps leftover .prune-trash residue from an interrupted removal"
+IDPT="$(new_in "$TMP/repoA" "hardening prune trash")"; publish_prompt "$IDPT" "task"
+TOKPT="$("$AM" claim "$IDPT" --owner p | val claim_token)"
+write_response "$IDPT" "$TMP/prunetrash.md"
+"$AM" respond "$IDPT" --token "$TOKPT" --file "$TMP/prunetrash.md" >/dev/null
+"$AM" archive "$IDPT" >/dev/null
+mkdir -p "$SECONDOPINION_DIR/archive/.prune-trash.999.2020-01-01T000000Z-stale"
+echo x > "$SECONDOPINION_DIR/archive/.prune-trash.999.2020-01-01T000000Z-stale/leftover"
+assert_rc 0 "$AM" prune --apply
+[ ! -e "$SECONDOPINION_DIR/archive/.prune-trash.999.2020-01-01T000000Z-stale" ] && ok || fail "stale .prune-trash residue not swept"
+
+# ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

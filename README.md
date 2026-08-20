@@ -251,7 +251,10 @@ agents on your machine.
 
 `SECONDOPINION_DIR` (store), `SECONDOPINION_OWNER` (default claim owner),
 `SECONDOPINION_STALE_CLAIM_SECS` (non-negative decimal seconds ≤ 4294967295,
-leading zeros allowed, same rule as `wait --timeout`), `SECONDOPINION_BACKUP_DIR`
+leading zeros allowed, same rule as `wait --timeout`),
+`SECONDOPINION_LOCK_WAIT_SECS` (default 30: a command that cannot acquire a held
+exchange lock within this many seconds fails with `exchange busy` instead of
+waiting forever), `SECONDOPINION_BACKUP_DIR`
 (installer backups), `SECONDOPINION_CLAUDE` (responder binary, default `claude`),
 `SECONDOPINION_CLAUDE_ARGS` (extra responder flags), `SECONDOPINION_MAX_TURNS`
 (default 60), `SECONDOPINION_ASK_TIMEOUT` (default 1800). Legacy `AGENT_MAILBOX_*`

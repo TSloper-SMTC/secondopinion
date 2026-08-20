@@ -1,6 +1,6 @@
 {
   "name": "secondopinion",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Global file-based mailbox for Codex\u2192Claude Code review exchanges: the secondopinion-request skill creates, publishes, waits for and reads exchanges in the ~/.secondopinion store (requires the secondopinion CLI on PATH; see install.sh).",
   "author": {
     "name": "Tim Sloper",

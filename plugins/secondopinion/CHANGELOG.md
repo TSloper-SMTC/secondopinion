@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.0.1 — 2026-08-20
+
+Reliability hardening from an exhaustive live + adversarial test campaign
+(all defects reproduced first; every fix carries a regression test — suite
+grows 309→350).
+
+- **No more availability crashes on damaged meta.** An exchange whose
+  `created_epoch`/`claimed_epoch` is empty (crash-torn or hand-edited meta)
+  no longer aborts `list`/`jobs` mid-output (rows after it were silently
+  dropped with exit 0) or crashes `claim`/`status` with a raw bash arithmetic
+  error; it lists with age `-`, and takeover on an epoch-less claim fails safe
+  (age 0). `status` on a meta-less exchange directory (a crash-orphaned `new`)
+  reports a clean error naming the cleanup instead of a raw `cat` failure.
+- **Lost-token outage closed.** A responder that died after publishing
+  `response.md` but before finalizing meta used to strand the exchange in
+  `claimed` for `SECONDOPINION_STALE_CLAIM_SECS` (default 30 min) until a
+  takeover re-ran `respond`. `wait` and `result` now roll a valid on-disk
+  response forward under the exchange lock (write-once + hash validation make
+  this safe); an invalid response is never finalized. Likewise, a takeover
+  that crashed between removing the old claim and recording the new one left
+  a claim nothing could ever answer — `claim` now treats state=claimed with
+  no `claim/` as orphaned and re-claims immediately.
+- **Locks time out.** A wedged holder used to hang every mutator on that
+  exchange silently and forever; `lock()` now fails with `exchange busy`
+  after `SECONDOPINION_LOCK_WAIT_SECS` (default 30).
+- **Prune removal is rename-first.** `flock` is per-inode and `lock()` opens
+  with O_CREAT, so a concurrent locker could recreate `.lock` inside a
+  directory mid-`rm -rf` and acquire a lock the pruner did not hold
+  (found by an adversarial self-review; mechanism demonstrated live).
+  `prune --apply` now renames the target to `archive/.prune-trash.*` under
+  the held lock before deleting, and sweeps stale trash on the next apply.
+- **`ask --attach` refuses a live responder.** Attaching while the recorded
+  background responder is still running would truncate its log mid-write and
+  orphan it from `cancel`; it now fails with a `cancel` hint.
+- **Timeout diagnostics.** A foreground `ask` timeout now appends a
+  `killed by ask --timeout` line to the responder log (previously empty —
+  headless `claude -p` buffers everything until completion) and the retry
+  hints name `ask --attach` (the actual recovery) instead of only `wait`.
+- `meta_set` fsyncs the store's authoritative file after rename (best-effort,
+  same discipline as tombstones; untestable in the suite — power-loss only).
+
 ## 1.0.0 — 2026-08-19
 
 First public release. secondopinion gives one AI coding agent a sealed,

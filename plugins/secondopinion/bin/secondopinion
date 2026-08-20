@@ -12,7 +12,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 warn() { echo "WARNING: $*" >&2; }
 
 # ---- agent-mailbox compatibility (the tool's pre-release internal name) -----------------------
@@ -60,6 +60,7 @@ parse_secs() { # name value -> prints the integer, or an error line on stderr an
     echo $((10#$v))
 }
 STALE_CLAIM_SECS="$(parse_secs SECONDOPINION_STALE_CLAIM_SECS "${SECONDOPINION_STALE_CLAIM_SECS:-1800}")" || exit 1
+LOCK_WAIT_SECS="$(parse_secs SECONDOPINION_LOCK_WAIT_SECS "${SECONDOPINION_LOCK_WAIT_SECS:-30}")" || exit 1
 DEFAULT_WAIT_TIMEOUT=600
 POLL_SECS=2
 TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"
@@ -131,6 +132,7 @@ Both:
 
 Environment: SECONDOPINION_DIR, SECONDOPINION_OWNER (default claim owner),
              SECONDOPINION_STALE_CLAIM_SECS (default 1800; --takeover allowed after this),
+             SECONDOPINION_LOCK_WAIT_SECS (default 30; error instead of waiting longer for a held exchange lock),
              SECONDOPINION_CLAUDE (responder binary, default: claude), SECONDOPINION_CLAUDE_ARGS
              (extra flags appended to the responder command), SECONDOPINION_MAX_TURNS (default 60),
              SECONDOPINION_ASK_TIMEOUT (default 1800), SECONDOPINION_RETAIN (prune bound, default 50)
@@ -253,8 +255,13 @@ meta_set() { # dir key value [key value ...]  (atomic rewrite; caller holds lock
     local k
     for k in "${order[@]}"; do printf '%s=%s\n' "$k" "${kv[$k]}" >> "$tmp"; done
     mv -f "$tmp" "$dir/meta"
+    sync -- "$dir/meta" 2>/dev/null || true   # meta is authoritative; best-effort durability (coreutils >=8.24)
 }
-lock() { [ -L "$1/.lock" ] && die "refusing symlinked .lock in $(basename "$1")"; exec 9>>"$1/.lock"; flock 9; }
+lock() {
+    [ -L "$1/.lock" ] && die "refusing symlinked .lock in $(basename "$1")"
+    exec 9>>"$1/.lock"
+    flock -w "$LOCK_WAIT_SECS" 9 || die "exchange busy: lock on $(basename "$1") still held after ${LOCK_WAIT_SECS}s (another secondopinion command is stuck or slow; SECONDOPINION_LOCK_WAIT_SECS adjusts the wait)"
+}
 unlock() { exec 9>&-; }
 
 # ---- validation ------------------------------------------------------------
@@ -548,6 +555,7 @@ cmd_ask() {
             *) die "exchange $attach is not published (state=$astate); publish it first";;
         esac
         [ "$(prompt_ok "$dir")" = "yes" ] || die "exchange $attach prompt failed validation; refusing to attach a responder"
+        [ "$(responder_state "$dir")" = "running" ] && die "a responder for $attach is still running (pid $(meta_get "$dir" responder_pid)); attaching now would truncate its log and orphan it — cancel it first: secondopinion cancel $attach"
         id="$attach"
     fi
     # Read the request text before creating anything.
@@ -645,9 +653,10 @@ $parent_resp_txt
         return 0
     fi
     echo "exchange_id=$id" >&2; echo "state=$state" >&2; echo "responder_log=$RESPONDER_LOG" >&2
-    local retry_hint="the exchange stays published (retry with a longer --timeout via: secondopinion wait $id, while any responder session answers it)"
-    [ "$state" = "claimed" ] && retry_hint="state=claimed: the responder claimed the exchange before dying, and its claim token is lost; after SECONDOPINION_STALE_CLAIM_SECS (default 1800) another responder can run: secondopinion claim $id --takeover --owner ..."
+    local retry_hint="the exchange stays published and the launched responder is gone; retry with: secondopinion ask --attach $id  (or let any responder session answer it, then: secondopinion wait $id)"
+    [ "$state" = "claimed" ] && retry_hint="state=claimed: the responder claimed the exchange before dying, and its claim token is lost; if it published its response first, secondopinion result $id recovers it; otherwise after SECONDOPINION_STALE_CLAIM_SECS (default 1800) another responder can run: secondopinion claim $id --takeover --owner ..."
     if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        printf '[secondopinion] responder killed by ask --timeout after %ss at %s\n' "$timeout" "$(now_utc)" >> "$RESPONDER_LOG" 2>/dev/null || true
         echo "result=timeout after ${timeout}s; $retry_hint" >&2
         return 124
     fi
@@ -799,9 +808,11 @@ cmd_publish() {
 
 emit_status() { # dir [json]
     local dir="$1" json="${2:-}" k v
-    local pok rok cage="" state
+    [ -f "$dir/meta" ] && [ ! -L "$dir/meta" ] || die "exchange has no meta (interrupted 'new'?); nothing to report — remove the directory to clean up: $dir"
+    local pok rok cage="" cep state
     pok="$(prompt_ok "$dir")"; rok="$(response_ok "$dir")"; state="$(meta_get "$dir" state)"
-    if [ "$state" = "claimed" ]; then cage="$(( $(epoch) - $(meta_get "$dir" claimed_epoch) ))"; fi
+    cep="$(meta_get "$dir" claimed_epoch)"
+    if [ "$state" = "claimed" ] && [ -n "$cep" ]; then cage="$(( $(epoch) - cep ))"; fi
     if [ -n "$json" ]; then
         printf '{'
         local first=1
@@ -840,7 +851,7 @@ status_extras() { # dir state -> elapsed, responder liveness, and a next-action 
     case "$state" in
         draft)     echo "next=edit the Task section of prompt.md, then: secondopinion publish $id";;
         published) if [ "$rstate" = "running" ]; then echo "next=responder running: secondopinion wait $id  (or: secondopinion cancel $id)"
-                   elif [ "$rstate" = "exited" ] || [ "$rstate" = "cancelled" ]; then echo "next=responder $rstate without answering; inspect $(meta_get "$dir" responder_log); retry with any responder session, then: secondopinion wait $id"
+                   elif [ "$rstate" = "exited" ] || [ "$rstate" = "cancelled" ]; then echo "next=responder $rstate without answering; inspect $(meta_get "$dir" responder_log); retry with: secondopinion ask --attach $id  (or any responder session, then: secondopinion wait $id)"
                    else echo "next=waiting for a responder: secondopinion wait $id"; fi;;
         claimed)   echo "next=claimed by $(meta_get "$dir" claimed_by); if stale (>SECONDOPINION_STALE_CLAIM_SECS), another responder may run: secondopinion claim $id --takeover --owner ...";;
         answered)  echo "next=secondopinion result $id   then: secondopinion archive $id";;
@@ -901,7 +912,8 @@ cmd_list() {
             active|all) ;;
         esac
         if [ -n "$want_common" ]; then [ "$common" = "$want_common" ] || continue; fi
-        local age; age="$(human_age $(( now - $(meta_get "$d" created_epoch) )))"
+        local age ce; ce="$(meta_get "$d" created_epoch)"
+        if [ -n "$ce" ]; then age="$(human_age $(( now - ce )))"; else age="-"; fi
         if [ -n "$json" ]; then
             [ "$first" = 1 ] || printf ','; first=0
             emit_status "$d" json
@@ -936,13 +948,23 @@ cmd_claim() {
                 rm -rf "$dir/claim"
             fi;;
         claimed)
-            local age=$(( $(epoch) - $(meta_get "$dir" claimed_epoch) )) by; by="$(meta_get "$dir" claimed_by)"
-            if [ "$takeover" = 1 ] && [ "$age" -ge "$STALE_CLAIM_SECS" ]; then
-                [ -L "$dir/claim" ] && { unlock; die "refusing symlinked claim in $id"; }
+            local cep age by; cep="$(meta_get "$dir" claimed_epoch)"; by="$(meta_get "$dir" claimed_by)"
+            if [ ! -e "$dir/claim" ] && [ ! -L "$dir/claim" ]; then
+                # state=claimed with no claim/: a takeover crashed between removing the old
+                # claim and recording the new one. The token is gone, so nothing can ever
+                # respond; treat the claim as orphaned and re-claim immediately.
                 meta_set "$dir" previous_claimant "$by"
-                rm -rf "$dir/claim"
             else
-                unlock; die "already claimed by '$by' (${age}s ago); --takeover is allowed after ${STALE_CLAIM_SECS}s"
+                # An empty claimed_epoch (corrupt meta) counts as age 0: fail safe by
+                # refusing takeover rather than treating the claim as infinitely stale.
+                age=$(( $(epoch) - ${cep:-$(epoch)} ))
+                if [ "$takeover" = 1 ] && [ "$age" -ge "$STALE_CLAIM_SECS" ]; then
+                    [ -L "$dir/claim" ] && { unlock; die "refusing symlinked claim in $id"; }
+                    meta_set "$dir" previous_claimant "$by"
+                    rm -rf "$dir/claim"
+                else
+                    unlock; die "already claimed by '$by' (${age}s ago); --takeover is allowed after ${STALE_CLAIM_SECS}s"
+                fi
             fi;;
         draft) unlock; die "exchange is not published yet";;
         *) unlock; die "cannot claim from state '$state'";;
@@ -975,6 +997,19 @@ validate_response_file() { # file id
 }
 finalize_response() { # dir  (caller holds lock; response.md exists and validated)
     meta_set "$1" state answered answered_utc "$(now_utc)" response_sha256 "$(sha "$1/response.md")" responder "$(responder_of "$1/response.md")"
+}
+
+try_rollforward() { # dir id — finalize a valid response.md left by a responder that died
+    # between ln and finalize (its claim token is lost). Write-once + validation make this
+    # safe; without it the exchange stays claimed until a stale takeover re-runs respond.
+    local dir="$1" id="$2"
+    lock "$dir"
+    if [ "$(meta_get "$dir" state)" = "claimed" ] && regular "$dir/response.md" \
+       && [ "$(prompt_ok "$dir")" = "yes" ] \
+       && ( validate_response_file "$dir/response.md" "$id" ) >/dev/null 2>&1; then
+        finalize_response "$dir"; unlock; return 0
+    fi
+    unlock; return 1
 }
 
 cmd_respond() {
@@ -1068,6 +1103,9 @@ cmd_wait() {
         is_active "$id" || die "unknown exchange: $id"
         dir="$EXCH/$id"; check_components "$dir"; state="$(meta_get "$dir" state)"
         if [ "$state" = "archived" ]; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
+        if [ "$state" = "claimed" ] && [ -e "$dir/response.md" ] && [ ! -L "$dir/response.md" ]; then
+            if try_rollforward "$dir" "$id"; then state="$(meta_get "$dir" state)"; fi
+        fi
         if [ "$state" = "answered" ]; then
             if [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
                 echo "exchange_id=$id"; echo "state=answered"; echo "response_path=$dir/response.md"
@@ -1127,6 +1165,15 @@ cmd_prune() {
     [ -L "$TOMB" ] && die "refusing symlinked tombstones file: $TOMB"
     echo "mode=$([ "$apply" = 1 ] && echo apply || echo dry-run)"
     echo "retain=$retain"
+    if [ "$apply" = 1 ]; then
+        # Sweep residue from removals interrupted after the rename below: a trash dir only
+        # ever exists for an already-tombstoned exchange, so removing it is always safe.
+        local trash_res
+        for trash_res in "$ARCH"/.prune-trash.*; do
+            [ -e "$trash_res" ] && [ ! -L "$trash_res" ] || continue
+            rm -rf -- "$trash_res" 2>/dev/null || true
+        done
+    fi
     local rows=() d id common key
     for d in "$ARCH"/*/; do
         d="${d%/}"; [ -e "$d" ] || continue
@@ -1173,7 +1220,12 @@ cmd_prune() {
                 exec 8>>"$TOMB"; flock 8; chmod 600 "$TOMB" 2>/dev/null || true
                 grep -Fxq -- "$i" "$TOMB" || printf '%s\n' "$i" >> "$TOMB"
                 sync -- "$TOMB" 2>/dev/null || true
-                rm -rf -- "$ARCH/$i" 2>/dev/null || true
+                # Rename away under OUR lock before deleting: once the dir leaves $ARCH,
+                # a concurrent lock() cannot recreate .lock on a fresh inode inside a
+                # directory that is mid-removal (flock is per-inode; open uses O_CREAT).
+                local trash="$ARCH/.prune-trash.$$.$i"
+                if mv -T -- "$ARCH/$i" "$trash" 2>/dev/null; then rm -rf -- "$trash" 2>/dev/null || true
+                else rm -rf -- "$ARCH/$i" 2>/dev/null || true; fi
                 exec 8>&-; exec 7>&-
                 # Count only VERIFIED removals; a survivor is reported, not miscounted.
                 if [ -e "$ARCH/$i" ]; then echo "skipped=$i reason=removal-failed" >&2; skipped=$((skipped+1))
@@ -1191,7 +1243,9 @@ cmd_prune() {
                 if ! flock -n 7; then exec 7>&-; echo "skipped=$i reason=locked"; skipped=$((skipped+1)); continue; fi
                 if real_dir "$ARCH/$i"; then
                     printf 'prune=%s\trule=completing-interrupted-prune\n' "$i"
-                    rm -rf -- "$ARCH/$i" 2>/dev/null || true
+                    local rtrash="$ARCH/.prune-trash.$$.$i"
+                    if mv -T -- "$ARCH/$i" "$rtrash" 2>/dev/null; then rm -rf -- "$rtrash" 2>/dev/null || true
+                    else rm -rf -- "$ARCH/$i" 2>/dev/null || true; fi
                     [ -e "$ARCH/$i" ] && { echo "skipped=$i reason=removal-failed" >&2; skipped=$((skipped+1)); } || pruned=$((pruned+1))
                 fi
                 exec 7>&-
@@ -1292,7 +1346,8 @@ cmd_jobs() {
         id="$(meta_get "$d" exchange_id)"; valid_id "$id" || continue
         state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
         if [ -n "$want_common" ] && [ "$common" != "$want_common" ]; then continue; fi
-        age="$(human_age $(( now - $(meta_get "$d" created_epoch) )))"
+        local ce; ce="$(meta_get "$d" created_epoch)"
+        if [ -n "$ce" ]; then age="$(human_age $(( now - ce )))"; else age="-"; fi
         rstate="$(responder_state "$d")"; [ -n "$rstate" ] || rstate="-"
         printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$state" "$age" "$rstate" "$(meta_get "$d" target)"
     done
@@ -1305,6 +1360,9 @@ cmd_result() {
     local id="$1"; require_id "$id"
     local dir; dir="$(exdir "$id")"
     local state; state="$(meta_get "$dir" state)"
+    if [ "$state" = "claimed" ] && [ -e "$dir/response.md" ] && [ ! -L "$dir/response.md" ]; then
+        if try_rollforward "$dir" "$id"; then state="$(meta_get "$dir" state)"; fi
+    fi
     case "$state" in
         answered|archived) cmd_read_response "$id";;
         *)
