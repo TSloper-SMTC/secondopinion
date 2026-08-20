@@ -73,6 +73,7 @@ git clone https://github.com/tsloper/secondopinion ~/tools/secondopinion
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --claude   # + the Claude Code plugin (optional)
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --skills   # symlink form instead of plugins
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --check    # verify; exit 0 = installed
+~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --uninstall # remove everything installed (both sides); the store and backups are kept
 ```
 
 Prerequisites: bash, GNU coreutils/sed/grep/awk/flock, git, python3 (installer

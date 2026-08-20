@@ -9,8 +9,12 @@
 #   archive/<ID>/                after the requester consumes the response
 #
 # States: draft -> published -> claimed -> answered -> archived
+#
+# Platform: Linux with GNU coreutils/util-linux and bash >= 4.3 (local -n, declare -A).
+# /proc, flock(1), and GNU mv/du/stat/timeout semantics are load-bearing throughout.
 set -euo pipefail
 umask 077
+command -v flock >/dev/null 2>&1 || { echo "ERROR: flock(1) (util-linux) not found on PATH; secondopinion requires Linux with GNU coreutils and util-linux." >&2; exit 1; }
 
 VERSION="1.0.1"
 warn() { echo "WARNING: $*" >&2; }
@@ -365,8 +369,14 @@ cmd_new() {
         break
     done
     local dir="$EXCH/$id"
+    # Stage in a private dot-dir and rename onto the reserved (empty) directory: a crash
+    # mid-creation leaves only invisible litter (GC'd by prune --apply after a day),
+    # never a half-built exchange for status/list to defend against.
+    local stage="$EXCH/.new.$$"
+    rm -rf -- "$stage" 2>/dev/null || true
+    mkdir "$stage" || { rmdir "$dir" 2>/dev/null; die "cannot create a staging directory in $EXCH"; }
 
-    cat > "$dir/prompt.md" <<EOF
+    cat > "$stage/prompt.md" <<EOF
 Exchange-ID: $id
 Requester: $requester
 Target: $target
@@ -395,13 +405,14 @@ Response requirements:
 - State a clear verdict and next action.
 - Publish with:  secondopinion claim $id  then  secondopinion respond $id --token <claim_token> --file <response.md>
 EOF
-    chmod 600 "$dir/prompt.md"
-    lock "$dir"
-    meta_set "$dir" exchange_id "$id" state draft created_utc "$created" created_epoch "$(epoch)" \
+    chmod 600 "$stage/prompt.md"
+    lock "$stage"
+    meta_set "$stage" exchange_id "$id" state draft created_utc "$created" created_epoch "$(epoch)" \
         requester "$requester" target "$target" repo "$repo" git_common_dir "$common" \
         branch "$branch" commit "$commit" dirty_state "$dirty" codex_thread "$thread"
-    [ -n "$parent" ] && meta_set "$dir" parent_exchange "$parent"
+    [ -n "$parent" ] && meta_set "$stage" parent_exchange "$parent"
     unlock
+    mv -T -- "$stage" "$dir" || { rm -rf -- "$stage" 2>/dev/null; rmdir "$dir" 2>/dev/null; die "could not finalize the exchange directory"; }
     echo "exchange_id=$id"
     echo "exchange_dir=$dir"
     echo "prompt_path=$dir/prompt.md"
@@ -556,6 +567,8 @@ cmd_ask() {
         esac
         [ "$(prompt_ok "$dir")" = "yes" ] || die "exchange $attach prompt failed validation; refusing to attach a responder"
         [ "$(responder_state "$dir")" = "running" ] && die "a responder for $attach is still running (pid $(meta_get "$dir" responder_pid)); attaching now would truncate its log and orphan it — cancel it first: secondopinion cancel $attach"
+        [ "$write" = 1 ] && [ -n "$(meta_get "$dir" review_mode)" ] && die "exchange $attach is a review exchange and reviews are read-only; --write is not allowed when attaching"
+        [ -n "${SECONDOPINION_TEST_ATTACH_PAUSE:-}" ] && sleep "$SECONDOPINION_TEST_ATTACH_PAUSE"
         id="$attach"
     fi
     # Read the request text before creating anything.
@@ -600,10 +613,18 @@ $parent_resp_txt
     RESPONDER_LOG="$STORE/responder-logs/$id.log"
     local argv=(); build_responder_argv argv "$id" "$write" "$model" "$effort" "$session_mode" "$session_arg" "$maxturns" || die "could not build the responder command (respond instructions unreadable)"
     if [ -n "${SECONDOPINION_CLAUDE_ARGS:-}" ]; then
-        # shellcheck disable=SC2206
-        local extra=( ${SECONDOPINION_CLAUDE_ARGS} ); argv+=("${extra[@]}")
+        # Word-split deliberately, but via read -a so glob characters are never expanded
+        # against the responder's cwd.
+        local extra=(); read -r -a extra <<<"${SECONDOPINION_CLAUDE_ARGS}"; argv+=("${extra[@]}")
     fi
     lock "$dir"
+    if [ -n "$attach" ]; then
+        # Re-check under the lock: a claim can land between the unlocked validation above
+        # and here; launching anyway would waste a whole responder session and overwrite
+        # the winner's responder_mode/log records.
+        local attach_state; attach_state="$(meta_get "$dir" state)"
+        [ "$attach_state" = "published" ] || { unlock; die "exchange $attach is no longer published (state=$attach_state); another responder got there first"; }
+    fi
     meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" ask_started_utc "$(now_utc)"
     [ -n "$model" ] && meta_set "$dir" requested_model "$model"
     [ -n "$effort" ] && meta_set "$dir" requested_effort "$effort"
@@ -622,6 +643,11 @@ $parent_resp_txt
             echo "sandbox=pid-namespaced init='$sandbox_init'"
             echo "sandbox_note=a --background responder dies with this sandbox; keep this shell alive until answered, or re-launch later with: secondopinion ask --attach $id"
         fi
+        # INVARIANT: $! is claude's OWN pid only because this background subshell is not a
+        # process-group leader, so setsid(1) takes over IN PLACE (no fork). Putting job
+        # control or a wrapper between `&` and exec makes the recorded pid+starttime
+        # describe a dead intermediary and breaks responder_state and cancel's group kill.
+        # If the launch shape ever changes, have the child record its own pid instead.
         ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
         local bgpid=$! bgstart
         bgstart="$(proc_start "$bgpid")"
@@ -649,7 +675,12 @@ $parent_resp_txt
         return 0
     fi
     local rc=0
-    ( cd -- "$repo" && exec timeout --kill-after=10 "$timeout" "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) || rc=$?
+    # Foreground runs also record the responder's identity so status/jobs in OTHER
+    # sessions show real liveness (and cancel can reach it) while this ask is in flight.
+    ( cd -- "$repo" && exec timeout --kill-after=10 "$timeout" "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
+    local fgpid=$! fgstart; fgstart="$(proc_start "$fgpid")"
+    lock "$dir"; meta_set "$dir" responder_pid "$fgpid" responder_starttime "${fgstart:-unknown}"; unlock
+    wait "$fgpid" || rc=$?
     local state; state="$(meta_get "$dir" state)"
     if [ -n "$model" ] || [ -n "$effort" ]; then record_realized_model "$dir" "$RESPONDER_LOG"; fi
     if [ "$state" = "answered" ] && [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
@@ -1058,7 +1089,10 @@ cmd_respond() {
         unlock; die "response.md already exists but is not a valid response for $id (write-once; manual inspection needed)"
     fi
     validate_response_file "$tmp" "$id" || { unlock; exit 1; }
-    if ! ln "$tmp" "$dir/response.md" 2>/dev/null; then unlock; die "response.md already exists (write-once)"; fi
+    if ! ln "$tmp" "$dir/response.md" 2>/dev/null; then
+        if [ -e "$dir/response.md" ] || [ -L "$dir/response.md" ]; then unlock; die "response.md already exists (write-once)"; fi
+        unlock; die "could not hardlink response.md into place (a filesystem without hardlink support? the store requires one POSIX filesystem)"
+    fi
     if ! finalize_response "$dir"; then
         unlock; die "response.md was published but meta could not be updated; re-run the same respond to roll forward"
     fi
@@ -1176,6 +1210,27 @@ cmd_prune() {
         for trash_res in "$ARCH"/.prune-trash.*; do
             [ -e "$trash_res" ] && [ ! -L "$trash_res" ] || continue
             rm -rf -- "$trash_res" 2>/dev/null || true
+        done
+    fi
+    # GC crash litter in exchanges/: day-old meta-less orphan dirs and .new.* staging
+    # (an interrupted `new`), plus day-old .*.tmp.* files inside live exchanges.
+    local gc_cutoff=$(( $(epoch) - 86400 )) gcd gcm
+    for gcd in "$EXCH"/.new.* "$EXCH"/*/; do
+        gcd="${gcd%/}"; [ -e "$gcd" ] || continue; [ -L "$gcd" ] && continue
+        case "$(basename "$gcd")" in
+            .new.*) ;;
+            *) [ -f "$gcd/meta" ] && continue; valid_id "$(basename "$gcd")" || continue;;
+        esac
+        gcm="$(stat -c %Y -- "$gcd" 2>/dev/null)"; { [ -n "$gcm" ] && [ "$gcm" -lt "$gc_cutoff" ]; } || continue
+        printf 'gc=%s\trule=crash-litter(no meta, older than one day)\n' "$(basename "$gcd")"
+        if [ "$apply" = 1 ]; then rm -rf -- "$gcd" 2>/dev/null || true; fi
+    done
+    if [ "$apply" = 1 ] && [ -d "$EXCH" ]; then
+        for gcd in "$EXCH"/*/; do
+            gcd="${gcd%/}"; [ -f "$gcd/meta" ] || continue; [ -L "$gcd/.lock" ] && continue
+            # Non-blocking: an exchange another process holds locked is skipped, not waited on.
+            ( exec 9>>"$gcd/.lock" 2>/dev/null && flock -n 9 \
+              && find "$gcd" -maxdepth 1 -name '.*.tmp.*' -type f -mmin +1440 -delete 2>/dev/null ) || true
         done
     fi
     local rows=() d id common key

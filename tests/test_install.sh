@@ -258,5 +258,19 @@ grep -Fq "\"$QT/.secondopinion\"" "$QT/.codex/config.toml" && ok || fail "store 
 grep -q 'network_access = true' "$QT/.codex/config.toml" && ok || fail "network_access not set in the quoted-header table"
 ( cd "$QT" && env -u SECONDOPINION_DIR HOME="$QT" PATH="$QT/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check fails on the quoted-header table"
 
+t "--uninstall removes the skills-form install and config edits but KEEPS the store"
+UH="$TMP/home-uninstall"; mkdir -p "$UH"
+( cd "$UH" && env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --skills --claude >/dev/null 2>&1 ) && ok || fail "fixture install failed"
+mkdir -p "$UH/.secondopinion/archive"; echo keep > "$UH/.secondopinion/archive/marker"
+assert_rc 0 env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall
+[ ! -e "$UH/.local/bin/secondopinion" ] && [ ! -L "$UH/.local/bin/secondopinion" ] && ok || fail "CLI symlink not removed"
+[ ! -e "$UH/.local/bin/agent-mailbox" ] && [ ! -L "$UH/.local/bin/agent-mailbox" ] && ok || fail "agent-mailbox alias not removed"
+[ ! -e "$UH/.codex/skills/secondopinion-request" ] && [ ! -L "$UH/.codex/skills/secondopinion-request" ] && ok || fail "Codex skill symlink not removed"
+[ ! -e "$UH/.claude/skills/secondopinion-respond" ] && [ ! -L "$UH/.claude/skills/secondopinion-respond" ] && ok || fail "Claude skill symlink not removed"
+grep -q secondopinion "$UH/.codex/config.toml" 2>/dev/null && fail "config.toml still references the store" || ok
+grep -q keep "$UH/.secondopinion/archive/marker" && ok || fail "store was not preserved"
+assert_rc 1 env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --check
+assert_rc 0 env -u SECONDOPINION_DIR HOME="$UH" PATH="$UH/.local/bin:$PATH" "$PLUGIN/scripts/install.sh" --uninstall
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

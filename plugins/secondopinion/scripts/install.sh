@@ -14,6 +14,9 @@
 #   install.sh --plugin  deprecated alias for --claude.
 #   install.sh --check   report status; exit 0 if fully installed (the Codex side in exactly one
 #                        current form; the Claude side may be absent, but must be current if present).
+#   install.sh --uninstall  remove every installed piece on both sides (plugins, marketplaces,
+#                        skill symlinks, CLI symlinks, sandbox config edits). The store and the
+#                        backups directory are KEPT.
 set -euo pipefail
 
 if [ -z "${HOME:-}" ]; then
@@ -34,15 +37,16 @@ backup_path() { # basename -> a fresh, non-clobbering path under BACKUP_DIR (sam
     while [ -e "$cand" ] || [ -L "$cand" ]; do cand="$base-$n"; n=$((n+1)); done
     echo "$cand"
 }
-CHECK=0; SKILLS=0; CLAUDE=0
+CHECK=0; SKILLS=0; CLAUDE=0; UNINSTALL=0
 for arg in "$@"; do
     case "$arg" in
         --check) CHECK=1;;
+        --uninstall) UNINSTALL=1;;
         --skills) SKILLS=1;;
         --claude) CLAUDE=1;;
         --plugin) CLAUDE=1; echo "note      --plugin is deprecated; it now means --claude (the Codex plugin is always installed by default)" >&2;;
-        -h|--help) sed -n '2,17p' "$0"; exit 0;;
-        *) echo "usage: install.sh [--check] [--claude] [--skills]   (unknown argument: '$arg')" >&2; exit 1;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0;;
+        *) echo "usage: install.sh [--check] [--claude] [--skills] [--uninstall]   (unknown argument: '$arg')" >&2; exit 1;;
     esac
 done
 PLUGIN_ID="secondopinion@secondopinion"
@@ -60,10 +64,10 @@ case "$STORE_DIR" in
 esac
 have_claude() { command -v claude >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; }
 have_codex_cli() { command -v codex >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; }
-if [ "$CHECK" = 0 ] && [ "$SKILLS" = 0 ] && ! have_codex_cli; then
+if [ "$CHECK" = 0 ] && [ "$SKILLS" = 0 ] && [ "$UNINSTALL" = 0 ] && ! have_codex_cli; then
     echo "ERROR: the default install form is the Codex plugin and needs the 'codex' CLI and python3 on PATH; use --skills for a symlink-only install (nothing was installed)." >&2; exit 1
 fi
-if [ "$CHECK" = 0 ] && [ "$CLAUDE" = 1 ] && [ "$SKILLS" = 0 ] && ! have_claude; then
+if [ "$CHECK" = 0 ] && [ "$CLAUDE" = 1 ] && [ "$SKILLS" = 0 ] && [ "$UNINSTALL" = 0 ] && ! have_claude; then
     echo "ERROR: --claude needs the 'claude' CLI and python3 on PATH (nothing was installed)." >&2; exit 1
 fi
 
@@ -148,6 +152,34 @@ for i, line in enumerate(lines):
 if not done: sys.exit(1)
 open(path, "w", encoding="utf-8").write("\n".join(lines))
 PY2
+}
+
+# Remove the whole [sandbox_workspace_write] table iff it now holds nothing but our own
+# settings (network_access = true and/or an empty writable_roots). A table the user added
+# anything to is left alone.
+remove_empty_sandbox_section() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$CODEX_CFG" <<'PY3'
+import re, sys
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").read().split("\n")
+start = None; end = None
+for i, line in enumerate(lines):
+    m = re.match(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", line)
+    if m:
+        t = m.group(1).strip()
+        if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'": t = t[1:-1]
+        if t == "sandbox_workspace_write" and start is None: start = i; continue
+        if start is not None and end is None: end = i
+if start is None: sys.exit(1)
+if end is None: end = len(lines)
+body = [l for l in lines[start+1:end] if l.strip() and not l.strip().startswith("#")]
+ok = all(re.match(r"^\s*network_access\s*=\s*true\s*$", l) or re.match(r"^\s*writable_roots\s*=\s*\[\s*\]\s*$", l) for l in body)
+if not ok: sys.exit(1)
+del lines[start:end]
+out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+open(path, "w", encoding="utf-8").write(out)
+PY3
 }
 
 # Extend a SINGLE-LINE `writable_roots = [...]` in [sandbox_workspace_write] with the store
@@ -321,6 +353,40 @@ except Exception:
     pass' "$MARKETPLACE" 2>/dev/null || true
 }
 
+
+# ---- --uninstall: remove every installed piece on both sides; store and backups are KEPT --
+if [ "$UNINSTALL" = 1 ]; then
+    if [ "$CHECK" = 1 ] || [ "$SKILLS" = 1 ] || [ "$CLAUDE" = 1 ]; then
+        echo "usage: install.sh --uninstall   (cannot be combined with other options)" >&2; exit 1
+    fi
+    if have_claude; then
+        claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 && echo "removed   Claude plugin $PLUGIN_ID" || true
+        claude plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 && echo "removed   Claude marketplace $MARKETPLACE" || true
+    fi
+    if [ -L "$CLAUDE_SKILL_LINK" ]; then rm -f -- "$CLAUDE_SKILL_LINK"; echo "removed   $CLAUDE_SKILL_LINK"; fi
+    if have_codex_cli; then
+        codex plugin remove "$PLUGIN_ID" >/dev/null 2>&1 && echo "removed   Codex plugin $PLUGIN_ID" || true
+        codex plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 && echo "removed   Codex marketplace $MARKETPLACE" || true
+    fi
+    UNINSTALL_CODEX_SKILL="$(codex_home)/skills/secondopinion-request"
+    if [ -L "$UNINSTALL_CODEX_SKILL" ]; then rm -f -- "$UNINSTALL_CODEX_SKILL"; echo "removed   $UNINSTALL_CODEX_SKILL"; fi
+    # CLI symlinks: only ones that resolve into a secondopinion checkout are ours to remove.
+    for l in "$HOME/.local/bin/secondopinion" "$HOME/.local/bin/agent-mailbox"; do
+        if [ -L "$l" ]; then
+            case "$(readlink -f -- "$l" 2>/dev/null)" in
+                */plugins/secondopinion/bin/secondopinion) rm -f -- "$l"; echo "removed   $l";;
+                *) echo "kept      $l (does not point at a secondopinion checkout)";;
+            esac
+        fi
+    done
+    if [ -L "$HOME/.agent-mailbox" ]; then rm -f -- "$HOME/.agent-mailbox"; echo "removed   $HOME/.agent-mailbox (legacy store symlink)"; fi
+    if [ -f "$CODEX_CFG" ] && [ ! -L "$CODEX_CFG" ]; then
+        remove_sandbox_root "$STORE_DIR" && echo "config    $CODEX_CFG: removed $STORE_DIR from [sandbox_workspace_write].writable_roots (backup in $BACKUP_DIR)" || true
+        remove_empty_sandbox_section && echo "config    $CODEX_CFG: removed the now-empty [sandbox_workspace_write] table" || true
+    fi
+    echo "uninstalled: the store ($STORE_DIR) and backups ($BACKUP_DIR) are KEPT; remove them manually if desired"
+    exit 0
+fi
 
 # --- retire forms the chosen mode does not use. Done BEFORE any symlink is created: a skill
 # symlink is only added once the same-side plugin is confirmed absent by a successful

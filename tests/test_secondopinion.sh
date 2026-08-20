@@ -924,6 +924,82 @@ assert_eq "$("$AM" status "$IDXF" | val state)" "answered" "(refusal must not mu
 assert_rc 0 "$AM" archive "$IDXF"
 assert_eq "$("$AM" status "$IDXF" | val state)" "archived" "(same-fs archive still works)"
 
+t "ask: a FOREGROUND responder's identity is recorded so jobs/status show liveness from any session"
+(cd "$TMP/repoA-wt" && STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "fg identity" --file "$TMP/request.md" --timeout 3 >/dev/null 2>&1) &
+ASKBG=$!
+IDFG=""
+for i in $(seq 1 20); do
+  IDFG="$(ls "$SECONDOPINION_DIR/exchanges" 2>/dev/null | grep 'fg-identity' | head -1)"
+  [ -n "$IDFG" ] && [ -n "$("$AM" status "$IDFG" 2>/dev/null | val responder_pid)" ] && break
+  sleep 0.1
+done
+[ -n "$IDFG" ] && ok || fail "fg-identity exchange not created"
+assert_eq "$("$AM" status "$IDFG" | val responder_status)" "running" "(foreground responder liveness while in flight)"
+wait "$ASKBG" 2>/dev/null
+assert_eq "$("$AM" status "$IDFG" | val responder_status)" "exited" "(liveness after the timeout kill)"
+
+t "prune: GCs day-old crash litter (meta-less orphans, .new staging, stale tmp files); fresh litter survives"
+mkdir -p "$SECONDOPINION_DIR/exchanges/2020-01-01T000000Z-old-orphan"
+touch -d '2 days ago' "$SECONDOPINION_DIR/exchanges/2020-01-01T000000Z-old-orphan"
+mkdir -p "$SECONDOPINION_DIR/exchanges/.new.99999"; echo x > "$SECONDOPINION_DIR/exchanges/.new.99999/prompt.md"
+touch -d '2 days ago' "$SECONDOPINION_DIR/exchanges/.new.99999"
+mkdir -p "$SECONDOPINION_DIR/exchanges/2020-01-02T000000Z-fresh-orphan"
+IDGC="$(new_in "$TMP/repoA" "hardening gc host")"; publish_prompt "$IDGC" "task"
+GCD="$("$AM" path "$IDGC")"
+echo t > "$GCD/.meta.tmp.123"; touch -d '2 days ago' "$GCD/.meta.tmp.123"
+echo t > "$GCD/.response.tmp.fresh"
+"$AM" prune >/dev/null 2>&1
+[ -d "$SECONDOPINION_DIR/exchanges/2020-01-01T000000Z-old-orphan" ] && ok || fail "dry-run removed an orphan"
+assert_rc 0 "$AM" prune --apply
+[ ! -e "$SECONDOPINION_DIR/exchanges/2020-01-01T000000Z-old-orphan" ] && ok || fail "old meta-less orphan not GCed"
+[ ! -e "$SECONDOPINION_DIR/exchanges/.new.99999" ] && ok || fail "old .new staging not GCed"
+[ -d "$SECONDOPINION_DIR/exchanges/2020-01-02T000000Z-fresh-orphan" ] && ok || fail "fresh orphan must survive (may be mid-creation)"
+[ ! -e "$GCD/.meta.tmp.123" ] && ok || fail "stale tmp file not GCed"
+[ -e "$GCD/.response.tmp.fresh" ] && ok || fail "fresh tmp file must survive"
+assert_eq "$("$AM" status "$IDGC" | val state)" "published" "(real exchange untouched by GC)"
+rm -rf "$SECONDOPINION_DIR/exchanges/2020-01-02T000000Z-fresh-orphan"
+
+t "ask --attach: re-checks state under the lock; a claim racing the attach wins and no responder launches"
+IDRA="$(new_in "$TMP/repoA-wt" "hardening attach race")"; publish_prompt "$IDRA" "task"
+printf 'UNTOUCHED\n' > "$STUB_ARGV_FILE"
+(cd "$TMP/repoA-wt" && SECONDOPINION_TEST_ATTACH_PAUSE=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDRA" --timeout 30 >"$TMP/attach-race.out" 2>&1) &
+ATTBG=$!
+sleep 0.3
+"$AM" claim "$IDRA" --owner racer >/dev/null 2>&1
+wait "$ATTBG"; rc=$?
+assert_eq "$rc" 1 "(attach rc when a claim won the race)"
+assert_grep "no longer published" "$TMP/attach-race.out"
+assert_grep "UNTOUCHED" "$STUB_ARGV_FILE"
+
+t "respond: an ln failure with no existing response is not misreported as write-once"
+mkdir -p "$TMP/failbin"; printf '#!/bin/bash\nexit 1\n' > "$TMP/failbin/ln"; chmod +x "$TMP/failbin/ln"
+IDLN="$(new_in "$TMP/repoA" "hardening ln fail")"; publish_prompt "$IDLN" "task"
+TOKLN="$("$AM" claim "$IDLN" --owner l | val claim_token)"
+write_response "$IDLN" "$TMP/lnfail.md"
+out="$(PATH="$TMP/failbin:$PATH" "$AM" respond "$IDLN" --token "$TOKLN" --file "$TMP/lnfail.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(respond rc on ln failure)"
+assert_grep "hardlink" <(echo "$out")
+assert_not_grep "write-once" <(echo "$out")
+
+t "ask: SECONDOPINION_CLAUDE_ARGS is word-split but never glob-expanded"
+touch "$TMP/repoA-wt/globfile"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE_ARGS='--extra-flag *' SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "glob args" --file "$TMP/request.md" --timeout 60 2>/dev/null)"
+grep -Fxq -- '*' "$STUB_ARGV_FILE" && ok || fail "literal * not passed through"
+assert_not_grep "^globfile$" "$STUB_ARGV_FILE"
+
+t "ask --attach --write: refused on a review exchange (reviews are read-only)"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=fail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --scope working-tree --topic "hardening review write" --task focus --timeout 60 2>&1)"
+IDRW="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+[ -n "$IDRW" ] && ok || fail "review exchange not created: $out"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDRW" --write 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach --write rc on review exchange)"
+assert_grep "read-only" <(echo "$out")
+
+t "preflight: a PATH without flock fails with one clear error naming flock"
+out="$(PATH="" "$AM" version 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc with empty PATH)"
+assert_grep "flock" <(echo "$out")
+
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -4,7 +4,7 @@
 
 Reliability hardening from an exhaustive live + adversarial test campaign
 (all defects reproduced first; every fix carries a regression test — suite
-grows 309→350).
+grows 309→389).
 
 - **No more availability crashes on damaged meta.** An exchange whose
   `created_epoch`/`claimed_epoch` is empty (crash-torn or hand-edited meta)
@@ -60,6 +60,29 @@ From the live interactive Codex spot-check and a second fix round:
 - The repo-root `CHANGELOG.md` had silently drifted from this file (it still
   said 1.0.0); both changelog top entries are now asserted against the tool
   version by the plugin suite.
+
+Backlog round (same day):
+
+- **Foreground responder identity.** A foreground `ask` now records the
+  responder's pid + kernel start time, so `status`/`jobs` from any other
+  session show real liveness (and `cancel` can reach it) while the ask runs.
+- **Atomic `new` + crash-litter GC.** `new` stages the exchange in a private
+  dot-dir and renames it into place; `prune` GCs day-old meta-less orphan
+  dirs, `.new.*` staging and stale `.*.tmp.*` files (fresh litter and locked
+  exchanges are skipped, exchanges are swept under their own lock).
+- **`install.sh --uninstall`** removes every installed piece on both sides —
+  plugins, marketplaces, skill symlinks, CLI symlinks, sandbox config edits
+  (config backed up first; the [sandbox_workspace_write] table is removed
+  only when it holds nothing but our settings) — and always keeps the store
+  and the backups directory.
+- **Platform preflight.** The CLI refuses to run without flock(1) and states
+  its Linux+GNU-only requirement; the setsid pid-tracking invariant is
+  documented at the launch site.
+- **Attach + respond edge cases.** `ask --attach` re-checks state under the
+  exchange lock (a racing claim wins cleanly; no responder is wasted) and
+  refuses `--write` on review exchanges; an `ln` failure without an existing
+  response is no longer misreported as write-once; `SECONDOPINION_CLAUDE_ARGS`
+  is word-split but never glob-expanded.
 
 ## 1.0.0 — 2026-08-19
 
