@@ -41,6 +41,26 @@ grows 309→350).
 - `meta_set` fsyncs the store's authoritative file after rename (best-effort,
   same discipline as tombstones; untestable in the suite — power-loss only).
 
+From the live interactive Codex spot-check and a second fix round:
+
+- **The PID-namespace warning now also lands on stdout** as parseable keys
+  (`sandbox=pid-namespaced`, `sandbox_note=...`): the live spot-check proved
+  the stderr WARNING fires inside Codex's sandbox but the calling agent
+  swallowed it, so the user never saw it. The request skill now tells the
+  agent to relay the constraint and to never end its turn with a launched
+  `--background` ask unresolved. (`SECONDOPINION_TEST_PID1_COMM` lets the
+  suite exercise the detection on a non-namespaced host.)
+- **`archive` refuses a cross-filesystem `archive/`** before mutating
+  anything: `mv -T` onto another device degrades to a non-atomic copy+rm
+  whose interruption poisons every later archive of that ID — demonstrated
+  by test: the old behavior silently archived onto the foreign device.
+- **Empty `jobs` explains itself**: a repository with no exchanges now says
+  so on stderr and points at `jobs --all`; an empty store says "no exchanges
+  in the store". Previously it printed nothing, exit 0.
+- The repo-root `CHANGELOG.md` had silently drifted from this file (it still
+  said 1.0.0); both changelog top entries are now asserted against the tool
+  version by the plugin suite.
+
 ## 1.0.0 — 2026-08-19
 
 First public release. secondopinion gives one AI coding agent a sealed,

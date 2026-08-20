@@ -617,6 +617,10 @@ $parent_resp_txt
         local sandbox_init
         if sandbox_init="$(in_ephemeral_sandbox)"; then
             echo "WARNING: this shell runs inside a PID-namespaced sandbox (init='$sandbox_init'). A --background responder is detached from the shell but CANNOT survive the sandbox: it will be KILLED when the launching command's sandbox is torn down. Keep this session alive until the exchange is answered, use a foreground ask, or re-launch later with: secondopinion ask --attach $id" >&2
+            # Also on stdout as parseable keys: the caller is usually an agent that reads
+            # stdout key=value output and may never surface a stderr warning to its user.
+            echo "sandbox=pid-namespaced init='$sandbox_init'"
+            echo "sandbox_note=a --background responder dies with this sandbox; keep this shell alive until answered, or re-launch later with: secondopinion ask --attach $id"
         fi
         ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
         local bgpid=$! bgstart
@@ -1121,7 +1125,7 @@ cmd_wait() {
 }
 
 in_ephemeral_sandbox() { # prints /proc/1/comm and succeeds when PID 1 is not a real init
-    local c; c="$(cat /proc/1/comm 2>/dev/null)" || return 1
+    local c; c="${SECONDOPINION_TEST_PID1_COMM:-$(cat /proc/1/comm 2>/dev/null)}"
     case "$c" in systemd|init) return 1;; "") return 1;; *) printf '%s\n' "$c"; return 0;; esac
 }
 
@@ -1338,7 +1342,7 @@ cmd_jobs() {
         [ -n "$want_common" ] || die "not inside a git repository: $repo (use --all, or --repo PATH)"
     fi
     ensure_store
-    local d id state common age rstate now; now="$(epoch)"
+    local d id state common age rstate now printed=0; now="$(epoch)"
     for d in "$EXCH"/*/; do
         d="${d%/}"; [ -e "$d" ] || continue
         real_dir "$d" || continue
@@ -1350,7 +1354,12 @@ cmd_jobs() {
         if [ -n "$ce" ]; then age="$(human_age $(( now - ce )))"; else age="-"; fi
         rstate="$(responder_state "$d")"; [ -n "$rstate" ] || rstate="-"
         printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$state" "$age" "$rstate" "$(meta_get "$d" target)"
+        printed=$((printed+1))
     done
+    if [ "$printed" = 0 ]; then
+        if [ -n "$want_common" ]; then echo "no exchanges for this repository; other repositories may have some: secondopinion jobs --all" >&2
+        else echo "no exchanges in the store" >&2; fi
+    fi
     [ -n "$want_common" ] && retention_note "$want_common"
     return 0
 }
@@ -1385,14 +1394,19 @@ cmd_archive() {
         die "unknown exchange: $id"
     fi
     local dir="$EXCH/$id"; check_components "$dir"
+    ensure_store
     lock "$dir"
+    # Same-device check BEFORE any mutation: on a cross-filesystem archive/, mv -T
+    # degrades to a non-atomic copy+rm whose interruption poisons every later archive
+    # of this ID (and a later prune of the partial copy would tombstone it).
+    [ "$(stat -L -c %d -- "$dir" 2>/dev/null)" = "$(stat -L -c %d -- "$ARCH" 2>/dev/null)" ] \
+        || { unlock; die "archive/ is on a different filesystem than the exchange (rename would degrade to a non-atomic copy); keep the store on one filesystem"; }
     local state; state="$(meta_get "$dir" state)"
     if [ "$state" != "archived" ]; then   # state=archived here means a previous archive was interrupted before the move
         if [ "$state" != "answered" ] && [ "$force" != 1 ]; then unlock; die "exchange not answered (state=$state); use --force to archive anyway"; fi
         [ -e "$ARCH/$id" ] && { unlock; die "archive target already exists: $ARCH/$id"; }
         meta_set "$dir" state archived archived_utc "$(now_utc)" archived_from_state "$state"
     fi
-    ensure_store
     if ! mv -T "$dir" "$ARCH/$id" 2>/dev/null; then
         # Roll the metadata back so the exchange stays usable and the retry is honest.
         local prev; prev="$(meta_get "$dir" archived_from_state)"; [ -n "$prev" ] || prev="$state"

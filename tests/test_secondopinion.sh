@@ -886,6 +886,44 @@ echo x > "$SECONDOPINION_DIR/archive/.prune-trash.999.2020-01-01T000000Z-stale/l
 assert_rc 0 "$AM" prune --apply
 [ ! -e "$SECONDOPINION_DIR/archive/.prune-trash.999.2020-01-01T000000Z-stale" ] && ok || fail "stale .prune-trash residue not swept"
 
+t "jobs: an exchange-less repository explains itself on stderr and hints --all"
+mkrepo "$TMP/repoC"
+out="$(cd "$TMP/repoC" && "$AM" jobs 2>"$TMP/jobs-empty.err")"; rc=$?
+assert_eq "$rc" 0 "(jobs rc in exchange-less repo)"
+assert_eq "$out" "" "(jobs stdout stays empty)"
+assert_grep "jobs --all" "$TMP/jobs-empty.err"
+out="$(cd "$TMP/repoA" && "$AM" jobs 2>"$TMP/jobs-nonempty.err")"
+assert_not_grep "no exchanges" "$TMP/jobs-nonempty.err"
+
+t "jobs --all: an empty store says so instead of printing nothing"
+out="$(cd "$TMP/repoC" && SECONDOPINION_DIR="$TMP/store-empty-jobs" "$AM" jobs --all 2>"$TMP/jobs-all.err")"; rc=$?
+assert_eq "$rc" 0 "(jobs --all rc on empty store)"
+assert_grep "no exchanges" "$TMP/jobs-all.err"
+
+t "ask --background: a PID-namespaced sandbox is reported as parseable stdout keys, not only stderr"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_TEST_PID1_COMM=codex-linux-san STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "sbx keys" --file "$TMP/request.md" --background 2>"$TMP/sbx.err")"; rc=$?
+assert_eq "$rc" 0 "(background launch rc under fake namespace)"
+assert_grep "^sandbox=pid-namespaced" <(echo "$out")
+assert_grep "ask --attach" <(echo "$out")
+assert_grep "WARNING" "$TMP/sbx.err"
+IDSB="$(echo "$out" | val exchange_id)"; "$AM" cancel "$IDSB" >/dev/null 2>&1
+
+t "archive: refuses a cross-filesystem archive/ before mutating anything"
+IDXF="$(new_in "$TMP/repoA" "hardening crossfs")"; publish_prompt "$IDXF" "task"
+TOKXF="$("$AM" claim "$IDXF" --owner x | val claim_token)"
+write_response "$IDXF" "$TMP/xfs.md"
+"$AM" respond "$IDXF" --token "$TOKXF" --file "$TMP/xfs.md" >/dev/null
+XDEV="/dev/shm/so-crossfs-test.$$"; mkdir -p "$XDEV"
+mv "$SECONDOPINION_DIR/archive" "$SECONDOPINION_DIR/archive.real"
+ln -s "$XDEV" "$SECONDOPINION_DIR/archive"
+out="$("$AM" archive "$IDXF" 2>&1)"; rc=$?
+rm "$SECONDOPINION_DIR/archive"; mv "$SECONDOPINION_DIR/archive.real" "$SECONDOPINION_DIR/archive"; rm -rf "$XDEV"
+assert_eq "$rc" 1 "(archive rc onto cross-fs archive/)"
+assert_grep "filesystem" <(echo "$out")
+assert_eq "$("$AM" status "$IDXF" | val state)" "answered" "(refusal must not mutate state)"
+assert_rc 0 "$AM" archive "$IDXF"
+assert_eq "$("$AM" status "$IDXF" | val state)" "archived" "(same-fs archive still works)"
+
 # ===========================================================================
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

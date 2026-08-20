@@ -45,7 +45,12 @@ the answer.
    responder died this way (state=published, responder=exited, empty log),
    re-launch one for the same exchange with `secondopinion ask --attach <ID>`
    instead of creating a new exchange. `ask --background` exits nonzero with
-   `responder=startup-failed` when the responder dies within seconds. Keep working, then check `secondopinion jobs` (repository-scoped:
+   `responder=startup-failed` when the responder dies within seconds. If the
+   output contains `sandbox=pid-namespaced`, RELAY that constraint to the user
+   in your reply. Do not end your turn with a launched `--background` ask
+   unresolved: either fetch the answer before finishing
+   (`secondopinion wait <ID> && secondopinion result <ID>`) or tell the user
+   the exact commands that will fetch it later. Keep working, then check `secondopinion jobs` (repository-scoped:
    state, age, responder liveness), `secondopinion wait <ID> --timeout 600`
    and `secondopinion result <ID>`; a stuck responder can be stopped with
    `secondopinion cancel <ID>` (the exchange stays published for a retry).

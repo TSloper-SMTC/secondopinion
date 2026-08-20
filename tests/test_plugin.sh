@@ -28,6 +28,12 @@ assert_eq "$(json "$ROOT/.claude-plugin/marketplace.json" "['plugins'][0]['sourc
 assert_eq "$(json "$ROOT/.agents/plugins/marketplace.json" "['plugins'][0]['source']['path']")" "./plugins/secondopinion"
 assert_eq "$(json "$ROOT/.agents/plugins/marketplace.json" "['plugins'][0]['name']")" "secondopinion"
 
+t "changelogs: the top entry of BOTH CHANGELOG.md files matches the tool version"
+for c in "$ROOT/CHANGELOG.md" "$PLUGIN/CHANGELOG.md"; do
+  top="$(sed -n 's/^## \([0-9][0-9.]*[0-9]\).*/\1/p' "$c" | head -1)"
+  assert_eq "$top" "$TOOL_VERSION" "(top entry of $c)"
+done
+
 t "each plugin exposes exactly its own side's skill; skill dir names match frontmatter"
 [ "$(json "$PLUGIN/.claude-plugin/plugin.json" "['skills']")" = "" ] || [ "$(json "$PLUGIN/.claude-plugin/plugin.json" "['skills']")" = "None" ] && ok || fail "Claude manifest should rely on the default skills/ scan"
 [ -f "$PLUGIN/skills/secondopinion-respond/SKILL.md" ] && [ -f "$PLUGIN/skills/secondopinion-request/SKILL.md" ] && ok || fail "skills not at the standard skills/<name>/SKILL.md location"
