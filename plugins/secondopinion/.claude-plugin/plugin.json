@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "secondopinion",
-  "version": "1.0.0",
+  "version": "1.0.2+codex.20260827162704",
   "description": "Global file-based mailbox for Codex\u2192Claude Code review exchanges: the secondopinion-respond skill answers pending exchanges held in the ~/.secondopinion store (requires the secondopinion CLI on PATH; see install.sh).",
   "author": {
     "name": "Tim Sloper",

@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.0.2+codex.20260827162704 — 2026-08-27
+
+- Detailed Codex requests must now use a private request file so terminal wait
+  cards cannot repeatedly expose a large inline prompt. The CLI enforces
+  `--topic` as a one-line, 120-character maximum and `--task` as a one-line,
+  240-character maximum; the bundled request skill applies the file-backed
+  launch rule in new sessions and installations.
+- `ask --timeout` is now a primary notification deadline followed by an
+  unconditional `--grace` window (default equal to the primary). GNU `timeout`
+  sends TERM at the resulting work deadline and allows a fixed ten-second
+  bounded shutdown before SIGKILL. Progress switches to `terminating`, and
+  lazy recovery cannot reap a live claim inside that TERM-to-KILL interval.
+- Default foreground progress is now a single quiet status sentence every 60
+  seconds. Detailed deadlines, event counts, activity age and tool/action are
+  retained in `status` and available live through `--verbose-progress` or
+  `SECONDOPINION_PROGRESS_MODE=verbose`.
+- Detached execution was removed. `ask --background` and `review --background`
+  now fail before creating an exchange; foreground is the only supported mode.
+  Its supervisor publishes a heartbeat for cross-session status and duplicate-
+  attach protection, each launch writes an immutable per-run log, archive
+  preserves all retry diagnostics, and cross-namespace cancellation fails closed.
+- Foreground `ask` now consumes Claude's structured JSON event stream and
+  emits structured progress (configurable with
+  `SECONDOPINION_PROGRESS_SECS`). `status` records heartbeat age, activity age,
+  event count and the last sanitized tool/action, including a heartbeat-based
+  liveness state when PID namespaces hide the responder process.
+- Every headless launch and its claim share a cryptographic run ID. On failure
+  or timeout, the supervisor releases only that exact run's unfinished
+  claim and returns the exchange to `published` for immediate `ask --attach`;
+  foreign claims and invalid partial responses remain untouched for inspection.
+- `--max-turns` is now opt-in. The wall-clock timeout remains the mandatory
+  reliability bound; arbitrary default turn caps no longer terminate healthy
+  responders just before publication. Because grace defaults to the primary
+  timeout, this can double an older caller's wall-clock/cost ceiling; callers
+  that prioritize cost should set `--grace` or `--max-turns` explicitly.
+- Test entrypoints now clear caller-owned auto-prune, retention and thread
+  variables so an interactive shell configuration cannot change test fixtures.
+- Headless Claude starts with `--safe-mode`, suppressing hooks, plugins,
+  auto-memory and session-environment setup. `ask` checks support before
+  creating an exchange and gives an exact `claude auth login` plus `--attach`
+  recovery path for an expired OAuth token.
+- Progress parsing is incremental rather than reparsing the complete stream on
+  every heartbeat. Regression coverage now includes live claim reaping,
+  TERM-resistant workers, PID-namespace liveness, duplicate attach, immutable
+  logs, topic bounds, auth failure, and installed-cache correspondence.
+- Foreground progress now clamps its next sleep to the work deadline, making
+  the `terminating` transition observable even when the normal reporting
+  interval is longer than the timeout. Stale foreign attach explicitly retains
+  the incumbent identity under `previous_responder_*` before replacement.
+- Published `show` now emits only a hash-validated snapshot, while draft
+  inspection remains available. A cryptographic foreground launch reservation
+  prevents an unrelated manual responder from stealing a live run's claim.
+  Forced SIGKILL timeout suppresses Bash's misleading `Killed (...)` job line;
+  the bounded timeout result remains visible. Tests include a real second PID
+  namespace rather than only simulated foreign metadata.
+- Launch reservations now have an explicit `launching` status and a five-second
+  abandonment bound; manual claim and duplicate attach fail closed during that
+  state, then recover normally after a genuine abandoned launch. Process exit
+  code and validated-answer completion are recorded separately, so exit 0
+  without a published answer is never represented as successful completion.
+
 ## 1.0.0 — 2026-08-20
 
 First public release. secondopinion gives one AI coding agent a sealed,

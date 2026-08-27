@@ -28,6 +28,10 @@ says otherwise.
      holds the matching `claim_token` from an earlier step; otherwise report an
      existing claim (`claimed_by`, `claim_age_secs`) and stop for that ID —
      re-running `claim` always fails, even for the same owner.
+     If `state=published` but `responder_status=launching`, `running`, or
+     `running-heartbeat`, an interactive/manual session must stop: a foreground
+     `ask` already owns the reserved run. The headless responder launched by
+     that `ask` carries its matching run identity and is allowed to continue.
    - Without an ID: `secondopinion list --pending --here` — exchanges whose
      repository (by git common dir, so every worktree counts) is the one this
      session runs in. If that is empty, run `secondopinion list --pending` and
@@ -63,7 +67,10 @@ says otherwise.
    output format. Label technical conclusions `PROVEN` / `LIKELY` / `UNPROVEN`
    / `REJECTED` when the prompt asks for evidence discipline. Ground claims in
    current source, artifacts, git history, or files the prompt cites — never
-   chat memory.
+   chat memory. For a headless run, `status` records `primary_deadline_epoch`
+   and `hard_deadline_epoch`. Prefer publishing a complete, concise answer with
+   the best evidence already obtained well before the hard deadline; do not lose
+   the whole result by holding publication for optional polish.
 6. **Write the response** to a private temp file OUTSIDE the target repository
    (`mktemp` under your scratchpad or `/tmp`, mode 0600), starting exactly:
    ```text

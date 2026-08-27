@@ -1,5 +1,5 @@
 #!/bin/bash
-# Parity-pass tests: retention/prune, background job control, follow-up/resume,
+# Parity-pass tests: retention/prune, foreground job control, follow-up/resume,
 # model/effort, review modes. Isolated store + throwaway HOME; fake `claude`.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,10 @@ val() { awk -v k="$1" -F= '$1==k{sub(/^[^=]*=/,""); print; exit}' ; }
 TMP="$(mktemp -d)"; [ -n "${KEEP_TMP:-}" ] && trap "echo TMP=$TMP" EXIT || trap "rm -rf \"$TMP\"" EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME"
 export SECONDOPINION_DIR="$TMP/store"
-unset SECONDOPINION_RETAIN CODEX_THREAD_ID
+# The suite exercises both the default-off and opt-in retention paths.  Do not
+# let a caller's shell policy silently turn every archive into an auto-prune.
+unset SECONDOPINION_RETAIN SECONDOPINION_AUTO_PRUNE SECONDOPINION_MAX_TURNS SECONDOPINION_PROGRESS_SECS SECONDOPINION_PROGRESS_MODE CODEX_THREAD_ID
+export SECONDOPINION_ASK_GRACE=0
 
 mkrepo() { git init -q -b main "$1" && git -C "$1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init; }
 mkrepo "$TMP/repoA"; mkrepo "$TMP/repoB"; mkdir -p "$TMP/nogit"
@@ -25,6 +28,18 @@ arch_in() { # arch_in <dir> <topic> -> archived exchange id (fast path: draft ->
   local id; id="$( (cd "$1" && "$AM" new --topic "$2") | val exchange_id )"
   "$AM" archive "$id" --force >/dev/null 2>&1 || { echo "ARCH-FAIL"; return 1; }
   printf '%s\n' "$id"
+}
+wait_exchange_slug() { # wait_exchange_slug <slug> -> id created by a concurrent foreground ask
+  local slug="$1" d i
+  for i in $(seq 1 100); do
+    for d in "$SECONDOPINION_DIR/exchanges/"*-"$slug"; do
+      [ -d "$d" ] || continue
+      printf '%s\n' "${d##*/}"
+      return 0
+    done
+    sleep 0.1
+  done
+  return 1
 }
 
 # ===========================================================================
@@ -117,7 +132,7 @@ SECONDOPINION_DIR="$RSTORE" SECONDOPINION_TEST_PRUNE_PAUSE=2 "$AM" prune --retai
 PRUNER=$!
 sleep 0.7                                  # inside the pause window, after target selection
 GRABBED=0
-exec 6>>"$RSTORE/archive/$OLDR/.lock" 2>/dev/null && flock -n 6 && GRABBED=1
+{ exec 6>>"$RSTORE/archive/$OLDR/.lock"; } 2>/dev/null && flock -n 6 && GRABBED=1
 wait "$PRUNER"
 if [ "$GRABBED" = 1 ]; then
   [ -d "$RSTORE/archive/$OLDR" ] && ok || fail "exchange was removed WHILE another process held its lock (probe/removal race)"
@@ -125,7 +140,9 @@ if [ "$GRABBED" = 1 ]; then
 else
   # the fixed implementation holds the lock through removal, so the grab must fail and the target goes
   [ ! -d "$RSTORE/archive/$OLDR" ] && ok || fail "lock grab failed but the candidate also survived"
-  exec 6>&- 2>/dev/null || true
+  # Do not attach 2>/dev/null directly to `exec`: with no command Bash would
+  # permanently redirect the test harness's stderr and hide every later FAIL.
+  { exec 6>&-; } 2>/dev/null || true
 fi
 
 t "prune: an interrupted apply (tombstone written, directory left) completes on re-run"
@@ -144,12 +161,13 @@ assert_eq "$rc" 1 "(prune with symlinked tombstones)"
 echo "$out" | grep -qi "symlink" && ok || fail "error does not name the symlink: $out"
 
 # ===========================================================================
-# Phase 4: background job identity, status, jobs, result, cancel
+# Phase 4: foreground job identity, status, jobs, result, cancel
 
 STUB_DIR="$TMP/claude-stub"; mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/bin/bash
 if [ "${1:-}" = "--help" ]; then
+  echo "  --safe-mode                            Disable hooks and customizations"
   echo "  --effort <level>                      Effort level for the current session"
   echo "                                        (low, medium, high, xhigh, max)"
   exit 0
@@ -177,10 +195,10 @@ export STUB_DIR STUB_AM="$AM" STUB_ARGV_FILE="$TMP/stub-argv"
 printf 'Check the thing.
 ' > "$TMP/request.md"
 
-t "background job identity: pid + start time recorded; status shows a running responder and elapsed time"
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$AM" ask --topic "bg job" --file "$TMP/request.md" --background 2>/dev/null)"
-IDBG="$(echo "$out" | val exchange_id)"
-[ -n "$IDBG" ] && ok || fail "no exchange id from ask --background"
+t "foreground job identity: pid + start time recorded; another session sees a running responder and elapsed time"
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$AM" ask --topic "foreground job" --file "$TMP/request.md" --timeout 60 >"$TMP/foreground-job.out" 2>&1) &
+ASKBG_PID=$!
+IDBG="$(wait_exchange_slug foreground-job)" || fail "foreground ask did not publish an exchange"
 sleep 1
 st="$("$AM" status "$IDBG")"
 PIDBG="$(echo "$st" | val responder_pid)"
@@ -191,9 +209,18 @@ el="$(echo "$st" | val elapsed_secs)"; [ -n "$el" ] && [ "$el" -ge 0 ] && ok || 
 echo "$st" | grep -q "^next=" && ok || fail "status lacks a next= recovery hint"
 
 t "cancel: kills only the verified process group; exchange stays recoverable; responder marked cancelled"
+BGDIR="$("$AM" path "$IDBG")"
+BGNS="$(echo "$st" | val responder_namespace)"
+( exec 9>>"$BGDIR/.lock"; flock 9; sed -i 's/^responder_namespace=.*/responder_namespace=pid:[999999]/' "$BGDIR/meta" )
+out="$("$AM" cancel "$IDBG" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(cancel must refuse a foreign PID namespace)"
+echo "$out" | grep -qi "namespace" && ok || fail "foreign-namespace refusal is not explained: $out"
+kill -0 "$PIDBG" 2>/dev/null && ok || fail "foreign-namespace refusal still killed the responder"
+( exec 9>>"$BGDIR/.lock"; flock 9; sed -i "s|^responder_namespace=.*|responder_namespace=$BGNS|" "$BGDIR/meta" )
 out="$("$AM" cancel "$IDBG" 2>&1)"; rc=$?
 assert_eq "$rc" 0 "(cancel rc)"
 assert_eq "$(echo "$out" | val cancelled)" "yes"
+wait "$ASKBG_PID" 2>/dev/null || true
 sleep 0.5
 kill -0 "$PIDBG" 2>/dev/null && fail "responder still alive after cancel" || ok
 st="$("$AM" status "$IDBG")"
@@ -212,17 +239,17 @@ assert_eq "$(echo "$out" | val cancelled)" "no"
 echo "$out" | grep -q "not-running\|already" && ok || fail "second cancel not reported honestly: $out"
 
 t "cancel: never demotes an answered exchange"
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "bg ans" --file "$TMP/request.md" --background 2>/dev/null)"
-IDANS="$(echo "$out" | val exchange_id)"
-assert_rc 0 "$AM" wait "$IDANS" --timeout 30
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "foreground ans" --file "$TMP/request.md" 2>/dev/null)"
+IDANS="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+[ -n "$IDANS" ] && ok || fail "answered foreground exchange id missing"
 out="$("$AM" cancel "$IDANS" 2>&1)"; rc=$?
 assert_eq "$(echo "$out" | val cancelled)" "no"
 assert_eq "$("$AM" status "$IDANS" | val state)" "answered" "(state untouched)"
 
 t "status: an exited (not cancelled) responder on an unanswered exchange is reported stale, not guessed running"
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=fail "$AM" ask --topic "bg dead" --file "$TMP/request.md" --background 2>/dev/null)"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=fail "$AM" ask --topic "foreground dead" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(failed foreground responder rc)"
 IDDEAD="$(echo "$out" | val exchange_id)"
-sleep 1
 st="$("$AM" status "$IDDEAD")"
 assert_eq "$(echo "$st" | val responder_status)" "exited"
 assert_eq "$(echo "$st" | val state)" "published"
@@ -244,10 +271,12 @@ echo "$out" | grep -q "responder_log=" && ok || fail "failed result does not poi
 "$AM" archive "$IDANS" >/dev/null 2>&1; "$AM" archive "$IDDEAD" --force >/dev/null 2>&1; "$AM" archive "$IDBG" --force >/dev/null 2>&1
 
 t "responder.pid containment: a symlinked pid record is refused, not followed"
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$AM" ask --topic "bg sym" --file "$TMP/request.md" --background 2>/dev/null)"
-IDSYM="$(echo "$out" | val exchange_id)"; sleep 0.5
+(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$AM" ask --topic "foreground sym" --file "$TMP/request.md" --timeout 60 >"$TMP/foreground-sym.out" 2>&1) &
+ASKSYM_PID=$!
+IDSYM="$(wait_exchange_slug foreground-sym)"; sleep 0.5
 d="$("$AM" path "$IDSYM")"; PIDS="$("$AM" status "$IDSYM" | val responder_pid)"
 "$AM" cancel "$IDSYM" >/dev/null 2>&1   # tidy the running stub first
+wait "$ASKSYM_PID" 2>/dev/null || true
 [ -f "$d/responder.pid" ] && { rm -f "$d/responder.pid"; ln -s /etc/passwd "$d/responder.pid"; st="$("$AM" status "$IDSYM" 2>&1)"; echo "$st" | grep -qi "symlink" && ok || fail "symlinked responder.pid not refused: $st"; } || ok
 "$AM" archive "$IDSYM" --force >/dev/null 2>&1
 
@@ -350,6 +379,21 @@ grep -qi "read-only\|do not fix\|must not modify" "$RVP" && ok || fail "read-onl
 assert_eq "$("$AM" status "$IDRV" | val review_mode)" "normal"
 assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --task t --write
 
+t "review: detailed focus uses --file; oversized or multiline --task is rejected before exchange creation"
+REVIEW_MARKER="$(printf 'review-file-focus-%0224d' 0 | tr 0 x)"
+printf '%s\nsecond detailed focus line\n' "$REVIEW_MARKER" > "$TMP/review-focus.md"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --file "$TMP/review-focus.md" --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(file-backed review rc)"
+IDRF="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+assert_grep "$REVIEW_MARKER" "$("$AM" path "$IDRF")/prompt.md"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --task "$REVIEW_MARKER" --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(oversized inline review focus rc)"
+assert_grep "review --file" <(echo "$out")
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --task $'first focus line\nsecond focus line' --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(multiline inline review focus rc)"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(inline review-focus rejection created an exchange)"
+
 t "review --adversarial: challenge framing; review --base validates the ref before any exchange"
 out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --adversarial --task "challenge the design" --timeout 60 2>/dev/null)"
 IDAV="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
@@ -388,17 +432,18 @@ rr="$("$AM" review-result "$IDSJ" 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(tampered response refused)"
 echo "$rr" | grep -q "parse_ok=yes" && fail "tampered response still reported parsed" || ok
 
-t "ask --max-turns: first-class turn budget — default 60, env override, flag beats env, invalid values refused"
+t "ask --max-turns: opt-in cost budget — absent by default, env override, flag beats env, invalid values refused"
 (cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "mt default" --file "$TMP/request.md" --timeout 60 >/dev/null 2>&1)
-grep -qx -- "--max-turns" "$STUB_ARGV_FILE" && grep -qx -- "60" "$STUB_ARGV_FILE" && ok || fail "default --max-turns 60 missing from argv"
+grep -qx -- "--max-turns" "$STUB_ARGV_FILE" && fail "default ask must rely on the hard timeout, not impose a turn cap" || ok
 (cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_MAX_TURNS=90 "$AM" ask --topic "mt env" --file "$TMP/request.md" --timeout 60 >/dev/null 2>&1)
-grep -qx -- "90" "$STUB_ARGV_FILE" && ok || fail "SECONDOPINION_MAX_TURNS env not honoured"
+grep -qx -- "--max-turns" "$STUB_ARGV_FILE" && grep -qx -- "90" "$STUB_ARGV_FILE" && ok || fail "SECONDOPINION_MAX_TURNS env not honoured"
 (cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_MAX_TURNS=90 "$AM" ask --topic "mt flag" --file "$TMP/request.md" --max-turns 137 --timeout 60 >/dev/null 2>&1)
 grep -qx -- "137" "$STUB_ARGV_FILE" && ok || fail "--max-turns flag does not override the env"
 grep -qx -- "90" "$STUB_ARGV_FILE" && fail "env value leaked into argv alongside the flag" || ok
 before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
 assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "mt zero" --file "$TMP/request.md" --max-turns 0
 assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "mt abc" --file "$TMP/request.md" --max-turns abc
+assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_MAX_TURNS=0 "$AM" ask --topic "mt env zero" --file "$TMP/request.md"
 assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange for invalid --max-turns)"
 
 t "review --max-turns passes through"
@@ -429,25 +474,22 @@ grep -q "retention" "$TMP/n.err" && grep -q "prune" "$TMP/n.err" && ok || fail "
 echo "$out" | grep -q "retention" && fail "retention note leaked into the jobs table" || ok
 
 # ===========================================================================
-# Sandbox fixes: startup handshake, ask --attach, PID-namespace warning
+# Foreground-only contract and ask --attach recovery
 
-t "ask --background: a responder that dies at startup is reported startup-failed (exit 1); the exchange stays published"
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=fail "$AM" ask --topic "hs fail" --file "$TMP/request.md" --background 2>&1)"; rc=$?
-assert_eq "$rc" 1 "(startup failure must be nonzero)"
-echo "$out" | grep -q "responder=startup-failed" && ok || fail "no startup-failed report: $out"
-IDHF="$(echo "$out" | val exchange_id)"
-assert_eq "$("$AM" status "$IDHF" | val state)" "published" "(exchange stays recoverable)"
-echo "$out" | grep -q "responder_log=" && ok || fail "startup failure does not point at the log"
+t "ask/review --background: removed option fails before creating an exchange"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "removed bg parity" --file "$TMP/request.md" --background 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask --background rc)"
+echo "$out" | grep -qi "removed" && ok || fail "removed-option error is unclear: $out"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --task "short focus" --background 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(review --background rc)"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(removed options create no exchanges)"
 
-t "ask --background: healthy slow and fast responders still report background/answered with exit 0"
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow "$AM" ask --topic "hs slow" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
-assert_eq "$rc" 0 "(slow responder)"
-echo "$out" | grep -q "responder=background" && ok || fail "healthy background not reported: $out"
-IDHS="$(echo "$out" | val exchange_id)"; "$AM" cancel "$IDHS" >/dev/null 2>&1
-out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "hs fast" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
-assert_eq "$rc" 0 "(fast responder)"
-IDHA="$(echo "$out" | val exchange_id)"
-assert_rc 0 "$AM" wait "$IDHA" --timeout 30
+IDHF="$(cd "$TMP/repoA" && "$AM" new --topic "attach published" | val exchange_id)"
+HF_PROMPT="$("$AM" path "$IDHF")/prompt.md"
+sed -i '/^<!-- Replace this section/,/-->$/d' "$HF_PROMPT"
+printf '\nCheck the thing.\n' >> "$HF_PROMPT"
+"$AM" publish "$IDHF" >/dev/null
 
 t "ask --attach: re-launches a responder for an existing published exchange; refuses claimed/answered/mixed arguments"
 res="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHF" --timeout 60 2>/dev/null)"; rc=$?
@@ -457,25 +499,16 @@ assert_eq "$("$AM" status "$IDHF" | val state)" "answered"
 out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHF" 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(attach to an answered exchange)"
 echo "$out" | grep -q "result" && ok || fail "answered-attach refusal lacks the result hint: $out"
-CLID="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=fail "$AM" ask --topic "attach claimed" --file "$TMP/request.md" --background 2>/dev/null | val exchange_id)"
+CLID="$(cd "$TMP/repoA" && "$AM" new --topic "attach claimed" | val exchange_id)"
+CL_PROMPT="$("$AM" path "$CLID")/prompt.md"
+sed -i '/^<!-- Replace this section/,/-->$/d' "$CL_PROMPT"
+printf '\nCheck the thing.\n' >> "$CL_PROMPT"
+"$AM" publish "$CLID" >/dev/null
 "$AM" claim "$CLID" --owner someone-else >/dev/null 2>&1
 out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$CLID" 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(attach to a claimed exchange)"
 echo "$out" | grep -qi "claim" && ok || fail "claimed-attach refusal does not explain the claim: $out"
 assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHF" --task "extra"
-
-t "sandbox: --background inside a PID namespace prints a teardown warning; the post-mortem is honest"
-if unshare -Ur -pf true 2>/dev/null; then
-  out="$(env SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow unshare -Ur -pf --mount-proc bash -c "cd '$TMP/repoA' && '$AM' ask --topic sbx --file '$TMP/request.md' --background" 2>&1)"; rc=$?
-  echo "$out" | grep -qi "sandbox" && echo "$out" | grep -qi "killed\|will not survive" && ok || fail "no sandbox teardown warning: $out"
-  IDSB="$(echo "$out" | val exchange_id)"
-  sleep 1
-  assert_eq "$("$AM" status "$IDSB" | val responder_status)" "exited" "(responder died with the namespace)"
-  assert_rc 1 "$AM" result "$IDSB"
-  "$AM" archive "$IDSB" --force >/dev/null 2>&1
-else
-  echo "note: unprivileged user+pid namespaces unavailable; sandbox reproduction skipped"
-fi
 
 # ===========================================================================
 # Hot-update safety: a running invocation must never parse bytes from a replacement

@@ -23,8 +23,19 @@ val() { awk -v k="$1" -F= '$1==k{sub(/^[^=]*=/,""); print; exit}' ; }  # key=val
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME"     # never let any fallback path touch the real HOME
 export SECONDOPINION_DIR="$TMP/store"
+mkdir -p "$TMP/fixed-clock"
+printf '%s\n' '#!/bin/sh' \
+  'if [ "$#" -eq 1 ] && [ "$1" = "+%s" ] && [ -n "${FAKE_EPOCH:-}" ]; then' \
+  '  printf "%s\\n" "$FAKE_EPOCH"' \
+  'else' \
+  '  exec /usr/bin/date "$@"' \
+  'fi' > "$TMP/fixed-clock/date"
+chmod +x "$TMP/fixed-clock/date"
 export SECONDOPINION_STALE_CLAIM_SECS=3600
-unset CODEX_THREAD_ID
+# Several cases assert the default-off path before enabling auto-prune locally.
+# Keep those cases independent of the invoking user's retention policy.
+unset SECONDOPINION_AUTO_PRUNE SECONDOPINION_MAX_TURNS SECONDOPINION_PROGRESS_SECS SECONDOPINION_PROGRESS_MODE CODEX_THREAD_ID
+export SECONDOPINION_ASK_GRACE=0
 
 mkrepo() { # mkrepo <dir>
   git init -q -b main "$1" && git -C "$1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
@@ -44,6 +55,18 @@ publish_prompt() { # publish_prompt <id> <body>  (fills the Task section like a 
 }
 write_response() { # write_response <id> <file> [responder]
   printf 'Exchange-ID: %s\nResponder: %s\n\nverdict: PROVEN ok\n' "$1" "${3:-Claude Code}" > "$2"
+}
+wait_exchange_slug() { # wait_exchange_slug <slug> -> id created by a concurrent foreground ask
+  local slug="$1" d i
+  for i in $(seq 1 100); do
+    for d in "$SECONDOPINION_DIR/exchanges/"*-"$slug"; do
+      [ -d "$d" ] || continue
+      printf '%s\n' "${d##*/}"
+      return 0
+    done
+    sleep 0.1
+  done
+  return 1
 }
 
 # ===========================================================================
@@ -99,6 +122,10 @@ ID2="$(new_in "$TMP/repoB" second)"; publish_prompt "$ID2" "Task: Y"
 chmod u+w "$("$AM" path "$ID2")/prompt.md"; echo "sneaky edit" >> "$("$AM" path "$ID2")/prompt.md"
 assert_eq "$("$AM" status "$ID2" | val prompt_ok)" "no"
 assert_rc 1 "$AM" claim "$ID2"           # cannot claim a tampered prompt
+out="$("$AM" show "$ID2" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(show refuses a hash-invalid prompt)"
+assert_grep "validation" <(echo "$out")
+assert_not_grep "sneaky edit" <(echo "$out")
 
 t "list --repo: matches by git common dir across worktrees, excludes other repos"
 assert_eq "$("$AM" list --pending --repo "$TMP/repoA" | grep -c "$ID1")" "1"     # main checkout sees worktree's exchange
@@ -114,6 +141,8 @@ else ok; fi
 
 t "show: prints the prompt; path/status reject bad IDs"
 assert_grep "Task: review X" <("$AM" show "$ID1")
+IDSHOWDRAFT="$(new_in "$TMP/repoA" "show draft")"
+assert_grep "Task:" <("$AM" show "$IDSHOWDRAFT")
 assert_rc 1 "$AM" status "../etc"
 assert_rc 1 "$AM" status "$ID1/../$ID2"
 assert_rc 1 "$AM" path "no-such-id"
@@ -128,6 +157,32 @@ assert_eq "$("$AM" status "$ID1" | val state)" "claimed"
 assert_eq "$("$AM" status "$ID1" | val claimed_by)" "claude-A"
 assert_rc 1 "$AM" claim "$ID1" --owner claude-B
 assert_eq "$("$AM" list --pending | grep -c "$ID1")" "1"     # still awaiting a response
+
+t "claim: a foreground launch reservation refuses manual theft but admits its matching child"
+IDRES="$(new_in "$TMP/repoA" "claim reservation")"; publish_prompt "$IDRES" "task"
+RUNRES="0123456789abcdef0123456789abcdef"
+printf 'responder_run_id=%s\nresponder_outcome=running\nresponder_pid=\nresponder_starttime=\nask_started_epoch=%s\n' "$RUNRES" "$(date +%s)" >> "$("$AM" path "$IDRES")/meta"
+assert_eq "$("$AM" status "$IDRES" | val responder_status)" "launching"
+assert_grep "responder launching" <("$AM" status "$IDRES")
+out="$("$AM" claim "$IDRES" --owner manual-racer 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(manual claim during launch reservation)"
+assert_grep "foreground responder is being launched" <(echo "$out")
+CRES="$(SECONDOPINION_RUN_ID="$RUNRES" "$AM" claim "$IDRES" --owner matching-child)"; rc=$?
+assert_eq "$rc" 0 "(matching child claim)"
+TOKRES="$(echo "$CRES" | val claim_token)"; write_response "$IDRES" "$TMP/reservation.md"
+assert_rc 0 "$AM" respond "$IDRES" --token "$TOKRES" --file "$TMP/reservation.md"
+
+t "claim: launch reservation is active at age 4, exited at age 5, and manually recoverable"
+IDRSTALE="$(new_in "$TMP/repoA" "stale claim reservation")"; publish_prompt "$IDRSTALE" "task"
+CLOCK_EPOCH=2000000000
+printf 'responder_run_id=abcdef0123456789abcdef0123456789\nresponder_outcome=running\nresponder_pid=\nresponder_starttime=\nask_started_epoch=%s\n' "$((CLOCK_EPOCH - 4))" >> "$("$AM" path "$IDRSTALE")/meta"
+assert_eq "$(FAKE_EPOCH="$CLOCK_EPOCH" PATH="$TMP/fixed-clock:$PATH" "$AM" status "$IDRSTALE" | val responder_status)" "launching"
+sed -i "s/^ask_started_epoch=.*/ask_started_epoch=$((CLOCK_EPOCH - 5))/" "$("$AM" path "$IDRSTALE")/meta"
+assert_eq "$(FAKE_EPOCH="$CLOCK_EPOCH" PATH="$TMP/fixed-clock:$PATH" "$AM" status "$IDRSTALE" | val responder_status)" "exited"
+CRSTALE="$(FAKE_EPOCH="$CLOCK_EPOCH" PATH="$TMP/fixed-clock:$PATH" "$AM" claim "$IDRSTALE" --owner recovery-responder)"; rc=$?
+assert_eq "$rc" 0 "(manual claim after abandoned launch bound)"
+TRSTALE="$(echo "$CRSTALE" | val claim_token)"; write_response "$IDRSTALE" "$TMP/stale-reservation.md"
+assert_rc 0 "$AM" respond "$IDRSTALE" --token "$TRSTALE" --file "$TMP/stale-reservation.md"
 
 t "respond: wrong token refused; missing Exchange-ID header refused; good response published atomically"
 RESP="$TMP/resp.md"; write_response "$ID1" "$RESP"
@@ -612,6 +667,11 @@ STUB_DIR="$TMP/claude-stub"; mkdir -p "$STUB_DIR"
 # and answers through the real tool exactly like the headless skill would.
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/bin/bash
+if [ "${1:-}" = "--help" ]; then
+  echo "  --safe-mode                            Disable hooks, plugins, auto-memory and startup files"
+  echo "  --effort <level>                       Effort level (low, medium, high, xhigh, max)"
+  exit 0
+fi
 printf '%s\n' "$@" > "${STUB_ARGV_FILE:?}"
 printf '%s\n' "$PWD" > "${STUB_CWD_FILE:?}"
 [ -t 0 ] && echo "stdin-is-tty" >> "${STUB_ARGV_FILE}"
@@ -620,11 +680,40 @@ case "${STUB_MODE:-answer}" in
   answer)
     tok="$("$STUB_AM" claim "$id" --owner stub 2>/dev/null | awk -F= '/^claim_token=/{print $2}')"
     printf 'Exchange-ID: %s\nResponder: Stub Claude\n\nverdict: PROVEN stub-answer\n' "$id" > "$STUB_DIR/resp.md"
-    "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1; echo '{"is_error":false}';;
+    "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1; echo '{"type":"result","subtype":"success","is_error":false}';;
+  progress)
+    echo '{"type":"system","subtype":"init","model":"claude-stub-progress"}'
+    sleep 2
+    echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"rg -n reliability plugins/secondopinion"}}]}}'
+    echo '{"type":"user","message":{"content":[{"type":"tool_result","content":"matching source found"}]}}'
+    sleep 2
+    tok="$("$STUB_AM" claim "$id" --owner stub-progress 2>/dev/null | awk -F= '/^claim_token=/{print $2}')"
+    printf 'Exchange-ID: %s\nResponder: Stub Claude\n\nverdict: PROVEN progress-answer\n' "$id" > "$STUB_DIR/resp.md"
+    "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1
+    echo '{"type":"result","subtype":"success","is_error":false}';;
+  graceanswer)
+    tok="$("$STUB_AM" claim "$id" --owner stub-grace 2>/dev/null | awk -F= '/^claim_token=/{print $2}')"
+    sleep 3
+    printf 'Exchange-ID: %s\nResponder: Stub Claude\n\nverdict: PROVEN grace-answer\n' "$id" > "$STUB_DIR/resp.md"
+    "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1
+    echo '{"type":"result","subtype":"success","is_error":false}';;
   slow)   sleep 30;;
+  successnoanswer) echo '{"type":"result","subtype":"success","is_error":false}'; exit 0;;
   fail)   echo "boom" >&2; exit 1;;
+  authfail)
+    echo '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["API Error: 401 authentication_failed: OAuth access token has expired"]}'
+    exit 1;;
+  claimignoreterm)
+    "$STUB_AM" claim "$id" --owner stub-ignore-term >/dev/null 2>&1
+    trap '' TERM
+    while :; do sleep 1; done;;
   claimfail) "$STUB_AM" claim "$id" --owner stub >/dev/null 2>&1; echo "boom after claim" >&2; exit 1;;
   claimslow) "$STUB_AM" claim "$id" --owner stub >/dev/null 2>&1; sleep 30;;
+  foreignclaimfail)
+    "$STUB_AM" claim "$id" --owner foreign-stub >/dev/null 2>&1
+    d="$($STUB_AM path "$id")"
+    ( exec 9>>"$d/.lock"; flock 9; sed -i 's/^claim_run_id=.*/claim_run_id=ffffffffffffffffffffffffffffffff/' "$d/meta" )
+    echo "boom after foreign claim" >&2; exit 1;;
 esac
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -638,6 +727,7 @@ IDASK="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
 [ -n "$IDASK" ] && ok || fail "answer not printed (out: $(echo "$out" | head -3))"
 assert_grep "verdict: PROVEN stub-answer" <(echo "$out")
 assert_eq "$("$AM" status "$IDASK" | val state)" "answered"
+assert_eq "$("$AM" status "$IDASK" | val responder_completion)" "validated-answer"
 assert_grep "Please check the thing." "$("$AM" path "$IDASK")/prompt.md"          # request text became the Task section
 assert_not_grep "Replace this section" "$("$AM" path "$IDASK")/prompt.md"
 assert_eq "$(cat "$STUB_CWD_FILE")" "$TMP/repoA-wt" "(responder cwd = the checkout the request was made from)"
@@ -650,6 +740,28 @@ grep -q -- "^---$" "$STUB_ARGV_FILE" && fail "skill frontmatter must be stripped
 assert_eq "$(tail -n1 "$STUB_PROMPT_FILE")" "Exchange-ID: $IDASK" "(the prompt's FINAL line is the assignment)"
 grep -qx -- "Bash,Read,Grep,Glob,Write" "$STUB_ARGV_FILE" && ok || fail "default allowlist wrong"
 grep -qx -- "Edit,NotebookEdit,WebFetch,WebSearch" "$STUB_ARGV_FILE" && ok || fail "default disallowed-tool list wrong"
+grep -qx -- "stream-json" "$STUB_ARGV_FILE" && ok || fail "ask must request stream-json for observable progress"
+grep -qx -- "--verbose" "$STUB_ARGV_FILE" && ok || fail "stream-json requires --verbose"
+grep -qx -- "--safe-mode" "$STUB_ARGV_FILE" && ok || fail "headless responder must suppress user hooks/plugins and session-env setup"
+
+t "ask: default progress is quiet while status retains detailed heartbeat/activity evidence"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=progress SECONDOPINION_PROGRESS_SECS=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask progress" --file "$TMP/request.md" --timeout 30 2>"$TMP/progress.err")"; rc=$?
+assert_eq "$rc" 0 "(progress ask rc)"
+IDPROG="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+assert_grep "^Claude is still working — .* elapsed; waiting for results\.$" "$TMP/progress.err"
+assert_not_grep "events=" "$TMP/progress.err"
+assert_not_grep "rg -n reliability" "$TMP/progress.err"
+PROG_EVENTS="$("$AM" status "$IDPROG" | val responder_event_count)"
+[ "$PROG_EVENTS" -ge 2 ] && ok || fail "progress monitor recorded only $PROG_EVENTS stream event(s)"
+PROG_STATUS="$("$AM" status "$IDPROG")"
+assert_grep "rg -n reliability" <(echo "$PROG_STATUS")
+
+t "ask --verbose-progress: opt-in diagnostics include deadlines, events, activity age and last action"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=progress SECONDOPINION_PROGRESS_SECS=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask verbose progress" --file "$TMP/request.md" --timeout 30 --verbose-progress 2>"$TMP/progress-verbose.err")"; rc=$?
+assert_eq "$rc" 0 "(verbose progress ask rc)"
+assert_grep "primary=30s work-deadline=30s" "$TMP/progress-verbose.err"
+assert_grep "events=" "$TMP/progress-verbose.err"
+assert_grep "tool Bash: rg -n reliability" "$TMP/progress-verbose.err"
 
 t "ask: --model and SECONDOPINION_CLAUDE_ARGS reach the responder argv"
 out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINION_CLAUDE_ARGS="--fallback-model claude-x" "$AM" ask --topic "ask argv" --file "$TMP/request.md" --model claude-test-model --timeout 60 2>/dev/null)"; rc=$?
@@ -679,19 +791,61 @@ IDS="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
 assert_eq "$("$AM" status "$IDS" | val state)" "published"
 sleep 1; pgrep -f "STUB_MODE=slow" >/dev/null 2>&1 && fail "slow responder still running after timeout" || ok
 
-t "ask --background: returns immediately with the id; wait/read-response complete later"
-out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask bg" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
-assert_eq "$rc" 0
-IDB="$(echo "$out" | val exchange_id)"
-[ -n "$IDB" ] && ok || fail "no exchange_id printed"
-assert_rc 0 "$AM" wait "$IDB" --timeout 30
-assert_grep "stub-answer" <("$AM" read-response "$IDB")
+t "ask grace: the primary deadline only notifies and an answer inside unconditional grace succeeds"
+T0="$(date +%s)"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=graceanswer SECONDOPINION_PROGRESS_SECS=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask grace answer" --file "$TMP/request.md" --timeout 2 --grace 3 2>"$TMP/grace-answer.err")"; rc=$?
+T1="$(date +%s)"
+assert_eq "$rc" 0 "(answer inside grace rc)"
+IDGA="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+assert_grep "grace-answer" <(echo "$out")
+[ $((T1 - T0)) -ge 3 ] && ok || fail "grace fixture returned before its delayed answer"
+GAST="$("$AM" status "$IDGA")"
+assert_eq "$(echo "$GAST" | val requested_timeout_secs)" "2"
+assert_eq "$(echo "$GAST" | val requested_grace_secs)" "3"
+assert_eq "$(echo "$GAST" | val hard_timeout_secs)" "5"
+[ -n "$(echo "$GAST" | val deadline_notice_utc)" ] && ok || fail "primary deadline notification was not recorded"
+
+t "ask grace: without an override grace defaults to the primary duration and the work deadline stays bounded"
+T0="$(date +%s)"
+out="$(cd "$TMP/repoA-wt" && env -u SECONDOPINION_ASK_GRACE STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask default grace" --file "$TMP/request.md" --timeout 2 2>&1)"; rc=$?
+T1="$(date +%s)"
+assert_eq "$rc" 124 "(default grace work-deadline rc)"
+[ $((T1 - T0)) -ge 4 ] && ok || fail "default grace did not preserve the run through the 4s work deadline"
+[ $((T1 - T0)) -le 8 ] && ok || fail "TERM-responsive run did not stop promptly (elapsed $((T1-T0))s)"
+assert_grep "work deadline reached after 4s" <(echo "$out")
+
+t "ask/review --background: reject before creating an exchange"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "removed background" --file "$TMP/request.md" --background 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask --background rc)"
+assert_grep "removed" <(echo "$out")
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" review --task "short focus" --background 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(review --background rc)"
+assert_grep "removed" <(echo "$out")
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(removed option creates no exchange)"
 
 t "ask: refuses to start without a claude binary and creates no exchange"
 before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
 out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$TMP/does-not-exist" "$AM" ask --topic "no claude" --file "$TMP/request.md" 2>&1)"; rc=$?
 assert_eq "$rc" 1
 assert_grep "claude" <(echo "$out")
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count"
+
+t "ask: responder exit zero without a validated answer is explicitly classified as incomplete"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=successnoanswer SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "zero without answer" --file "$TMP/request.md" --timeout 30 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(zero exit without answer rc)"
+IDZWA="$(echo "$out" | val exchange_id)"
+ZWAST="$("$AM" status "$IDZWA")"
+assert_eq "$(echo "$ZWAST" | val responder_exit_code)" "0"
+assert_eq "$(echo "$ZWAST" | val responder_outcome)" "responder-exit-0-without-valid-answer"
+assert_eq "$(echo "$ZWAST" | val responder_completion)" "no-valid-answer"
+
+t "ask: refuses an older Claude CLI without safe mode before creating an exchange"
+mkdir -p "$TMP/old-claude"; printf '#!/bin/bash\necho "Claude Code old help"\n' > "$TMP/old-claude/claude"; chmod +x "$TMP/old-claude/claude"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$TMP/old-claude/claude" "$AM" ask --topic "old claude" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1
+assert_grep "update Claude Code" <(echo "$out")
 assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count"
 
 t "ask: refuses when the respond instructions are missing next to the CLI, creates no exchange"
@@ -721,35 +875,51 @@ out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" SECONDOPINI
 assert_eq "$rc" 1 "(ask rc SECONDOPINION_ASK_TIMEOUT=0)"
 assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange created for zero timeouts)"
 
-t "ask: responder that CLAIMS and then fails/times out is reported as claimed with the takeover path, not as published"
+t "ask: grace accepts zero, rejects malformed/overflow values, and creates no exchange on rejection"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "bad grace" --file "$TMP/request.md" --timeout 2 --grace abc
+assert_rc 1 env SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "overflow grace" --file "$TMP/request.md" --timeout 4294967295 --grace 1
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(no exchange created for invalid grace)"
+
+t "ask: a foreground responder's exact failed/timed-out claim is safely released for immediate retry"
 out="$(cd "$TMP/repoA-wt" && STUB_MODE=claimfail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "claim fail" --file "$TMP/request.md" --timeout 60 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(ask rc on claim-then-fail)"
 IDCF="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
-assert_eq "$("$AM" status "$IDCF" | val state)" "claimed"
-echo "$out" | grep -q "state=claimed" && ok || fail "claim-then-fail does not report state=claimed: $out"
-echo "$out" | grep -qi "takeover" && ok || fail "claim-then-fail does not mention the takeover path: $out"
-echo "$out" | grep -q "stays published" && fail "claim-then-fail still claims the exchange stays published" || ok
+assert_eq "$("$AM" status "$IDCF" | val state)" "published"
+[ ! -e "$("$AM" path "$IDCF")/claim" ] && ok || fail "failed foreground responder left a claim behind"
+assert_grep "safely released" <(echo "$out")
 out="$(cd "$TMP/repoA-wt" && STUB_MODE=claimslow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "claim slow" --file "$TMP/request.md" --timeout 2 2>&1)"; rc=$?
 assert_eq "$rc" 124 "(ask rc on claim-then-timeout)"
-echo "$out" | grep -q "state=claimed" && ok || fail "claim-then-timeout does not report state=claimed: $out"
-echo "$out" | grep -qi "takeover" && ok || fail "claim-then-timeout does not mention the takeover path: $out"
+IDCS="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+assert_eq "$("$AM" status "$IDCS" | val state)" "published"
+[ ! -e "$("$AM" path "$IDCS")/claim" ] && ok || fail "timed-out foreground responder left a claim behind"
+assert_grep "retry immediately" <(echo "$out")
 
-t "ask --background: the printed state is read from meta, not hardcoded"
-out="$(cd "$TMP/repoA-wt" && STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "bg state" --file "$TMP/request.md" --background 2>/dev/null)"; rc=$?
-assert_eq "$rc" 0
-IDBS="$(echo "$out" | val exchange_id)"
-assert_eq "$(echo "$out" | val state)" "$("$AM" status "$IDBS" | val state)" "(reported state matches meta)"
+t "ask: failed foreground recovery never releases a different or uncorrelated claim"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=foreignclaimfail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "foreign claim fail" --file "$TMP/request.md" --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(ask rc on foreign claim failure)"
+IDFC="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+assert_eq "$("$AM" status "$IDFC" | val state)" "claimed"
+[ -d "$("$AM" path "$IDFC")/claim" ] && ok || fail "uncorrelated claim was incorrectly removed"
+assert_grep "claim was preserved" <(echo "$out")
 
 t "archive relocates the responder log into the archived exchange (no errant files left behind)"
-[ -f "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && ok || fail "fixture: responder log missing for $IDASK"
+ASK_LOG="$($AM status "$IDASK" | val responder_log)"; ASK_LOG_BASE="${ASK_LOG##*/}"
+[ -f "$ASK_LOG" ] && ok || fail "fixture: responder log missing for $IDASK"
 assert_rc 0 "$AM" archive "$IDASK"
-[ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && ok || fail "responder log left orphaned in responder-logs/ after archive"
-[ -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log" ] && ok || fail "responder log not preserved inside the archived exchange"
-assert_eq "$("$AM" status "$IDASK" | val responder_log)" "$SECONDOPINION_DIR/archive/$IDASK/responder.log" "(meta responder_log updated to the relocated path)"
+[ ! -e "$ASK_LOG" ] && ok || fail "responder log left orphaned in responder-logs/ after archive"
+[ -f "$SECONDOPINION_DIR/archive/$IDASK/responder-logs/$ASK_LOG_BASE" ] && ok || fail "responder log not preserved inside the archived exchange"
+assert_eq "$("$AM" status "$IDASK" | val responder_log)" "$SECONDOPINION_DIR/archive/$IDASK/responder-logs/$ASK_LOG_BASE" "(meta responder_log updated to the relocated path)"
 # repair path: an orphan log for an ALREADY archived exchange is relocated by a re-archive
-echo "orphan" > "$SECONDOPINION_DIR/responder-logs/$IDASK.log"; rm -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log"
+echo "orphan" > "$SECONDOPINION_DIR/responder-logs/$IDASK.log"
 assert_rc 0 "$AM" archive "$IDASK"
-[ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && [ -f "$SECONDOPINION_DIR/archive/$IDASK/responder.log" ] && ok || fail "re-archive did not repair an orphaned responder log"
+[ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && [ -f "$SECONDOPINION_DIR/archive/$IDASK/responder-logs/$IDASK.log" ] && ok || fail "re-archive did not repair an orphaned responder log"
+# collision repair: a later legacy log is disambiguated, never left behind or overwritten
+echo "orphan-two" > "$SECONDOPINION_DIR/responder-logs/$IDASK.log"
+assert_rc 0 "$AM" archive "$IDASK"
+[ ! -e "$SECONDOPINION_DIR/responder-logs/$IDASK.log" ] && [ -f "$SECONDOPINION_DIR/archive/$IDASK/responder-logs/$IDASK.log.2" ] && ok || fail "colliding orphan responder log was not disambiguated into the archive"
+assert_grep "orphan" "$SECONDOPINION_DIR/archive/$IDASK/responder-logs/$IDASK.log"
+assert_grep "orphan-two" "$SECONDOPINION_DIR/archive/$IDASK/responder-logs/$IDASK.log.2"
 
 t "ask: task text via --task and via stdin (-)"
 out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask task" --task "Inline task text" --timeout 60 2>/dev/null)"; rc=$?
@@ -758,6 +928,31 @@ IDT="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"; assert_grep "Inli
 out="$(cd "$TMP/repoA-wt" && printf 'Piped task\n' | SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask stdin" --file - --timeout 60 2>/dev/null)"; rc=$?
 assert_eq "$rc" 0
 IDP="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"; assert_grep "Piped task" "$("$AM" path "$IDP")/prompt.md"
+
+t "ask: detailed inline tasks are rejected before exchange creation; the same text works through --file"
+LONGTASK="$(printf '%0241d' 0 | tr 0 x)"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "oversized task" --task "$LONGTASK" --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(oversized inline task rc)"
+assert_grep "private request file" <(echo "$out")
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "multiline task" --task $'first line\nsecond line' --timeout 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(multiline inline task rc)"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(inline-task rejection created an exchange)"
+printf '%s\n' "$LONGTASK" > "$TMP/long-request.md"
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "file-backed task" --file "$TMP/long-request.md" --timeout 60 2>/dev/null)"; rc=$?
+assert_eq "$rc" 0 "(file-backed detailed task rc)"
+
+t "new/ask: topics are one line and bounded before an exchange is created"
+LONGTOPIC="$(printf '%0121d' 0 | tr 0 t)"
+before_count="$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)"
+out="$(cd "$TMP/repoA-wt" && "$AM" new --topic "$LONGTOPIC" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(oversized new topic rc)"
+assert_grep "--topic is limited" <(echo "$out")
+out="$(cd "$TMP/repoA-wt" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "$LONGTOPIC" --file "$TMP/request.md" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(oversized ask topic rc)"
+out="$(cd "$TMP/repoA-wt" && "$AM" new --topic $'first\nsecond' 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(multiline topic rc)"
+assert_eq "$(ls "$SECONDOPINION_DIR/exchanges" | wc -l)" "$before_count" "(topic rejection created an exchange)"
 
 # ===========================================================================
 # --- reliability hardening: empty meta values, orphans, lock waits, rollforward
@@ -816,6 +1011,20 @@ out="$(SECONDOPINION_LOCK_WAIT_SECS=abc "$AM" status "$IDLK" 2>&1)"; rc=$?
 assert_eq "$rc" 1 "(rc bad LOCK_WAIT_SECS)"
 assert_grep "SECONDOPINION_LOCK_WAIT_SECS" <(echo "$out")
 
+t "env: SECONDOPINION_PROGRESS_SECS must be a positive integer"
+out="$(SECONDOPINION_PROGRESS_SECS=0 "$AM" status "$IDLK" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc zero PROGRESS_SECS)"
+assert_grep "SECONDOPINION_PROGRESS_SECS" <(echo "$out")
+out="$(SECONDOPINION_PROGRESS_SECS=abc "$AM" status "$IDLK" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc bad PROGRESS_SECS)"
+
+t "env: SECONDOPINION_PROGRESS_MODE accepts quiet/verbose only"
+assert_rc 0 env SECONDOPINION_PROGRESS_MODE=quiet "$AM" status "$IDLK"
+assert_rc 0 env SECONDOPINION_PROGRESS_MODE=verbose "$AM" status "$IDLK"
+out="$(SECONDOPINION_PROGRESS_MODE=noisy "$AM" status "$IDLK" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(rc bad PROGRESS_MODE)"
+assert_grep "SECONDOPINION_PROGRESS_MODE" <(echo "$out")
+
 t "wait: finalizes a valid on-disk response left by a responder that died before meta finalize"
 IDRF="$(new_in "$TMP/repoA" "hardening rollforward wait")"; publish_prompt "$IDRF" "task"
 "$AM" claim "$IDRF" --owner doomed >/dev/null
@@ -857,11 +1066,45 @@ out="$(cd "$TMP/repoA-wt" && STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/clau
 assert_eq "$rc" 124 "(ask rc on timeout)"
 assert_grep "ask --attach" <(echo "$out")
 IDTL="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
-LOGTL="$SECONDOPINION_DIR/responder-logs/$IDTL.log"
+LOGTL="$("$AM" status "$IDTL" | val responder_log)"
 [ -s "$LOGTL" ] && ok || fail "responder log empty after timeout kill"
-assert_grep "killed by ask" "$LOGTL"
+assert_grep "reached work deadline" "$LOGTL"
+TLST="$("$AM" status "$IDTL")"
+assert_eq "$(echo "$TLST" | val termination_grace_secs)" "10"
+assert_eq "$(echo "$TLST" | val final_kill_epoch)" "$(( $(echo "$TLST" | val hard_deadline_epoch) + 10 ))"
 
-t "ask --attach: refuses while the recorded background responder is still running (no log truncation)"
+t "ask --timeout: a TERM-resistant responder is visibly terminating, then SIGKILLed and recovered"
+T0="$(date +%s)"
+out="$(cd "$TMP/repoA-wt" && STUB_MODE=claimignoreterm SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "hardening term kill" --file "$TMP/request.md" --timeout 1 --grace 0 2>&1)"; rc=$?
+T1="$(date +%s)"
+assert_eq "$rc" 124 "(TERM-resistant timeout rc)"
+[ $((T1 - T0)) -ge 11 ] && [ $((T1 - T0)) -le 16 ] && ok || fail "TERM-to-KILL interval was not bounded as declared (elapsed $((T1-T0))s)"
+assert_grep "reached its work deadline — terminating" <(echo "$out")
+assert_not_grep "Killed" <(echo "$out")
+TERM_LINE="$(printf '%s\n' "$out" | grep -n -m1 'reached its work deadline' | cut -d: -f1)"
+printf '%s\n' "$out" | tail -n "+$TERM_LINE" | grep -q 'Claude is still working' && fail "progress called Claude working after termination began" || ok
+IDTK="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+assert_eq "$("$AM" status "$IDTK" | val state)" "published" "(TERM-resistant exact claim recovered)"
+assert_eq "$("$AM" status "$IDTK" | val responder_exit_code)" "137"
+
+t "lazy reap: a correlated live responder keeps its claim throughout bounded termination"
+IDLR="$(new_in "$TMP/repoA" "hardening live reap")"; publish_prompt "$IDLR" "task"
+RUNLR="11112222333344445555666677778888"
+SECONDOPINION_RUN_ID="$RUNLR" "$AM" claim "$IDLR" --owner live-reap >/dev/null
+sleep 60 & LRPID=$!
+LRSTAT="$(cat /proc/$LRPID/stat)"; LRSTAT="${LRSTAT##*) }"; set -- $LRSTAT; LRSTART="${20}"
+LRNOW="$(date +%s)"; LRNS="$(readlink /proc/self/ns/pid)"
+printf 'responder_pid=%s\nresponder_starttime=%s\nresponder_namespace=%s\nresponder_run_id=%s\nhard_deadline_epoch=%s\nfinal_kill_epoch=%s\nreap_after_epoch=%s\n' \
+  "$LRPID" "$LRSTART" "$LRNS" "$RUNLR" "$((LRNOW - 1))" "$((LRNOW + 9))" "$((LRNOW + 11))" >> "$("$AM" path "$IDLR")/meta"
+assert_eq "$("$AM" status "$IDLR" | val state)" "claimed" "(live claim must survive work-deadline TERM window)"
+[ -d "$("$AM" path "$IDLR")/claim" ] && ok || fail "live claim was reaped before the final-kill bound"
+sed -i "s/^reap_after_epoch=.*/reap_after_epoch=$((LRNOW - 1))/" "$("$AM" path "$IDLR")/meta"
+LRST="$("$AM" status "$IDLR")"
+assert_eq "$(echo "$LRST" | val state)" "published" "(claim released after final-kill/reap bound)"
+assert_eq "$(echo "$LRST" | val claim_release_reason)" "final-kill-bound-expired"
+kill "$LRPID" 2>/dev/null; wait "$LRPID" 2>/dev/null
+
+t "ask --attach: refuses while the recorded responder is still running (no log truncation)"
 IDAT="$(new_in "$TMP/repoA" "hardening attach running")"; publish_prompt "$IDAT" "task"
 sleep 60 & RPID=$!
 RSTAT="$(cat /proc/$RPID/stat)"; RSTAT="${RSTAT##*) }"; set -- $RSTAT; RSTART="${20}"
@@ -874,6 +1117,133 @@ assert_grep "still running" <(echo "$out")
 assert_grep "cancel" <(echo "$out")
 assert_grep "SENTINEL-DO-NOT-TRUNCATE" "$SECONDOPINION_DIR/responder-logs/$IDAT.log"
 kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null
+
+t "status/attach: a fresh supervisor heartbeat proves liveness across PID namespaces"
+IDHB="$(new_in "$TMP/repoA" "hardening heartbeat liveness")"; publish_prompt "$IDHB" "task"
+HBNOW="$(date +%s)"
+printf 'responder_pid=2147483647\nresponder_starttime=not-visible\nresponder_namespace=pid:[foreign-heartbeat]\nresponder_heartbeat_epoch=%s\nresponder_activity_epoch=%s\nresponder_activity=tool Read: src/main.c\nresponder_event_count=7\n' "$HBNOW" "$HBNOW" >> "$("$AM" path "$IDHB")/meta"
+assert_eq "$("$AM" status "$IDHB" | val responder_status)" "running-heartbeat"
+HB_STATUS="$("$AM" status "$IDHB")"
+assert_grep "activity_age_secs=" <(echo "$HB_STATUS")
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDHB" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach rc with fresh cross-namespace heartbeat)"
+assert_grep "still running" <(echo "$out")
+sed -i "s/^responder_heartbeat_epoch=.*/responder_heartbeat_epoch=$((HBNOW - 1000))/" "$("$AM" path "$IDHB")/meta"
+assert_eq "$("$AM" status "$IDHB" | val responder_status)" "unknown-foreign-namespace"
+
+t "ask --attach: refuses a fresh launch reservation, then recovers it after the short launch bound"
+IDLAUNCH="$(new_in "$TMP/repoA" "attach launch reservation")"; publish_prompt "$IDLAUNCH" "task"
+OLDLAUNCHRUN="11111111111111111111111111111111"
+printf 'responder_run_id=%s\nresponder_outcome=running\nresponder_pid=\nresponder_starttime=\nask_started_epoch=%s\n' "$OLDLAUNCHRUN" "$(date +%s)" >> "$("$AM" path "$IDLAUNCH")/meta"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDLAUNCH" 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach during launch reservation)"
+assert_grep "still launching" <(echo "$out")
+sed -i "s/^ask_started_epoch=.*/ask_started_epoch=$(( $(date +%s) - 5 ))/" "$("$AM" path "$IDLAUNCH")/meta"
+out="$(cd "$TMP/repoA" && STUB_MODE=fail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDLAUNCH" --timeout 30 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(attach after abandoned launch bound reaches replacement responder)"
+LAUNCHST="$("$AM" status "$IDLAUNCH")"
+[ "$(echo "$LAUNCHST" | val responder_run_id)" != "$OLDLAUNCHRUN" ] && ok || fail "stale launch reservation was not replaced"
+assert_eq "$(echo "$LAUNCHST" | val attach_arbitration)" "exited-responder-replacement"
+
+t "PID namespace: a real isolated foreground responder is heartbeat-visible and cannot be signalled by an outer session"
+if unshare -Ur -pf --mount-proc true 2>/dev/null; then
+  SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=slow SECONDOPINION_PROGRESS_SECS=1 \
+    unshare --kill-child=KILL -Ur -pf --mount-proc bash -c 'cd "$1" && exec "$2" ask --topic "real namespace heartbeat" --file "$3" --timeout 60' \
+      bash "$TMP/repoA" "$AM" "$TMP/request.md" >"$TMP/real-ns.out" 2>&1 &
+  NSPID=$!
+  IDNS="$(wait_exchange_slug real-namespace-heartbeat)" || fail "PID-namespace ask did not publish an exchange"
+  for i in $(seq 1 40); do [ -n "$("$AM" status "$IDNS" | val responder_heartbeat_epoch)" ] && break; sleep 0.1; done
+  NSSTATUS="$("$AM" status "$IDNS")"
+  [ "$(echo "$NSSTATUS" | val responder_namespace)" != "$(readlink /proc/self/ns/pid)" ] && ok || fail "fixture did not enter a distinct PID namespace"
+  assert_eq "$(echo "$NSSTATUS" | val responder_status)" "running-heartbeat"
+  out="$("$AM" cancel "$IDNS" 2>&1)"; rc=$?
+  assert_eq "$rc" 1 "(outer cancel of foreign PID namespace)"
+  assert_grep "another PID namespace" <(echo "$out")
+  kill -TERM "$NSPID" 2>/dev/null || true; wait "$NSPID" 2>/dev/null || true
+  sed -i 's/^responder_heartbeat_epoch=.*/responder_heartbeat_epoch=1/' "$("$AM" path "$IDNS")/meta"
+  NSAFTER="$("$AM" status "$IDNS" | val responder_status)"
+  case "$NSAFTER" in
+    exited|unknown-foreign-namespace) ok;;
+    *) fail "post-teardown foreign responder state is '$NSAFTER'";;
+  esac
+else
+  echo "note: unprivileged PID namespaces unavailable; real namespace case skipped"
+fi
+
+t "foreground supervisor heartbeat prevents a cross-namespace duplicate attach"
+(cd "$TMP/repoA" && STUB_MODE=slow SECONDOPINION_PROGRESS_SECS=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "hardening foreground heartbeat" --file "$TMP/request.md" --timeout 60 >"$TMP/foreground-heartbeat.out" 2>&1) &
+FGASKPID=$!
+IDBGHB="$(wait_exchange_slug hardening-foreground-heartbeat)" || fail "foreground ask did not publish an exchange"
+DBGHB="$("$AM" path "$IDBGHB")"
+for i in $(seq 1 30); do [ -n "$("$AM" status "$IDBGHB" | val responder_heartbeat_epoch)" ] && break; sleep 0.1; done
+[ -n "$("$AM" status "$IDBGHB" | val responder_heartbeat_epoch)" ] && ok || fail "foreground supervisor did not publish a heartbeat"
+out="$("$AM" claim "$IDBGHB" --owner manual-racer 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(manual claim must not steal a live foreground exchange)"
+assert_grep "foreground responder" <(echo "$out")
+assert_eq "$("$AM" status "$IDBGHB" | val state)" "published" "(refused manual claim leaves exchange published)"
+STATUS_PIDS=()
+for i in $(seq 1 12); do "$AM" status "$IDBGHB" > "$TMP/fg-heartbeat-status.$i" 2>&1 & STATUS_PIDS+=("$!"); done
+for p in "${STATUS_PIDS[@]}"; do wait "$p"; done
+for i in $(seq 1 12); do
+  assert_eq "$(val state < "$TMP/fg-heartbeat-status.$i")" "published" "(concurrent status $i while heartbeat rewrites meta)"
+  [ -n "$(val responder_run_id < "$TMP/fg-heartbeat-status.$i")" ] && ok || fail "concurrent status $i observed truncated meta"
+done
+BGNS="$("$AM" status "$IDBGHB" | val responder_namespace)"
+sed -i 's|^responder_namespace=.*|responder_namespace=pid:[foreign-test]|' "$DBGHB/meta"
+assert_eq "$("$AM" status "$IDBGHB" | val responder_status)" "running-heartbeat"
+ATTACH_PIDS=()
+for i in $(seq 1 4); do
+  ( cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDBGHB" > "$TMP/fg-heartbeat-attach.$i" 2>&1; printf '%s\n' "$?" > "$TMP/fg-heartbeat-attach.$i.rc" ) &
+  ATTACH_PIDS+=("$!")
+done
+for p in "${ATTACH_PIDS[@]}"; do wait "$p"; done
+for i in $(seq 1 4); do
+  assert_eq "$(cat "$TMP/fg-heartbeat-attach.$i.rc")" 1 "(cross-namespace duplicate attach $i rc)"
+  assert_grep "still running" "$TMP/fg-heartbeat-attach.$i"
+done
+sed -i "s|^responder_namespace=.*|responder_namespace=$BGNS|" "$DBGHB/meta"
+"$AM" cancel "$IDBGHB" >/dev/null 2>&1
+wait "$FGASKPID" 2>/dev/null || true
+
+t "ask --attach: stale foreign recovery uses a unique log and never truncates incumbent diagnostics"
+IDUFL="$(new_in "$TMP/repoA" "hardening foreign attach log")"; publish_prompt "$IDUFL" "task"
+mkdir -p "$SECONDOPINION_DIR/responder-logs"
+OLDLOG="$SECONDOPINION_DIR/responder-logs/$IDUFL.incumbent.log"
+printf 'SENTINEL-FOREIGN-INCUMBENT\n' > "$OLDLOG"
+printf 'responder_pid=2147483647\nresponder_starttime=not-visible\nresponder_namespace=pid:[foreign-stale]\nresponder_heartbeat_epoch=1\nresponder_log=%s\n' "$OLDLOG" >> "$("$AM" path "$IDUFL")/meta"
+sed -i '/^responder_log=/i responder_run_id=incumbent-run-identity' "$("$AM" path "$IDUFL")/meta"
+out="$(cd "$TMP/repoA" && STUB_MODE=fail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDUFL" --timeout 30 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(stale foreign attach failure rc)"
+assert_grep "SENTINEL-FOREIGN-INCUMBENT" "$OLDLOG"
+NEWLOG="$("$AM" status "$IDUFL" | val responder_log)"
+[ "$NEWLOG" != "$OLDLOG" ] && ok || fail "attach reused the incumbent responder log"
+[ -s "$NEWLOG" ] && ok || fail "replacement responder did not receive a unique diagnostic log"
+UFST="$("$AM" status "$IDUFL")"
+assert_eq "$(echo "$UFST" | val attach_arbitration)" "stale-foreign-replacement"
+assert_eq "$(echo "$UFST" | val previous_responder_run_id)" "incumbent-run-identity"
+assert_eq "$(echo "$UFST" | val previous_responder_namespace)" "pid:[foreign-stale]"
+assert_eq "$(echo "$UFST" | val previous_responder_log)" "$OLDLOG"
+assert_rc 0 "$AM" archive "$IDUFL" --force
+UFA="$SECONDOPINION_DIR/archive/$IDUFL/responder-logs"
+assert_eq "$("$AM" status "$IDUFL" | val previous_responder_log)" "$UFA/${OLDLOG##*/}" "(archived previous log path updated)"
+assert_eq "$("$AM" status "$IDUFL" | val responder_log)" "$UFA/${NEWLOG##*/}" "(archived current log path updated)"
+
+t "ask --attach: a clean exchange clears stale arbitration metadata"
+IDCLEAN="$(new_in "$TMP/repoA" "hardening clean attach")"; publish_prompt "$IDCLEAN" "task"
+printf 'attach_arbitration=stale-value\nprevious_responder_run_id=stale-run\nprevious_responder_log=stale-log\n' >> "$("$AM" path "$IDCLEAN")/meta"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDCLEAN" --timeout 30 2>&1)"; rc=$?
+assert_eq "$rc" 0 "(clean attach rc)"
+CLEANST="$("$AM" status "$IDCLEAN")"
+assert_eq "$(echo "$CLEANST" | val attach_arbitration)" ""
+assert_eq "$(echo "$CLEANST" | val previous_responder_run_id)" ""
+assert_eq "$(echo "$CLEANST" | val previous_responder_log)" ""
+
+t "ask: an authentication failure gives an actionable normal-terminal login and exact attach path"
+out="$(cd "$TMP/repoA" && STUB_MODE=authfail SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "hardening auth hint" --file "$TMP/request.md" --timeout 30 2>&1)"; rc=$?
+assert_eq "$rc" 1 "(auth failure rc)"
+assert_grep "claude auth login" <(echo "$out")
+assert_grep "normal terminal" <(echo "$out")
+assert_grep "ask --attach" <(echo "$out")
 
 t "prune --apply: sweeps leftover .prune-trash residue from an interrupted removal"
 IDPT="$(new_in "$TMP/repoA" "hardening prune trash")"; publish_prompt "$IDPT" "task"
@@ -899,14 +1269,6 @@ t "jobs --all: an empty store says so instead of printing nothing"
 out="$(cd "$TMP/repoC" && SECONDOPINION_DIR="$TMP/store-empty-jobs" "$AM" jobs --all 2>"$TMP/jobs-all.err")"; rc=$?
 assert_eq "$rc" 0 "(jobs --all rc on empty store)"
 assert_grep "no exchanges" "$TMP/jobs-all.err"
-
-t "ask --background: a PID-namespaced sandbox is reported as parseable stdout keys, not only stderr"
-out="$(cd "$TMP/repoA-wt" && SECONDOPINION_TEST_PID1_COMM=codex-linux-san STUB_MODE=slow SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "sbx keys" --file "$TMP/request.md" --background 2>"$TMP/sbx.err")"; rc=$?
-assert_eq "$rc" 0 "(background launch rc under fake namespace)"
-assert_grep "^sandbox=pid-namespaced" <(echo "$out")
-assert_grep "ask --attach" <(echo "$out")
-assert_grep "WARNING" "$TMP/sbx.err"
-IDSB="$(echo "$out" | val exchange_id)"; "$AM" cancel "$IDSB" >/dev/null 2>&1
 
 t "archive: refuses a cross-filesystem archive/ before mutating anything"
 IDXF="$(new_in "$TMP/repoA" "hardening crossfs")"; publish_prompt "$IDXF" "task"
@@ -970,6 +1332,19 @@ wait "$ATTBG"; rc=$?
 assert_eq "$rc" 1 "(attach rc when a claim won the race)"
 assert_grep "no longer published" "$TMP/attach-race.out"
 assert_grep "UNTOUCHED" "$STUB_ARGV_FILE"
+
+t "ask --attach: a heartbeat racing the attach is rechecked under lock and prevents a duplicate"
+IDRAH="$(new_in "$TMP/repoA-wt" "hardening attach heartbeat race")"; publish_prompt "$IDRAH" "task"
+printf 'responder_pid=2147483647\nresponder_starttime=not-visible\nresponder_namespace=pid:[foreign-race]\nresponder_heartbeat_epoch=1\n' >> "$("$AM" path "$IDRAH")/meta"
+printf 'UNTOUCHED-HEARTBEAT\n' > "$STUB_ARGV_FILE"
+(cd "$TMP/repoA-wt" && SECONDOPINION_TEST_ATTACH_PAUSE=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDRAH" --timeout 30 >"$TMP/attach-heartbeat-race.out" 2>&1) &
+ATTHB=$!
+sleep 0.3
+sed -i "s/^responder_heartbeat_epoch=.*/responder_heartbeat_epoch=$(date +%s)/" "$("$AM" path "$IDRAH")/meta"
+wait "$ATTHB"; rc=$?
+assert_eq "$rc" 1 "(attach rc when a heartbeat revived during startup)"
+assert_grep "became live" "$TMP/attach-heartbeat-race.out"
+assert_grep "UNTOUCHED-HEARTBEAT" "$STUB_ARGV_FILE"
 
 t "respond: an ln failure with no existing response is not misreported as write-once"
 mkdir -p "$TMP/failbin"; printf '#!/bin/bash\nexit 1\n' > "$TMP/failbin/ln"; chmod +x "$TMP/failbin/ln"

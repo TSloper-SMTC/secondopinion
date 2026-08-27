@@ -7,8 +7,8 @@ description: Use when working in Codex and the user wants a second opinion, inde
 
 `secondopinion` is a file-based, hash-bound exchange between coding agents.
 From Codex, one command does everything: create and publish the exchange, run
-a headless Claude Code responder in this checkout, wait, validate, and print
-the answer.
+a headless Claude Code responder in this checkout, stream quiet progress,
+wait, validate, and print the answer.
 
 ## Preconditions
 
@@ -21,45 +21,69 @@ the answer.
   out"), the Codex sandbox has no network: the user must run
   `scripts/install.sh` (it sets `[sandbox_workspace_write] network_access =
   true` in `~/.codex/config.toml`) and restart Codex. Do not work around it.
+- If `ask` reports `authentication_failed` or an expired OAuth token, tell the
+  user to run `claude auth login` in a normal terminal, then retry the exact
+  published exchange with `secondopinion ask --attach <ID>`. `claude auth
+  status` alone does not prove an API request can refresh its token.
 - Repository instructions (`AGENTS.md`) stay authoritative for what may be
   asked and what Claude may do in that repository.
 
 ## Ask
 
-1. Write the request to a file (or use `--task "…"` for a one-liner): what to
-   review, exact paths/commits/artifacts, the verdict form you need
+1. Write the request to a file (use `--task "…"` only for a genuinely short
+   one-liner): what to review, exact paths/commits/artifacts, the verdict form you need
    (PROVEN/LIKELY/UNPROVEN/REJECTED, "READY / NOT READY: reasons", …), and
    say explicitly whether it is read-only (the default) or Claude may edit.
+   In Codex, a detailed request MUST go in a private mode-0600 temporary file
+   outside the target repository (prefer `/tmp/secondopinion-request.XXXXXX.md`),
+   populated with the normal file-editing tool, and be passed as `--file PATH`.
+   Remove it after `ask` returns. Never put detailed request text directly in a
+   long-running shell command: Codex may redisplay that command on every wait,
+   creating repeated large UI blocks. The CLI rejects multiline or over-240-
+   character `--task` values to enforce this boundary in every session. Keep
+   `--topic` to one short line (the CLI enforces at most 120 characters).
 2. Run, in the foreground for a bounded request:
 
    ```bash
    secondopinion ask --topic "<short topic>" --file request.md --timeout 900
    ```
 
-   For a long or open-ended request use `--background`; it prints the ID at
-   once. IMPORTANT under Codex: your commands run in a PID-namespaced sandbox
-   that is torn down when the launching exec finishes — a detached background
-   responder is killed with it (`ask` prints a WARNING when it detects this).
-   Either run the ask in the FOREGROUND inside a persistent exec session, or
-   keep the launching session alive until the answer lands. If a background
-   responder died this way (state=published, responder=exited, empty log),
-   re-launch one for the same exchange with `secondopinion ask --attach <ID>`
-   instead of creating a new exchange. `ask --background` exits nonzero with
-   `responder=startup-failed` when the responder dies within seconds. If the
-   output contains `sandbox=pid-namespaced`, RELAY that constraint to the user
-   in your reply. Do not end your turn with a launched `--background` ask
-   unresolved: either fetch the answer before finishing
-   (`secondopinion wait <ID> && secondopinion result <ID>`) or tell the user
-   the exact commands that will fetch it later. Keep working, then check `secondopinion jobs` (repository-scoped:
-   state, age, responder liveness), `secondopinion wait <ID> --timeout 600`
-   and `secondopinion result <ID>`; a stuck responder can be stopped with
-   `secondopinion cancel <ID>` (the exchange stays published for a retry).
-   Size the turn budget to the request: the responder stops at `--max-turns`
-   (default 60) and an over-broad task can burn the whole budget without
-   publishing — split broad reviews into 2-3 focused asks, or raise the budget
-   (`--max-turns 150`) knowing cost rises with it. If an ask fails with
-   `error_max_turns` in its log, narrow the request or raise the budget before
-   retrying (archive the dead exchange first).
+   Keep the foreground command alive. By default it emits only a quiet line
+   every 60 seconds (configurable with `SECONDOPINION_PROGRESS_SECS`): `Claude
+   is still working — 3m elapsed; waiting for results.` During long requests,
+   relay only that concise fact to the user; do not repeat exchange IDs, command
+   text, paths, event counts, activity details, or tool actions unless the user
+   explicitly asks for diagnostics. `status` retains those details, and
+   `--verbose-progress` (or `SECONDOPINION_PROGRESS_MODE=verbose`) opts into
+   displaying them. These summaries expose no hidden reasoning.
+
+   Foreground is the only supported execution mode. Never pass `--background`;
+   the CLI rejects it before creating an exchange because detached responders
+   cannot reliably survive Codex's PID-namespaced command sandbox. Keep the
+   launching command/session alive until the answer lands. Another session may
+   inspect `secondopinion jobs` or `secondopinion status <ID>`, and may stop a
+   stuck responder with `secondopinion cancel <ID>`; the exchange stays
+   published for a retry. `status` may briefly report `responder_status=launching`
+   before the PID is recorded. An unrelated manual responder or duplicate
+   attach is refused while that foreground run is launching or live, preventing
+   it from stealing the claim. If a
+   foreground run is interrupted, fails, or times
+   out, re-launch the same published exchange with `secondopinion ask --attach
+   <ID>` instead of creating a duplicate exchange.
+   `--timeout` is a primary notification deadline. Claude always receives one
+   unconditional grace window (`--grace`, default equal to `--timeout`). GNU
+   `timeout` sends TERM at `timeout + grace`, then permits at most 10 seconds
+   for bounded shutdown before SIGKILL. No event/activity heuristic may deny
+   grace: a healthy model
+   can be silent while composing. `--grace 0` restores legacy behavior. There
+   is no turn cap unless one is explicitly requested. Tool-turn counts are not
+   a reliable progress measure and can cut off a healthy responder immediately
+   before publication. Once the work deadline is reached, report that Claude is
+   terminating; never say it is still working.
+   Use `--max-turns N` only as an intentional cost/work-budget guard. If an ask
+   fails with `error_max_turns`, retry the same published exchange with
+   `secondopinion ask --attach <ID>` and a higher cap or no cap; exact-run claim
+   recovery makes that retry immediate.
    Add `--write` only when Claude is meant to change files (responder runs
    with `acceptEdits` instead of deny-only). Optional controls:
    `--model M`, `--effort low|medium|high|xhigh|max` (validated against the
@@ -70,7 +94,8 @@ the answer.
    For a code review, prefer the dedicated interface:
 
    ```bash
-   secondopinion review [--adversarial] [--base <ref>] --task "<focus>" --timeout 900
+   secondopinion review [--adversarial] [--base <ref>] --task "<short focus>" --timeout 900
+   secondopinion review [--adversarial] [--base <ref>] --file <detailed-focus.md> --timeout 900
    secondopinion review-result <ID>    # structured verdict/findings; exit 3 = parse failed, raw preserved
    ```
 
@@ -79,9 +104,17 @@ the answer.
    on its merits — parsing is not correctness.
 3. Exit codes: `0` — the printed text is Claude's validated answer (it starts
    with `Exchange-ID:` and `Responder:` lines); `124` — timeout, the exchange
-   stays published (retry `secondopinion wait <ID>`, or ask the user to run
-   `/secondopinion-respond <ID>` in a Claude Code session); `1` — error, the
-   log path is printed and the exchange stays published for a retry.
+   is immediately retryable with `secondopinion ask --attach <ID>`; `1` —
+   error, the log path is printed and the exchange is likewise retryable.
+   Foreground claims are correlated to a cryptographic launch ID: failure or
+   timeout releases only that exact run's claim. Cross-namespace recovery waits
+   through the recorded TERM→SIGKILL/reap bound whenever the
+   responder still appears live. Each attach uses a new immutable diagnostic
+   log, so it cannot truncate an incumbent log. A stale foreign replacement is
+   explicit arbitration: the prior pid/namespace/run/log remain in
+   `previous_responder_*`, while the atomic claim still allows only one answer.
+   A different or uncorrelated
+   responder claim is preserved and explicitly reported instead of guessed at.
 4. Independently classify what is actionable, wrong, stale, or unproven, then
    `secondopinion archive <ID>` once the content has been consumed.
 

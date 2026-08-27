@@ -30,7 +30,7 @@ assert_eq "$(json "$ROOT/.agents/plugins/marketplace.json" "['plugins'][0]['name
 
 t "changelogs: the top entry of BOTH CHANGELOG.md files matches the tool version"
 for c in "$ROOT/CHANGELOG.md" "$PLUGIN/CHANGELOG.md"; do
-  top="$(sed -n 's/^## \([0-9][0-9.]*[0-9]\).*/\1/p' "$c" | head -1)"
+  top="$(sed -n 's/^## \([^ ]*\).*/\1/p' "$c" | head -1)"
   assert_eq "$top" "$TOOL_VERSION" "(top entry of $c)"
 done
 
@@ -60,6 +60,10 @@ if command -v claude >/dev/null 2>&1; then
   ( cd "$HOME" && claude plugin install secondopinion@secondopinion >/dev/null 2>&1 ) && ok || fail "plugin install failed"
   cached="$(find "$HOME/.claude/plugins/cache" -path '*/skills/secondopinion-respond/SKILL.md' 2>/dev/null | head -1)"
   [ -n "$cached" ] && ok || fail "installed plugin lacks skills/secondopinion-respond/SKILL.md"
+  cached_root="${cached%/skills/secondopinion-respond/SKILL.md}"
+  for rel in bin/secondopinion skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+    cmp -s "$PLUGIN/$rel" "$cached_root/$rel" && ok || fail "Claude cache payload differs from source: $rel"
+  done
   details="$(cd "$HOME" && claude plugin details secondopinion@secondopinion 2>&1)"
   echo "$details" | grep -q "secondopinion-respond" && ok || fail "details do not list secondopinion-respond: $details"
   echo "$details" | grep -q "secondopinion-request" && ok || fail "standard skills/ scan should expose secondopinion-request too: $details"
@@ -76,6 +80,12 @@ if command -v claude >/dev/null 2>&1; then
   [ ! -e "$HOME/.codex/skills/secondopinion-request" ] && [ ! -L "$HOME/.codex/skills/secondopinion-request" ] && ok || fail "Codex skill symlink must not exist in (default) plugin mode"
   st="$(cd "$HOME" && codex plugin list --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=[x for x in d.get("installed",[]) if x.get("pluginId")=="secondopinion@secondopinion"]; print(p[0]["version"], p[0]["enabled"], p[0]["marketplaceSource"]["source"]) if p else print("absent")')"
   assert_eq "$st" "$TOOL_VERSION True $ROOT" "(codex plugin installed+enabled from the repo marketplace)"
+  codex_cached="$(find "$CODEX_HOME/plugins/cache" -path "*/$TOOL_VERSION/bin/secondopinion" 2>/dev/null | head -1)"
+  [ -n "$codex_cached" ] && ok || fail "Codex cache lacks the versioned secondopinion payload"
+  codex_cached_root="${codex_cached%/bin/secondopinion}"
+  for rel in bin/secondopinion skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .codex-plugin/plugin.json; do
+    cmp -s "$PLUGIN/$rel" "$codex_cached_root/$rel" && ok || fail "Codex cache payload differs from source: $rel"
+  done
   [ ! -e "$HOME/.claude/skills/secondopinion-respond" ] && [ ! -L "$HOME/.claude/skills/secondopinion-respond" ] && ok || fail "user-level Claude skill still present after default install"
   assert_eq "$(cd "$HOME" && claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["id"]=="secondopinion@secondopinion"]))')" "0" "(Claude plugin removed: nothing stays installed in Claude)"
   ( cd "$HOME" && "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check rejects the default (Codex-plugin-only) install"

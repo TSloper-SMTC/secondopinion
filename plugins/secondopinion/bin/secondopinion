@@ -16,7 +16,7 @@ set -euo pipefail
 umask 077
 command -v flock >/dev/null 2>&1 || { echo "ERROR: flock(1) (util-linux) not found on PATH; secondopinion requires Linux with GNU coreutils and util-linux." >&2; exit 1; }
 
-VERSION="1.0.0"
+VERSION="1.0.2+codex.20260827162704"
 warn() { echo "WARNING: $*" >&2; }
 
 # ---- agent-mailbox compatibility (the tool's pre-release internal name) -----------------------
@@ -69,12 +69,21 @@ DEFAULT_WAIT_TIMEOUT=600
 POLL_SECS=2
 TASK_PLACEHOLDER_MARK="Replace this section with the focused request for"
 MAX_HEADER_LINES=64
+MAX_INLINE_TASK_CHARS=240
+MAX_TOPIC_CHARS=120
 
 parse_count() { # name value -> positive integer (reuses parse_secs, then requires >= 1)
     local v; v="$(parse_secs "$1" "$2")" || return 1
     [ "$v" -ge 1 ] || { echo "ERROR: $1 must be at least 1" >&2; return 1; }
     printf '%s\n' "$v"
 }
+PROGRESS_SECS="$(parse_count SECONDOPINION_PROGRESS_SECS "${SECONDOPINION_PROGRESS_SECS:-60}")" || exit 1
+HEARTBEAT_STALE_SECS=$((PROGRESS_SECS * 3 + 5))
+PROGRESS_MODE="${SECONDOPINION_PROGRESS_MODE:-quiet}"
+case "$PROGRESS_MODE" in quiet|verbose) ;; *) echo "ERROR: SECONDOPINION_PROGRESS_MODE must be 'quiet' or 'verbose' (got '$PROGRESS_MODE')" >&2; exit 1;; esac
+KILL_AFTER_SECS=10
+REAP_SLACK_SECS=2
+LAUNCH_STALE_SECS=5
 
 usage() {
     cat <<EOF
@@ -82,24 +91,26 @@ secondopinion $VERSION — sealed, verifiable second-opinion exchanges between c
 Store: $STORE   (override: SECONDOPINION_DIR)
 
 Requester (Codex) side:
-  ask --topic TOPIC (--file REQ.md | --file - | --task TEXT) [--timeout S] [--write]
-      [--background] [--model M] [--effort L] [--max-turns N] [--json] [--persist]
+  ask --topic TOPIC (--file REQ.md | --file - | --task SHORT_TEXT) [--timeout S] [--grace S] [--write]
+      [--model M] [--effort L] [--max-turns N] [--verbose-progress] [--json] [--persist]
       [--follow-up ID | --resume ID] [--fresh]
-  ask --attach ID [--write] [--model M] [--effort L] [--max-turns N] [--timeout S] [--background]
+  ask --attach ID [--write] [--model M] [--effort L] [--max-turns N] [--timeout S] [--grace S]
+                          [--verbose-progress]
                           re-launch a headless responder for an EXISTING published exchange
-                          (e.g. after a background responder died with its sandbox)
+                          (e.g. after an interrupted foreground responder)
                           one call: create+publish the exchange, run a headless Claude Code
                           responder in this checkout (self-contained prompt, never prompts:
                           --permission-mode dontAsk + tool allowlist; --write = acceptEdits),
-                          wait, validate and print the answer. exit 0 answered | 124 timeout |
-                          1 error (exchange stays published for a retry). --background returns
-                          the ID at once; then: jobs / wait ID / result ID / cancel ID.
+                          stream quiet progress, wait, validate and print the answer. exit 0 answered |
+                          124 timeout | 1 error (a foreground run releases its own failed claim
+                          for immediate retry). The responder always stays in the foreground;
+                          detached --background execution was removed as unreliable in Codex.
                           --effort is validated against the live claude CLI. --follow-up ID
                           embeds the validated parent exchange in a NEW linked exchange
                           (stateless). --persist opts into a stored Claude session id so a
                           later ask --resume ID can continue that native session; the default
                           stays private (--no-session-persistence). --fresh is the default.
-  review [--adversarial] [--base REF | --scope working-tree] [--task FOCUS] [--topic T]
+  review [--adversarial] [--base REF | --scope working-tree] [--task SHORT_FOCUS | --file FOCUS.md] [--topic T]
          [+ ask options]  read-only code review of this checkout's working tree (or
                           REF...HEAD) with a structured verdict/findings JSON contract;
                           --adversarial challenges design choices and assumptions.
@@ -108,7 +119,7 @@ Requester (Codex) side:
                           response preserved | 1 validation error.
   jobs [--all|--repo P]   repository-scoped table: id, state, age, responder liveness
   result ID               validated answer (read-response), or an honest status + log path
-  cancel ID               stop a background responder (verified pid+start time; the exchange
+  cancel ID               stop a responder from another session (verified pid+start time; the exchange
                           stays recoverable; a valid answer is never demoted)
   prune [--apply] [--retain N]
                           bounded retention over archive/ per repository (default keep
@@ -141,8 +152,11 @@ Environment: SECONDOPINION_DIR, SECONDOPINION_OWNER (default claim owner),
              SECONDOPINION_STALE_CLAIM_SECS (default 1800; --takeover allowed after this),
              SECONDOPINION_LOCK_WAIT_SECS (default 30; error instead of waiting longer for a held exchange lock),
              SECONDOPINION_CLAUDE (responder binary, default: claude), SECONDOPINION_CLAUDE_ARGS
-             (extra flags appended to the responder command), SECONDOPINION_MAX_TURNS (default 60),
-             SECONDOPINION_ASK_TIMEOUT (default 1800), SECONDOPINION_RETAIN (prune bound, default 50),
+             (extra flags appended to the responder command), SECONDOPINION_MAX_TURNS
+             (optional cost/work cap; unset by default), SECONDOPINION_ASK_TIMEOUT (default 1800),
+             SECONDOPINION_ASK_GRACE (default: same as the ask timeout; 0 removes the extra work window),
+             SECONDOPINION_PROGRESS_SECS (default 60), SECONDOPINION_PROGRESS_MODE (quiet|verbose),
+             SECONDOPINION_RETAIN (prune bound, default 50),
              SECONDOPINION_AUTO_PRUNE (nonempty and not 0/false/no: archive auto-prunes its own bucket)
 EOF
 }
@@ -199,6 +213,11 @@ safe_value() { # name value
     case "$2" in *[![:print:][:blank:]]*) die "$1 must not contain control characters or newlines";; esac
     case "$2" in *$'\n'*|*$'\r'*) die "$1 must not contain newlines";; esac
     return 0
+}
+validate_topic() { # topic
+    safe_value "--topic" "$1"
+    [ "${#1}" -le "$MAX_TOPIC_CHARS" ] \
+        || die "--topic is limited to $MAX_TOPIC_CHARS characters; use a short label and put the detailed request in --file. No exchange was created"
 }
 trim() { printf '%s' "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//'; }
 # Header block of prompt.md / response.md = the lines before the first blank line
@@ -340,7 +359,7 @@ cmd_new() {
     done
     [ -z "$parent" ] || require_id "$parent"
     [ -n "$topic" ] || die "new requires --topic TOPIC"
-    safe_value "--topic" "$topic"; safe_value "--target" "$target"; safe_value "--requester" "$requester"
+    validate_topic "$topic"; safe_value "--target" "$target"; safe_value "--requester" "$requester"
     local slug
     slug="$(printf '%s' "$topic" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60)"
     [ -n "$slug" ] || slug="exchange"
@@ -454,6 +473,10 @@ claude_effort_levels() { # bin -> space-separated levels from the live CLI's --h
     return 0
 }
 
+claude_supports_safe_mode() { # bin -> current headless contract is available
+    "$1" --help 2>/dev/null | grep -q -- '--safe-mode'
+}
+
 new_session_uuid() { python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || uuidgen 2>/dev/null; }
 
 build_responder_argv() { # arrayname id write_mode model effort session_mode session_arg max_turns
@@ -462,7 +485,14 @@ build_responder_argv() { # arrayname id write_mode model effort session_mode ses
     local -n _argv="$1"
     local bin="${SECONDOPINION_CLAUDE:-claude}" prompt
     prompt="$(responder_prompt "$2")" || return 1
-    _argv=("$bin" -p "$prompt" --max-turns "${8:-${SECONDOPINION_MAX_TURNS:-60}}" --output-format json)
+    # stream-json is diagnostic only: response.md remains the hash-validated authority.
+    # Unlike one terminal JSON object, streaming lets the foreground supervisor prove
+    # liveness and report the last tool/action during a long request.
+    # Safe mode keeps a headless exchange deterministic: no user hooks, plugins,
+    # auto-memory, or automatic CLAUDE.md discovery run during startup. The sealed
+    # prompt still explicitly requires repository policy files to be read.
+    _argv=("$bin" -p "$prompt" --safe-mode --output-format stream-json --verbose)
+    [ -n "${8:-}" ] && _argv+=(--max-turns "$8")
     case "${6:-}" in
         persist) _argv+=(--session-id "$7");;
         resume)  _argv+=(--resume "$7");;
@@ -478,15 +508,154 @@ build_responder_argv() { # arrayname id write_mode model effort session_mode ses
     [ -n "${5:-}" ] && _argv+=(--effort "$5")
     return 0
 }
+
+progress_snapshot() { # stream-json log byte-offset prior-summary -> "new-offset<TAB>new-events<TAB>last action"
+    # Parse only bytes appended since the prior sample. Retain an incomplete final
+    # line for the next pass so long streams remain O(total log size), not O(n^2).
+    python3 - "$1" "$2" "$3" 2>/dev/null <<'PYEOF'
+import json, sys
+
+count = 0
+summary = sys.argv[3] or "starting"
+offset = int(sys.argv[2])
+try:
+    stream = open(sys.argv[1], "rb")
+    stream.seek(offset)
+    data = stream.read()
+except OSError:
+    data = b""
+
+complete = data.rfind(b"\n") + 1
+chunk = data[:complete]
+new_offset = offset + complete
+
+def clean(value):
+    text = " ".join(str(value).split())
+    return text.replace("\t", " ").replace("|", "/")[:160]
+
+for raw_bytes in chunk.splitlines():
+    raw = raw_bytes.decode("utf-8", errors="replace")
+    try:
+        event = json.loads(raw)
+    except Exception:
+        continue
+    if not isinstance(event, dict):
+        continue
+    count += 1
+    etype = event.get("type")
+    if etype == "system" and event.get("subtype") == "init":
+        summary = "initialized model " + clean(event.get("model", "unknown"))
+    elif etype == "assistant":
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        tool = next((item for item in reversed(content)
+                     if isinstance(item, dict) and item.get("type") == "tool_use"), None)
+        if tool:
+            name = clean(tool.get("name", "tool"))
+            inp = tool.get("input") if isinstance(tool.get("input"), dict) else {}
+            detail = inp.get("command") or inp.get("file_path") or inp.get("path") or inp.get("pattern") or ""
+            summary = "tool " + name + ((": " + clean(detail)) if detail else "")
+        elif content:
+            summary = "Claude produced an assistant update"
+    elif etype == "user":
+        # A tool result proves activity but should not erase the more useful
+        # preceding tool name/command from the operator-facing progress line.
+        pass
+    elif etype == "result":
+        summary = "terminal result " + clean(event.get("terminal_reason") or event.get("subtype") or "received")
+
+print(f"{new_offset}\t{count}\t{clean(summary)}")
+PYEOF
+}
+
+monitor_foreground_progress() { # dir id pid starttime started_epoch primary hard mode log run-id
+    local dir="$1" id="$2" pid="$3" st0="$4" started="$5" primary="$6" hard="$7" mode="$8" log="$9" run_id="${10}"
+    local now elapsed mtime activity_age snap delta summary state sleeper="" notice="" offset=0 events=0 nap
+    # Bash defers a TERM trap while waiting for a foreground sleep. Keep sleep as a
+    # child we can kill from the trap, otherwise every quick ask would wait out the
+    # entire progress interval while shutting its monitor down.
+    trap '[ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null || true; exit 0' TERM INT
+    while [ -n "$(proc_start "$pid")" ] && [ "$(proc_start "$pid")" = "$st0" ]; do
+        now="$(epoch)"; elapsed=$((now - started))
+        mtime="$(stat -c %Y "$log" 2>/dev/null || echo "$started")"
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime="$started"
+        activity_age=$((now - mtime)); [ "$activity_age" -ge 0 ] || activity_age=0
+        snap="$(progress_snapshot "$log" "$offset" "${summary:-starting}")" || snap="$offset"$'\t0\tprogress parser unavailable'
+        IFS=$'\t' read -r offset delta summary <<< "$snap"
+        [ -n "$offset" ] || offset=0; [ -n "$delta" ] || delta=0; events=$((events + delta)); [ -n "$summary" ] || summary="starting"
+        state="$(meta_get "$dir" state)"
+        if lock "$dir" 2>/dev/null; then
+            [ "$(meta_get "$dir" responder_run_id)" = "$run_id" ] || { unlock; return 0; }
+            meta_set "$dir" responder_heartbeat_utc "$(now_utc)" responder_heartbeat_epoch "$now" \
+                responder_activity_epoch "$mtime" responder_activity "$summary" responder_event_count "$events"
+            if [ "$elapsed" -ge "$primary" ] && [ -z "$(meta_get "$dir" deadline_notice_utc)" ]; then
+                notice="$(now_utc)"
+                meta_set "$dir" deadline_notice_utc "$notice" deadline_notice_epoch "$now"
+            fi
+            unlock
+        fi
+        if [ "$elapsed" -ge "$hard" ]; then
+            if [ "$mode" = verbose ]; then
+                printf '[secondopinion] exchange=%s elapsed=%ss phase=terminating final-kill-within=%ss state=%s events=%s activity_age=%ss last=%s\n' \
+                    "$id" "$elapsed" "$KILL_AFTER_SECS" "$state" "$events" "$activity_age" "$summary" >&2
+            else
+                printf 'Claude reached its work deadline — terminating; waiting for shutdown.\n' >&2
+            fi
+        elif [ "$mode" = verbose ]; then
+            printf '[secondopinion] exchange=%s elapsed=%ss primary=%ss work-deadline=%ss state=%s events=%s activity_age=%ss last=%s\n' \
+                "$id" "$elapsed" "$primary" "$hard" "$state" "$events" "$activity_age" "$summary" >&2
+        else
+            printf 'Claude is still working — %s elapsed; waiting for results.\n' "$(human_age "$elapsed")" >&2
+        fi
+        # Wake exactly at the work deadline when it is sooner than the normal
+        # reporting interval. Otherwise a 60s tick could skip the entire 10s
+        # TERM-to-KILL phase and leave "still working" as the final live status.
+        nap="$PROGRESS_SECS"
+        if [ "$elapsed" -lt "$hard" ] && [ $((hard - elapsed)) -lt "$nap" ]; then nap=$((hard - elapsed)); fi
+        [ "$nap" -ge 1 ] || nap=1
+        sleep "$nap" & sleeper=$!
+        wait "$sleeper" 2>/dev/null || true
+        sleeper=""
+    done
+    return 0
+}
+
+recover_finished_headless_claim() { # dir id run-id reason -> released|answered|unchanged|blocked
+    local dir="$1" id="$2" run_id="$3" reason="$4" state owner
+    lock "$dir"
+    state="$(meta_get "$dir" state)"
+    [ "$state" = "claimed" ] || { unlock; echo unchanged; return 0; }
+    if [ -e "$dir/response.md" ] || [ -L "$dir/response.md" ]; then
+        if regular "$dir/response.md" && [ "$(prompt_ok "$dir")" = "yes" ] \
+           && ( validate_response_file "$dir/response.md" "$id" ) >/dev/null 2>&1; then
+            finalize_response "$dir"; meta_set "$dir" responder_outcome answered-after-run-exit
+            unlock; echo answered; return 0
+        fi
+        meta_set "$dir" responder_outcome "${reason}-blocked-invalid-response"
+        unlock; echo blocked; return 0
+    fi
+    if [ -z "$run_id" ] || [ "$(meta_get "$dir" claim_run_id)" != "$run_id" ]; then
+        meta_set "$dir" responder_outcome "${reason}-foreign-claim-preserved"
+        unlock; echo unchanged; return 0
+    fi
+    [ -L "$dir/claim" ] && { meta_set "$dir" responder_outcome "${reason}-blocked-symlinked-claim"; unlock; echo blocked; return 0; }
+    owner="$(meta_get "$dir" claimed_by)"
+    rm -rf -- "$dir/claim" || { meta_set "$dir" responder_outcome "${reason}-claim-remove-failed"; unlock; echo blocked; return 0; }
+    meta_set "$dir" state published previous_claimant "$owner" claimed_by "" claimed_utc "" claimed_epoch "" \
+        claim_run_id "" claim_released_utc "$(now_utc)" claim_release_reason "$reason" responder_outcome "$reason"
+    unlock; echo released
+}
 cmd_ask() {
-    local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 background=0 model="" json=""
-    local effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}" maxturns="" attach=""
+    local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 model="" json=""
+    local grace="${SECONDOPINION_ASK_GRACE:-}" effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}" maxturns="" attach=""
+    local progress_mode="$PROGRESS_MODE"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
             --file) [ "$#" -ge 2 ] || die "--file requires a value"; file="$2"; shift 2;;
             --task) [ "$#" -ge 2 ] || die "--task requires a value"; task="$2"; shift 2;;
             --timeout) [ "$#" -ge 2 ] || die "--timeout requires seconds"; timeout="$2"; shift 2;;
+            --grace) [ "$#" -ge 2 ] || die "--grace requires seconds"; grace="$2"; shift 2;;
             --model) [ "$#" -ge 2 ] || die "--model requires a value"; model="$2"; shift 2;;
             --effort) [ "$#" -ge 2 ] || die "--effort requires a level"; effort="$2"; shift 2;;
             --max-turns) [ "$#" -ge 2 ] || die "--max-turns requires a count"; maxturns="$2"; shift 2;;
@@ -496,7 +665,8 @@ cmd_ask() {
             --persist) persist=1; shift;;
             --fresh) fresh=1; shift;;
             --write) write=1; shift;;
-            --background) background=1; shift;;
+            --background) die "--background was removed because detached responders do not survive Codex's sandbox; keep this foreground command alive. No exchange was created";;
+            --verbose-progress) progress_mode=verbose; shift;;
             --json) json=1; shift;;
             -h|--help) usage; exit 0;;
             *) die "unknown ask option: $1";;
@@ -508,14 +678,30 @@ cmd_ask() {
             || die "--attach re-launches a responder for an EXISTING published exchange; it cannot be combined with --topic/--file/--task/--follow-up/--resume/--persist"
     else
         [ -n "$topic" ] || die "ask requires --topic TOPIC"
+        validate_topic "$topic"
         { [ -n "$file" ] && [ -z "$task" ]; } || { [ -z "$file" ] && [ -n "$task" ]; } || die "ask requires exactly one of --file REQ.md (or --file -) or --task TEXT"
+    fi
+    if [ -n "$task" ] && [ -z "$review_mode" ]; then
+        [ "${#task}" -le "$MAX_INLINE_TASK_CHARS" ] || die "--task is limited to $MAX_INLINE_TASK_CHARS characters so long-running terminal status cannot redisplay a large inline prompt; put detailed text in a private request file and use --file PATH. No exchange was created"
+        case "$task" in *$'\n'*|*$'\r'*) die "--task must be one line; put detailed text in a private request file and use --file PATH. No exchange was created";; esac
     fi
     timeout="$(parse_secs "--timeout" "$timeout")" || exit 1
     [ "$timeout" -gt 0 ] || die "ask --timeout must be at least 1 second (GNU timeout treats 0 as 'no limit'); no exchange was created"
+    if [ -z "$grace" ]; then
+        grace="$timeout"
+        [ "$grace" -le $((MAX_SECS - timeout)) ] || grace=$((MAX_SECS - timeout))
+    else
+        grace="$(parse_secs "--grace" "$grace")" || exit 1
+        [ "$grace" -le $((MAX_SECS - timeout)) ] || die "ask --timeout + --grace must not exceed $MAX_SECS seconds; no exchange was created"
+    fi
+    local hard_timeout=$((timeout + grace))
     [ -z "$model" ] || safe_value "--model" "$model"
+    [ -n "$maxturns" ] || maxturns="${SECONDOPINION_MAX_TURNS:-}"
     [ -z "$maxturns" ] || { maxturns="$(parse_count "--max-turns" "$maxturns")" || exit 1; }
     local bin="${SECONDOPINION_CLAUDE:-claude}"
     command -v -- "$bin" >/dev/null 2>&1 || die "responder binary '$bin' not found (install the 'claude' CLI so it is on PATH, or set SECONDOPINION_CLAUDE); no exchange was created"
+    claude_supports_safe_mode "$bin" \
+        || die "responder CLI '$bin' does not support --safe-mode; update Claude Code before using the headless plugin. No exchange was created"
     local skill_file; skill_file="$(respond_skill_file)" || die "cannot resolve this CLI's own path; no exchange was created"
     { [ -f "$skill_file" ] && [ -r "$skill_file" ]; } || die "respond instructions missing or unreadable: $skill_file — the CLI must run from (or be symlinked into) its checkout; re-run plugins/secondopinion/scripts/install.sh. No exchange was created"
     if [ -n "$effort" ]; then
@@ -557,11 +743,12 @@ cmd_ask() {
         session_mode="persist"; session_arg="$(new_session_uuid)"
         printf '%s' "$session_arg" | grep -Eq '^[0-9a-f-]{36}$' || die "could not generate a session id (python3 or uuidgen required for --persist)"
     fi
-    local id dir
+    local id dir attach_arbitration=""
     if [ -n "$attach" ]; then
         [ -L "$EXCH/$attach" ] && die "refusing symlinked exchange directory: $attach"
         is_active "$attach" || { is_archived "$attach" && die "exchange $attach is archived: secondopinion result $attach"; die "unknown exchange: $attach"; }
         dir="$EXCH/$attach"; check_components "$dir"
+        lazy_reap_expired "$dir" "$attach"
         local astate; astate="$(meta_get "$dir" state)"
         case "$astate" in
             published) ;;
@@ -570,7 +757,13 @@ cmd_ask() {
             *) die "exchange $attach is not published (state=$astate); publish it first";;
         esac
         [ "$(prompt_ok "$dir")" = "yes" ] || die "exchange $attach prompt failed validation; refusing to attach a responder"
-        [ "$(responder_state "$dir")" = "running" ] && die "a responder for $attach is still running (pid $(meta_get "$dir" responder_pid)); attaching now would truncate its log and orphan it — cancel it first: secondopinion cancel $attach"
+        local attach_responder_state; attach_responder_state="$(responder_state "$dir")"
+        case "$attach_responder_state" in
+            launching)
+                die "a responder for $attach is still launching; attaching now would launch a duplicate worker — wait for status to leave launching";;
+            running|running-heartbeat)
+                die "a responder for $attach is still running (pid $(meta_get "$dir" responder_pid)); attaching now would launch a duplicate worker — wait for it or cancel it first: secondopinion cancel $attach";;
+        esac
         [ "$write" = 1 ] && [ -n "$(meta_get "$dir" review_mode)" ] && die "exchange $attach is a review exchange and reviews are read-only; --write is not allowed when attaching"
         [ -n "${SECONDOPINION_TEST_ATTACH_PAUSE:-}" ] && sleep "$SECONDOPINION_TEST_ATTACH_PAUSE"
         id="$attach"
@@ -613,14 +806,21 @@ $parent_resp_txt
     fi
     # Responder in the checkout the exchange records (or the cwd for non-git requests).
     local repo; repo="$(meta_get "$dir" repo)"; [ -d "$repo" ] || repo="$PWD"
+    local argv=() run_id
+    run_id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ "$run_id" =~ ^[0-9a-f]{32}$ ]] || die "could not generate a responder run id"
     mkdir -p "$STORE/responder-logs"; chmod 700 "$STORE/responder-logs"
-    RESPONDER_LOG="$STORE/responder-logs/$id.log"
-    local argv=(); build_responder_argv argv "$id" "$write" "$model" "$effort" "$session_mode" "$session_arg" "$maxturns" || die "could not build the responder command (respond instructions unreadable)"
+    RESPONDER_LOG="$STORE/responder-logs/$id.$run_id.log"
+    build_responder_argv argv "$id" "$write" "$model" "$effort" "$session_mode" "$session_arg" "$maxturns" || die "could not build the responder command (respond instructions unreadable)"
     if [ -n "${SECONDOPINION_CLAUDE_ARGS:-}" ]; then
         # Word-split deliberately, but via read -a so glob characters are never expanded
         # against the responder's cwd.
         local extra=(); read -r -a extra <<<"${SECONDOPINION_CLAUDE_ARGS}"; argv+=("${extra[@]}")
     fi
+    local ask_started hard_deadline final_kill_epoch reap_after_epoch responder_ns
+    ask_started="$(epoch)"; hard_deadline=$((ask_started + hard_timeout))
+    final_kill_epoch=$((hard_deadline + KILL_AFTER_SECS)); reap_after_epoch=$((final_kill_epoch + REAP_SLACK_SECS))
+    responder_ns="$(pid_namespace)"
     lock "$dir"
     if [ -n "$attach" ]; then
         # Re-check under the lock: a claim can land between the unlocked validation above
@@ -628,76 +828,105 @@ $parent_resp_txt
         # the winner's responder_mode/log records.
         local attach_state; attach_state="$(meta_get "$dir" state)"
         [ "$attach_state" = "published" ] || { unlock; die "exchange $attach is no longer published (state=$attach_state); another responder got there first"; }
+        # Re-check liveness while holding the exchange lock. A heartbeat may have
+        # landed after the earlier probe. A stale foreign namespace cannot be
+        # signalled safely; explicit attach arbitrates recovery by retaining its
+        # complete identity and immutable log before installing the replacement.
+        local locked_responder_state previous_reason=""; locked_responder_state="$(responder_state "$dir")"
+        case "$locked_responder_state" in
+            launching)
+                unlock
+                die "a responder for $attach became launch-reserved while attach was starting; no duplicate was launched — wait for status to leave launching";;
+            running|running-heartbeat)
+                unlock
+                die "a responder for $attach became live while attach was starting; no duplicate was launched — wait for it or cancel it first: secondopinion cancel $attach";;
+            unknown-foreign-namespace)
+                previous_reason="stale-foreign-replacement";;
+            exited|cancelled)
+                [ -n "$(meta_get "$dir" responder_run_id)" ] && previous_reason="${locked_responder_state}-responder-replacement";;
+        esac
+        if [ -n "$previous_reason" ]; then
+            attach_arbitration="$previous_reason"
+            meta_set "$dir" previous_responder_run_id "$(meta_get "$dir" responder_run_id)" \
+                previous_responder_pid "$(meta_get "$dir" responder_pid)" \
+                previous_responder_starttime "$(meta_get "$dir" responder_starttime)" \
+                previous_responder_namespace "$(meta_get "$dir" responder_namespace)" \
+                previous_responder_log "$(meta_get "$dir" responder_log)" \
+                previous_responder_heartbeat_epoch "$(meta_get "$dir" responder_heartbeat_epoch)" \
+                previous_responder_replaced_utc "$(now_utc)" attach_arbitration "$attach_arbitration"
+        else
+            meta_set "$dir" previous_responder_run_id "" previous_responder_pid "" \
+                previous_responder_starttime "" previous_responder_namespace "" \
+                previous_responder_log "" previous_responder_heartbeat_epoch "" \
+                previous_responder_replaced_utc "" attach_arbitration ""
+        fi
     fi
-    meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" ask_started_utc "$(now_utc)"
+    meta_set "$dir" responder_mode headless responder_log "$RESPONDER_LOG" responder_run_id "$run_id" \
+        responder_pid "" responder_starttime "" \
+        ask_started_utc "$(now_utc)" ask_started_epoch "$ask_started" responder_finished_utc "" \
+        responder_finished_epoch "" responder_exit_code "" responder_cancelled_utc "" responder_completion "" \
+        responder_outcome running responder_heartbeat_utc "" responder_heartbeat_epoch "" \
+        responder_activity_epoch "" responder_activity starting responder_event_count 0 \
+        requested_timeout_secs "$timeout" requested_grace_secs "$grace" hard_timeout_secs "$hard_timeout" \
+        primary_deadline_epoch "$((ask_started + timeout))" hard_deadline_epoch "$hard_deadline" \
+        termination_grace_secs "$KILL_AFTER_SECS" final_kill_timeout_secs "$((hard_timeout + KILL_AFTER_SECS))" \
+        final_kill_epoch "$final_kill_epoch" reap_after_epoch "$reap_after_epoch" \
+        responder_heartbeat_interval_secs "$PROGRESS_SECS" \
+        deadline_notice_utc "" deadline_notice_epoch "" responder_namespace "$responder_ns"
     [ -n "$model" ] && meta_set "$dir" requested_model "$model"
     [ -n "$effort" ] && meta_set "$dir" requested_effort "$effort"
+    [ -n "$maxturns" ] && meta_set "$dir" requested_max_turns "$maxturns"
     [ -n "$review_mode" ] && meta_set "$dir" review_mode "$review_mode"
     case "$session_mode" in
         persist) meta_set "$dir" session_id "$session_arg" session_persist yes;;
         resume)  meta_set "$dir" session_id "$session_arg" session_persist yes;;
     esac
     unlock
-    if [ "$background" = 1 ]; then
-        local sandbox_init
-        if sandbox_init="$(in_ephemeral_sandbox)"; then
-            echo "WARNING: this shell runs inside a PID-namespaced sandbox (init='$sandbox_init'). A --background responder is detached from the shell but CANNOT survive the sandbox: it will be KILLED when the launching command's sandbox is torn down. Keep this session alive until the exchange is answered, use a foreground ask, or re-launch later with: secondopinion ask --attach $id" >&2
-            # Also on stdout as parseable keys: the caller is usually an agent that reads
-            # stdout key=value output and may never surface a stderr warning to its user.
-            echo "sandbox=pid-namespaced init='$sandbox_init'"
-            echo "sandbox_note=a --background responder dies with this sandbox; keep this shell alive until answered, or re-launch later with: secondopinion ask --attach $id"
-        fi
-        # INVARIANT: $! is claude's OWN pid only because this background subshell is not a
-        # process-group leader, so setsid(1) takes over IN PLACE (no fork). Putting job
-        # control or a wrapper between `&` and exec makes the recorded pid+starttime
-        # describe a dead intermediary and breaks responder_state and cancel's group kill.
-        # If the launch shape ever changes, have the child record its own pid instead.
-        ( cd -- "$repo" && exec setsid nohup "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
-        local bgpid=$! bgstart
-        bgstart="$(proc_start "$bgpid")"
-        lock "$dir"; meta_set "$dir" responder_pid "$bgpid" responder_starttime "${bgstart:-unknown}"; unlock
-        # Startup handshake (up to 2s): a responder that dies immediately without claiming
-        # or answering is a startup failure and must be reported as one, not as success.
-        local hs="running" hi=0 hstate
-        while [ "$hi" -lt 20 ]; do
-            if [ -z "$bgstart" ] || [ "$(proc_start "$bgpid")" != "$bgstart" ]; then
-                hstate="$(meta_get "$dir" state)"
-                case "$hstate" in answered|claimed) hs="finished";; *) hs="dead";; esac
-                break
-            fi
-            if [ -s "$RESPONDER_LOG" ] || [ "$(meta_get "$dir" state)" != "published" ]; then break; fi
-            sleep 0.1; hi=$((hi+1))
-        done
-        echo "exchange_id=$id"; echo "state=$(meta_get "$dir" state)"
-        if [ "$hs" = "dead" ]; then
-            echo "responder=startup-failed"; echo "responder_pid=$bgpid"; echo "responder_log=$RESPONDER_LOG"
-            echo "result=the responder exited within seconds without claiming or answering; inspect the log, then retry with: secondopinion ask --attach $id" >&2
-            return 1
-        fi
-        echo "responder=background"; echo "responder_pid=$bgpid"; echo "responder_log=$RESPONDER_LOG"
-        echo "next=secondopinion wait $id  &&  secondopinion read-response $id"
-        return 0
-    fi
-    local rc=0
+    local rc=0 started monitor_pid recovery="unchanged" outcome
     # Foreground runs also record the responder's identity so status/jobs in OTHER
     # sessions show real liveness (and cancel can reach it) while this ask is in flight.
-    ( cd -- "$repo" && exec timeout --kill-after=10 "$timeout" "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
+    started="$ask_started"
+    ( cd -- "$repo" && export SECONDOPINION_RUN_ID="$run_id" && exec timeout --kill-after="${KILL_AFTER_SECS}s" "$hard_timeout" "${argv[@]}" </dev/null >"$RESPONDER_LOG" 2>&1 ) &
     local fgpid=$! fgstart; fgstart="$(proc_start "$fgpid")"
     lock "$dir"; meta_set "$dir" responder_pid "$fgpid" responder_starttime "${fgstart:-unknown}"; unlock
-    wait "$fgpid" || rc=$?
+    monitor_foreground_progress "$dir" "$id" "$fgpid" "${fgstart:-unknown}" "$started" "$timeout" "$hard_timeout" "$progress_mode" "$RESPONDER_LOG" "$run_id" &
+    monitor_pid=$!
+    # Bash reports an asynchronously SIGKILLed job as `Killed (...)` from the
+    # wait builtin. The bounded timeout result below is the authoritative,
+    # actionable diagnostic; suppress only that shell-owned job notification.
+    wait "$fgpid" 2>/dev/null || rc=$?
+    kill "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then outcome="timeout"
+    else outcome="responder-exit-$rc-without-valid-answer"; fi
+    lock "$dir"; meta_set "$dir" responder_finished_utc "$(now_utc)" responder_finished_epoch "$(epoch)" \
+        responder_exit_code "$rc" responder_outcome "$outcome" responder_completion no-valid-answer; unlock
+    if [ "$(meta_get "$dir" state)" = "claimed" ]; then
+        recovery="$(recover_finished_headless_claim "$dir" "$id" "$run_id" "$outcome")"
+    fi
     local state; state="$(meta_get "$dir" state)"
     if [ -n "$model" ] || [ -n "$effort" ]; then record_realized_model "$dir" "$RESPONDER_LOG"; fi
     if [ "$state" = "answered" ] && [ "$(response_ok "$dir")" = "yes" ] && [ "$(prompt_ok "$dir")" = "yes" ]; then
+        lock "$dir"; meta_set "$dir" responder_outcome answered responder_completion validated-answer; unlock
         if [ -n "$json" ]; then emit_status "$dir" json; echo; else cat "$dir/response.md"; fi
         return 0
     fi
     echo "exchange_id=$id" >&2; echo "state=$state" >&2; echo "responder_log=$RESPONDER_LOG" >&2
-    local retry_hint="the exchange stays published and the launched responder is gone; retry with: secondopinion ask --attach $id  (or let any responder session answer it, then: secondopinion wait $id)"
-    [ "$state" = "claimed" ] && retry_hint="state=claimed: the responder claimed the exchange before dying, and its claim token is lost; if it published its response first, secondopinion result $id recovers it; otherwise after SECONDOPINION_STALE_CLAIM_SECS (default 1800) another responder can run: secondopinion claim $id --takeover --owner ..."
+    local retry_hint="the exchange is published and immediately retryable: secondopinion ask --attach $id"
+    [ "$recovery" = "released" ] && retry_hint="the failed responder's exact claim was safely released; retry immediately with: secondopinion ask --attach $id"
+    [ "$state" = "claimed" ] && retry_hint="state=claimed by a different or uncorrelated responder; its claim was preserved. If it published a response, secondopinion result $id recovers it; otherwise takeover is allowed only after SECONDOPINION_STALE_CLAIM_SECS"
+    [ "$recovery" = "blocked" ] && retry_hint="automatic claim recovery was blocked by an invalid response or unsafe claim object; inspect the exchange before retrying"
     if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-        printf '[secondopinion] responder killed by ask --timeout after %ss at %s\n' "$timeout" "$(now_utc)" >> "$RESPONDER_LOG" 2>/dev/null || true
-        echo "result=timeout after ${timeout}s; $retry_hint" >&2
+        local events activity_epoch activity_age now
+        events="$(meta_get "$dir" responder_event_count)"; activity_epoch="$(meta_get "$dir" responder_activity_epoch)"; now="$(epoch)"
+        if [[ "$activity_epoch" =~ ^[0-9]+$ ]]; then activity_age=$((now - activity_epoch)); else activity_age="unknown"; fi
+        printf '[secondopinion] responder reached work deadline after %ss; bounded termination completed with rc=%s (primary=%ss grace=%ss final-kill-within=%ss events=%s activity_age=%ss) at %s\n' \
+            "$hard_timeout" "$rc" "$timeout" "$grace" "$KILL_AFTER_SECS" "${events:-0}" "$activity_age" "$(now_utc)" >> "$RESPONDER_LOG" 2>/dev/null || true
+        echo "result=work deadline reached after ${hard_timeout}s (primary=${timeout}s grace=${grace}s events=${events:-0} last_activity_age=${activity_age}s); bounded termination completed (final SIGKILL no later than ${KILL_AFTER_SECS}s after that deadline); $retry_hint" >&2
         return 124
+    fi
+    if grep -Eqi 'authentication_failed|OAuth access token has expired|API Error: 401' "$RESPONDER_LOG" 2>/dev/null; then
+        die "Claude authentication failed in the headless responder. Run 'claude auth login' in a normal terminal, then retry this exact exchange with: secondopinion ask --attach $id"
     fi
     die "responder exited $rc without a valid answer; see the log above; $retry_hint"
 }
@@ -732,7 +961,7 @@ REVIEW_CONTRACT='At the END of the response add a fenced ```json block with EXAC
 cmd_review() {
     # Dedicated review interface: composes a review charter + target scope + structured
     # output contract, then delegates to `ask`. Reviews are strictly read-only.
-    local adversarial=0 base="" topic="" focus="" pass=()
+    local adversarial=0 base="" topic="" focus="" focus_file="" pass=()
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --adversarial) adversarial=1; shift;;
@@ -740,13 +969,23 @@ cmd_review() {
             --scope) [ "$#" -ge 2 ] || die "--scope requires working-tree"; [ "$2" = "working-tree" ] || die "unknown --scope '$2' (working-tree, or use --base REF)"; shift 2;;
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
             --task) [ "$#" -ge 2 ] || die "--task requires a value"; focus="$2"; shift 2;;
+            --file) [ "$#" -ge 2 ] || die "--file requires a value"; focus_file="$2"; shift 2;;
             --write) die "reviews are read-only; --write is not available under 'review' (use plain 'ask --write' for a task that must edit)";;
-            --timeout|--model|--effort|--max-turns|--follow-up|--resume) [ "$#" -ge 2 ] || die "$1 requires a value"; pass+=("$1" "$2"); shift 2;;
-            --background|--json|--persist|--fresh) pass+=("$1"); shift;;
-            -h|--help) echo "usage: review [--adversarial] [--base REF | --scope working-tree] [--task FOCUS] [--topic T] [ask options: --timeout --model --effort --background --json --persist --follow-up ID --resume ID]"; exit 0;;
+            --timeout|--grace|--model|--effort|--max-turns|--follow-up|--resume) [ "$#" -ge 2 ] || die "$1 requires a value"; pass+=("$1" "$2"); shift 2;;
+            --background) die "review --background was removed because detached responders do not survive Codex's sandbox; keep this foreground command alive. No exchange was created";;
+            --verbose-progress|--json|--persist|--fresh) pass+=("$1"); shift;;
+            -h|--help) echo "usage: review [--adversarial] [--base REF | --scope working-tree] [--task SHORT_FOCUS | --file FOCUS.md] [--topic T] [ask options: --timeout --grace --model --effort --verbose-progress --json --persist --follow-up ID --resume ID]"; exit 0;;
             *) die "unknown review option: $1";;
         esac
     done
+    [ -z "$focus" ] || [ -z "$focus_file" ] || die "review accepts only one of --task or --file"
+    if [ -n "$focus_file" ]; then
+        regular "$focus_file" || die "review focus file missing or not a regular file: $focus_file"
+        focus="$(cat -- "$focus_file")"; [ -n "$(trim "$focus")" ] || die "review focus file is empty"
+    elif [ -n "$focus" ]; then
+        [ "${#focus}" -le "$MAX_INLINE_TASK_CHARS" ] || die "review --task is limited to $MAX_INLINE_TASK_CHARS characters; put detailed focus text in a private file and use review --file PATH"
+        case "$focus" in *$'\n'*|*$'\r'*) die "review --task must be one line; put detailed focus text in a private file and use review --file PATH";; esac
+    fi
     git -C "$PWD" rev-parse --git-dir >/dev/null 2>&1 || die "review must run inside the git checkout to be reviewed"
     if [ -n "$base" ]; then
         safe_value "--base" "$base"
@@ -864,9 +1103,12 @@ emit_status() { # dir [json]
         printf ',"exchange_dir":%s,"prompt_ok":%s,"response_ok":%s,"response_present":%s' \
             "$(json_str "$dir")" "$(json_str "$pok")" "$(json_str "$rok")" "$( [ -e "$dir/response.md" ] && echo '"yes"' || echo '"no"')"
         [ -n "$cage" ] && printf ',"claim_age_secs":%s' "$cage"
-        local ce rstate; ce="$(meta_get "$dir" created_epoch)"; rstate="$(responder_state "$dir")"
+        local ce rstate hbe aep now; ce="$(meta_get "$dir" created_epoch)"; rstate="$(responder_state "$dir")"
+        hbe="$(meta_get "$dir" responder_heartbeat_epoch)"; aep="$(meta_get "$dir" responder_activity_epoch)"; now="$(epoch)"
         [ -n "$ce" ] && printf ',"elapsed_secs":%s' "$(json_str "$(( $(epoch) - ce ))")"
         [ -n "$rstate" ] && printf ',"responder_status":%s' "$(json_str "$rstate")"
+        [[ "$hbe" =~ ^[0-9]+$ ]] && printf ',"heartbeat_age_secs":%s' "$(( now - hbe ))"
+        [[ "$aep" =~ ^[0-9]+$ ]] && printf ',"activity_age_secs":%s' "$(( now - aep ))"
         printf '}'
     else
         cat "$dir/meta"
@@ -880,19 +1122,24 @@ emit_status() { # dir [json]
     return 0
 }
 
-status_extras() { # dir state -> elapsed, responder liveness, and a next-action hint
-    local dir="$1" state="$2" ce rstate id
+status_extras() { # dir state -> elapsed, responder liveness, activity ages, and a next-action hint
+    local dir="$1" state="$2" ce rstate id hbe aep now
     ce="$(meta_get "$dir" created_epoch)"
     [ -n "$ce" ] && echo "elapsed_secs=$(( $(epoch) - ce ))"
     rstate="$(responder_state "$dir")"
     [ -n "$rstate" ] && echo "responder_status=$rstate"
+    now="$(epoch)"; hbe="$(meta_get "$dir" responder_heartbeat_epoch)"; aep="$(meta_get "$dir" responder_activity_epoch)"
+    [[ "$hbe" =~ ^[0-9]+$ ]] && echo "heartbeat_age_secs=$(( now - hbe ))"
+    [[ "$aep" =~ ^[0-9]+$ ]] && echo "activity_age_secs=$(( now - aep ))"
     id="$(meta_get "$dir" exchange_id)"
     case "$state" in
         draft)     echo "next=edit the Task section of prompt.md, then: secondopinion publish $id";;
-        published) if [ "$rstate" = "running" ]; then echo "next=responder running: secondopinion wait $id  (or: secondopinion cancel $id)"
+        published) if [ "$rstate" = "launching" ]; then echo "next=responder launching: secondopinion wait $id"
+                   elif [ "$rstate" = "running" ] || [ "$rstate" = "running-heartbeat" ]; then echo "next=responder running: secondopinion wait $id  (or: secondopinion cancel $id)"
                    elif [ "$rstate" = "exited" ] || [ "$rstate" = "cancelled" ]; then echo "next=responder $rstate without answering; inspect $(meta_get "$dir" responder_log); retry with: secondopinion ask --attach $id  (or any responder session, then: secondopinion wait $id)"
                    else echo "next=waiting for a responder: secondopinion wait $id"; fi;;
-        claimed)   echo "next=claimed by $(meta_get "$dir" claimed_by); if stale (>SECONDOPINION_STALE_CLAIM_SECS), another responder may run: secondopinion claim $id --takeover --owner ...";;
+        claimed)   if [ "$rstate" = "launching" ] || [ "$rstate" = "running" ] || [ "$rstate" = "running-heartbeat" ]; then echo "next=responder active; last=$(meta_get "$dir" responder_activity); wait: secondopinion wait $id"
+                   else echo "next=claimed by $(meta_get "$dir" claimed_by); if stale (>SECONDOPINION_STALE_CLAIM_SECS), another responder may run: secondopinion claim $id --takeover --owner ..."; fi;;
         answered)  echo "next=secondopinion result $id   then: secondopinion archive $id";;
         archived)  echo "next=archived (read: secondopinion result $id)";;
     esac
@@ -904,6 +1151,7 @@ cmd_status() {
     while [ "$#" -gt 0 ]; do case "$1" in --json) json=1;; -h|--help) usage; exit 0;; *) positional id "$1";; esac; shift; done
     [ -n "$id" ] || die "usage: status ID [--json]"
     local dir; dir="$(exdir "$id")"
+    lazy_reap_expired "$dir" "$id"
     emit_status "$dir" "$json"; [ -n "$json" ] && echo
     return 0
 }
@@ -914,7 +1162,14 @@ cmd_show() {
     [ "$#" -eq 1 ] || die "usage: show ID"
     local dir; dir="$(exdir "$1")"
     regular "$dir/prompt.md" || die "prompt.md missing or not a regular file"
-    cat "$dir/prompt.md"
+    if [ "$(meta_get "$dir" state)" = draft ]; then
+        cat "$dir/prompt.md"
+        return 0
+    fi
+    [ "$(prompt_ok "$dir")" = yes ] \
+        || die "prompt.md failed published hash/header validation; refusing to show untrusted content"
+    emit_validated "$dir" prompt.md prompt_sha256 \
+        || die "prompt.md changed while being validated; refusing to show untrusted content"
 }
 
 cmd_list() {
@@ -942,8 +1197,9 @@ cmd_list() {
     for d in "${dirs[@]}"; do
         [ -f "$d/meta" ] && [ ! -L "$d/meta" ] || continue
         local id state common
-        id="$(meta_get "$d" exchange_id)"; state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
-        valid_id "$id" || continue
+        id="$(meta_get "$d" exchange_id)"; valid_id "$id" || continue
+        case "$d" in "$EXCH"/*) lazy_reap_expired "$d" "$id";; esac
+        state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
         case "$filter" in
             pending)  case "$state" in published|claimed) ;; *) continue;; esac; [ "$(prompt_ok "$d")" = "yes" ] || continue;;
             answered) [ "$state" = "answered" ] || continue;;
@@ -965,7 +1221,7 @@ cmd_list() {
 }
 
 cmd_claim() {
-    local id="" owner="${SECONDOPINION_OWNER:-${USER:-user}@$(hostname)}" takeover=0
+    local id="" owner="${SECONDOPINION_OWNER:-${USER:-user}@$(hostname)}" takeover=0 run_id="${SECONDOPINION_RUN_ID:-}"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --owner) [ "$#" -ge 2 ] || die "--owner requires a value"; owner="$2"; shift;;
@@ -976,11 +1232,30 @@ cmd_claim() {
     done
     [ -n "$id" ] || die "usage: claim ID [--owner NAME] [--takeover]"
     safe_value "--owner" "$owner"; owner="$(trim "$owner")"; [ -n "$owner" ] || die "--owner must not be empty"
+    [ -z "$run_id" ] || [[ "$run_id" =~ ^[0-9a-f]{32}$ ]] || die "SECONDOPINION_RUN_ID is malformed"
     local dir; dir="$(active_dir "$id")"
     lock "$dir"
     local state; state="$(meta_get "$dir" state)"
     case "$state" in
         published)
+            # `ask` reserves a cryptographic run ID before it launches Claude.
+            # Only that child inherits the matching SECONDOPINION_RUN_ID. Refuse
+            # an interactive/manual responder while the reservation is live so
+            # it cannot steal the claim, waste the foreground run, and park the
+            # exchange behind the stale-claim timeout.
+            local active_run active_state
+            active_run="$(meta_get "$dir" responder_run_id)"
+            active_state="$(responder_state "$dir")"
+            if [ -n "$active_run" ] && [ "$run_id" != "$active_run" ]; then
+                case "$active_state" in
+                    launching)
+                        unlock
+                        die "a foreground responder is being launched for $id; refusing a competing claim. Wait for it to answer, or inspect it with: secondopinion status $id";;
+                    running|running-heartbeat)
+                        unlock
+                        die "a foreground responder is already running for $id; refusing a competing claim. Wait for it to answer, or inspect/cancel it with: secondopinion status $id / secondopinion cancel $id";;
+                esac
+            fi
             # An orphan claim/ (crash after mkdir, before meta) must not block a fresh claim.
             if [ -e "$dir/claim" ] || [ -L "$dir/claim" ]; then
                 [ -L "$dir/claim" ] && { unlock; die "refusing symlinked claim in $id"; }
@@ -1013,7 +1288,7 @@ cmd_claim() {
     local token; token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
     if ! { printf '%s\n' "$token" > "$dir/claim/token" && printf '%s\n' "$owner" > "$dir/claim/owner" \
            && chmod 600 "$dir/claim/token" "$dir/claim/owner" \
-           && meta_set "$dir" state claimed claimed_by "$owner" claimed_utc "$(now_utc)" claimed_epoch "$(epoch)"; }; then
+           && meta_set "$dir" state claimed claimed_by "$owner" claimed_utc "$(now_utc)" claimed_epoch "$(epoch)" claim_run_id "$run_id"; }; then
         rm -rf "$dir/claim"; unlock; die "claim could not be recorded (I/O failure); nothing was claimed"
     fi
     unlock
@@ -1143,7 +1418,7 @@ cmd_wait() {
         [ -L "$EXCH/$id" ] || [ -L "$ARCH/$id" ] && die "refusing symlinked exchange directory: $id"
         if is_archived "$id"; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
         is_active "$id" || die "unknown exchange: $id"
-        dir="$EXCH/$id"; check_components "$dir"; state="$(meta_get "$dir" state)"
+        dir="$EXCH/$id"; check_components "$dir"; lazy_reap_expired "$dir" "$id"; state="$(meta_get "$dir" state)"
         if [ "$state" = "archived" ]; then echo "exchange_id=$id"; echo "state=archived"; return 2; fi
         if [ "$state" = "claimed" ] && [ -e "$dir/response.md" ] && [ ! -L "$dir/response.md" ]; then
             if try_rollforward "$dir" "$id"; then state="$(meta_get "$dir" state)"; fi
@@ -1162,9 +1437,13 @@ cmd_wait() {
     done
 }
 
-in_ephemeral_sandbox() { # prints /proc/1/comm and succeeds when PID 1 is not a real init
-    local c; c="${SECONDOPINION_TEST_PID1_COMM:-$(cat /proc/1/comm 2>/dev/null)}"
-    case "$c" in systemd|init) return 1;; "") return 1;; *) printf '%s\n' "$c"; return 0;; esac
+pid_namespace() {
+    readlink /proc/self/ns/pid 2>/dev/null || printf '%s\n' unknown
+}
+
+same_responder_namespace() { # dir -> true when it is safe to interpret/kill the recorded pid
+    local recorded; recorded="$(meta_get "$1" responder_namespace)"
+    [ -z "$recorded" ] || [ "$recorded" = unknown ] || [ "$recorded" = "$(pid_namespace)" ]
 }
 
 proc_start() { # pid -> kernel start time in clock ticks, or "" if no such process
@@ -1174,14 +1453,70 @@ proc_start() { # pid -> kernel start time in clock ticks, or "" if no such proce
     set -- $st; printf '%s\n' "${20:-}"
 }
 
-responder_state() { # dir -> running|cancelled|exited|"" (no background responder recorded)
-    local pid st0 cur
-    pid="$(meta_get "$1" responder_pid)"; [ -n "$pid" ] || { echo ""; return 0; }
+responder_state() { # dir -> launching|running|running-heartbeat|unknown-foreign-namespace|cancelled|exited|""
+    local pid st0 cur finished cancelled heartbeat interval stale now age outcome run started
+    finished="$(meta_get "$1" responder_finished_epoch)"
+    cancelled="$(meta_get "$1" responder_cancelled_utc)"
+    if [ -n "$cancelled" ]; then echo cancelled; return 0
+    elif [ -n "$finished" ]; then echo exited; return 0; fi
+    pid="$(meta_get "$1" responder_pid)"
+    if [ -z "$pid" ]; then
+        outcome="$(meta_get "$1" responder_outcome)"; run="$(meta_get "$1" responder_run_id)"
+        if [ "$outcome" = running ] && [ -n "$run" ]; then
+            started="$(meta_get "$1" ask_started_epoch)"; now="$(epoch)"
+            if [[ "$started" =~ ^[0-9]+$ ]] && [ $((now - started)) -ge "$LAUNCH_STALE_SECS" ]; then echo exited
+            else echo launching; fi
+        else
+            echo ""
+        fi
+        return 0
+    fi
     st0="$(meta_get "$1" responder_starttime)"
-    cur="$(proc_start "$pid")"
-    if [ -n "$cur" ] && [ "$cur" = "$st0" ]; then echo "running"
-    elif [ -n "$(meta_get "$1" responder_cancelled_utc)" ]; then echo "cancelled"
-    else echo "exited"; fi
+    heartbeat="$(meta_get "$1" responder_heartbeat_epoch)"
+    if ! same_responder_namespace "$1"; then
+        if [[ "$heartbeat" =~ ^[0-9]+$ ]]; then
+            interval="$(meta_get "$1" responder_heartbeat_interval_secs)"
+            if [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 1 ] && [ "$interval" -le 3600 ]; then
+                stale=$((interval * 3 + 5))
+            else
+                stale="$HEARTBEAT_STALE_SECS"
+            fi
+            now="$(epoch)"; age=$((now - heartbeat))
+            if [ "$age" -ge 0 ] && [ "$age" -le "$stale" ]; then echo "running-heartbeat"; return 0; fi
+        fi
+        echo "unknown-foreign-namespace"
+    else
+        cur="$(proc_start "$pid")"
+        if [ -n "$cur" ] && [ "$cur" = "$st0" ]; then echo "running"
+        else echo "exited"; fi
+    fi
+}
+
+lazy_reap_expired() { # dir id — recover after exit, never during timeout's TERM-to-KILL window
+    local dir="$1" id="$2" state hard final reap now run result rstate reason
+    state="$(meta_get "$dir" state)"; [ "$state" = claimed ] || return 0
+    hard="$(meta_get "$dir" hard_deadline_epoch)"; [[ "$hard" =~ ^[0-9]+$ ]] || return 0
+    now="$(epoch)"; [ "$now" -ge "$hard" ] || return 0
+    final="$(meta_get "$dir" final_kill_epoch)"
+    [[ "$final" =~ ^[0-9]+$ ]] || final=$((hard + KILL_AFTER_SECS))
+    reap="$(meta_get "$dir" reap_after_epoch)"
+    [[ "$reap" =~ ^[0-9]+$ ]] || reap=$((final + REAP_SLACK_SECS))
+    rstate="$(responder_state "$dir")"
+    case "$rstate" in
+        running|running-heartbeat|unknown-foreign-namespace)
+            [ "$now" -ge "$reap" ] || return 0
+            reason=final-kill-bound-expired;;
+        *) reason=work-deadline-expired;;
+    esac
+    run="$(meta_get "$dir" responder_run_id)"
+    result="$(recover_finished_headless_claim "$dir" "$id" "$run" "$reason")"
+    case "$result" in released|answered|blocked)
+        lock "$dir"
+        [ -n "$(meta_get "$dir" responder_finished_epoch)" ] || meta_set "$dir" \
+            responder_finished_utc "$(now_utc)" responder_finished_epoch "$now" responder_exit_code 124
+        unlock;;
+    esac
+    return 0
 }
 
 US=$'\x1f'   # field separator for prune bookkeeping; control bytes cannot appear in meta values
@@ -1344,16 +1679,41 @@ retention_note() { # git_common_dir -> stderr note when that archive bucket exce
     return 0
 }
 
-relocate_responder_log() { # id (archived) — move responder-logs/<id>.log into the archived
-    # exchange and point meta at it. Idempotent repair: also called on re-archive. A log
-    # problem must not fail the archive, but it is reported, never silent.
-    local id="$1" src="$STORE/responder-logs/$1.log" dst="$ARCH/$1/responder.log"
-    [ -f "$src" ] && [ ! -L "$src" ] || return 0
-    if mv -f -- "$src" "$dst" 2>/dev/null; then
-        chmod 600 "$dst" 2>/dev/null || true
-        lock "$ARCH/$id"; meta_set "$ARCH/$id" responder_log "$dst"; unlock
-    else
-        echo "note=responder log could not be moved into the archive; it remains at $src" >&2
+relocate_responder_log() { # id (archived) — preserve every per-run log inside the exchange
+    # Each attach has a unique log. Archive all of them without overwriting any earlier
+    # diagnostic, and repoint meta when the current run's log moves. Idempotent repair:
+    # also called on re-archive. A log problem is reported but does not fail the archive.
+    local id="$1" logdir="$STORE/responder-logs" dst_dir="$ARCH/$1/responder-logs"
+    local current previous src base dst candidate n moved_current="" moved_previous=""
+    current="$(meta_get "$ARCH/$id" responder_log)"
+    previous="$(meta_get "$ARCH/$id" previous_responder_log)"
+    if [ -e "$dst_dir" ] && ! real_dir "$dst_dir"; then
+        echo "note=responder logs could not be archived: unsafe destination $dst_dir" >&2
+        return 0
+    fi
+    mkdir -p "$dst_dir" 2>/dev/null || { echo "note=responder logs could not be archived: cannot create $dst_dir" >&2; return 0; }
+    chmod 700 "$dst_dir" 2>/dev/null || true
+    for src in "$logdir/$id.log" "$logdir/$id."*.log; do
+        [ -f "$src" ] && [ ! -L "$src" ] || continue
+        base="${src##*/}"; dst="$dst_dir/$base"
+        if [ -e "$dst" ]; then
+            n=2; candidate="$dst.$n"
+            while [ -e "$candidate" ]; do n=$((n + 1)); candidate="$dst.$n"; done
+            dst="$candidate"
+        fi
+        if mv -- "$src" "$dst" 2>/dev/null; then
+            chmod 600 "$dst" 2>/dev/null || true
+            [ "$current" = "$src" ] && moved_current="$dst"
+            [ "$previous" = "$src" ] && moved_previous="$dst"
+        else
+            echo "note=responder log could not be moved into the archive; it remains at $src" >&2
+        fi
+    done
+    if [ -n "$moved_current$moved_previous" ]; then
+        lock "$ARCH/$id"
+        [ -n "$moved_current" ] && meta_set "$ARCH/$id" responder_log "$moved_current"
+        [ -n "$moved_previous" ] && meta_set "$ARCH/$id" previous_responder_log "$moved_previous"
+        unlock
     fi
     return 0
 }
@@ -1362,12 +1722,14 @@ cmd_cancel() {
     [ "$#" -eq 1 ] || die "usage: cancel ID"
     local id="$1"; require_id "$id"
     local dir; dir="$(exdir "$id")"
+    lazy_reap_expired "$dir" "$id"
     local state pid st0
     lock "$dir"; state="$(meta_get "$dir" state)"; pid="$(meta_get "$dir" responder_pid)"; st0="$(meta_get "$dir" responder_starttime)"; unlock
     case "$state" in
         answered|archived) echo "exchange_id=$id"; echo "state=$state"; echo "cancelled=no"; echo "reason=already-$state: a valid answer is never demoted"; return 0;;
     esac
-    [ -n "$pid" ] || die "no background responder recorded for $id (only 'ask --background' responders can be cancelled)"
+    [ -n "$pid" ] || die "no responder process is recorded for $id"
+    same_responder_namespace "$dir" || die "refusing to kill pid $pid: responder was launched in another PID namespace; liveness is unknown here and signalling could target an unrelated process"
     local cur; cur="$(proc_start "$pid")"
     if [ -z "$cur" ]; then
         echo "exchange_id=$id"; echo "state=$state"; echo "cancelled=no"; echo "reason=not-running (responder already exited)"; return 0
@@ -1412,6 +1774,7 @@ cmd_jobs() {
         real_dir "$d" || continue
         [ -f "$d/meta" ] && [ ! -L "$d/meta" ] || continue
         id="$(meta_get "$d" exchange_id)"; valid_id "$id" || continue
+        lazy_reap_expired "$d" "$id"
         state="$(meta_get "$d" state)"; common="$(meta_get "$d" git_common_dir)"
         if [ -n "$want_common" ] && [ "$common" != "$want_common" ]; then continue; fi
         local ce; ce="$(meta_get "$d" created_epoch)"
@@ -1432,6 +1795,7 @@ cmd_result() {
     [ "$#" -eq 1 ] || die "usage: result ID"
     local id="$1"; require_id "$id"
     local dir; dir="$(exdir "$id")"
+    lazy_reap_expired "$dir" "$id"
     local state; state="$(meta_get "$dir" state)"
     if [ "$state" = "claimed" ] && [ -e "$dir/response.md" ] && [ ! -L "$dir/response.md" ]; then
         if try_rollforward "$dir" "$id"; then state="$(meta_get "$dir" state)"; fi

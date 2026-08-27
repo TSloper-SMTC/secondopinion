@@ -18,7 +18,7 @@ marketplace for both.)
   exchanges/<Exchange-ID>/claim/        atomic claim (token + owner)
   exchanges/<Exchange-ID>/response.md   responder writes; write-once, hash-bound
   archive/<Exchange-ID>/                after the requester consumes it
-  responder-logs/<Exchange-ID>.log      output of the headless responder run
+  responder-logs/<Exchange-ID>.<Run-ID>.log  immutable output of one headless run
 ```
 
 States: `draft → published → claimed → answered → archived`.
@@ -39,25 +39,81 @@ Claude Code in that checkout:
 
 ```
 claude -p "<the full secondopinion-respond workflow, inlined>\n…\nExchange-ID: <ID>" \
+       --safe-mode \
        --permission-mode dontAsk \
        --allowedTools Bash,Read,Grep,Glob,Write --disallowedTools Edit,NotebookEdit,WebFetch,WebSearch \
-       --no-session-persistence --max-turns 60 --output-format json
+       --no-session-persistence --output-format stream-json --verbose
 ```
 
 The prompt is **self-contained**: `ask` inlines the respond instructions shipped
-next to the CLI, so no skill, plugin or configuration has to exist in Claude —
-only the `claude` binary. `dontAsk` is the analogue of the Codex plugin's
+next to the CLI, so no skill or plugin has to exist in Claude — only a current
+`claude` binary with `--safe-mode`. Safe mode suppresses user hooks, plugins,
+auto-memory, session-environment setup and automatic startup-file discovery;
+the sealed prompt explicitly tells Claude to read the target repository's
+policy files itself. `dontAsk` is the analogue of the Codex plugin's
 `approvalPolicy: never`: anything not on the allowlist is denied instead of
 asked. Claude follows the same `secondopinion-respond` workflow a human session
 would: verifies the checkout matches the header, reads that repository's
 `AGENTS.md`/`CLAUDE.md`, claims the exchange (atomic, one-use token), does the
 work, and publishes a write-once, hash-bound response from a temp file outside
-the repository. (3) `ask` waits, validates
+the repository. While Claude works, the foreground supervisor prints only a
+quiet status line every 60 seconds by default: `Claude is still working — 3m
+elapsed; waiting for results.` Detailed event count, activity age, and last
+tool/action remain recorded in `status`; opt into those live diagnostics with
+`--verbose-progress` or `SECONDOPINION_PROGRESS_MODE=verbose`. Hidden reasoning
+is never exposed. (3) `ask` waits, validates
 (Exchange-ID, prompt hash, response hash) and prints the answer. Exit `0`
-answered · `124` timeout · `1` error — in both failure cases the exchange stays
-published and can be retried (`secondopinion wait <ID>`, or a Claude session
-running `/secondopinion-respond <ID>`). `--background` returns the ID at once;
+answered · `124` timeout · `1` error. `--timeout` is the primary deadline, not
+an activity-based kill: the responder always receives an unconditional grace
+window (`--grace`, default equal to the primary timeout). One GNU `timeout`
+process is armed at launch: `timeout + grace` is the work deadline and sends
+TERM, then a fixed 10-second bounded shutdown window ends in SIGKILL if needed.
+`--grace 0` removes only the extra work window. No event/activity heuristic can
+deny grace. Once termination begins, progress says `terminating`, never `still
+working`. If a foreground launch reaches the work deadline,
+if it fails after claiming, only that exact launch's run-bound claim is released
+and the exchange returns to `published`, so `secondopinion ask --attach <ID>`
+can retry immediately. A foreign or uncorrelated claim is never released.
 `--write` runs the responder with `acceptEdits` for tasks that may edit files.
+
+Foreground is the only supported execution mode. `--background` is rejected
+before an exchange is created because a detached process cannot reliably
+outlive Codex's PID-namespaced command sandbox. Keep the `ask` command/session
+alive until it returns. Its quiet supervisor publishes a heartbeat so another
+session can inspect `status` or safely refuse a duplicate `ask --attach`. A
+later `status`, `list`, `wait`, `jobs`, or `result` lazily releases
+only an expired exact-run claim: immediately after a definitely observed exit,
+or only after the TERM→SIGKILL bound plus a small reap margin when liveness is
+still reported or hidden by a PID namespace. Sandbox teardown therefore does
+not leave an exchange claimed forever and a live run is never reaped during
+shutdown. Every attach receives a fresh run ID and log path, so recovery cannot
+truncate an incumbent run's diagnostics. If an explicit attach replaces a
+stale responder hidden in a foreign PID namespace, its prior run ID, pid,
+namespace, heartbeat and log remain recorded under `previous_responder_*` with
+`attach_arbitration=stale-foreign-replacement`; claim-token arbitration still
+allows only one response.
+PID-based cancellation is refused across PID namespaces to avoid signalling an
+unrelated process. Set `SECONDOPINION_PROGRESS_SECS` to a positive integer to
+change the reporting interval (default 60).
+
+For Codex-driven requests, detailed prompt text belongs in a private temporary
+request file passed with `--file`; do not place it inline in the long-running
+terminal command. Codex can redisplay that command while waiting, which would
+repeat the full prompt as a large UI block. `--topic` is restricted to a single
+line of at most 120 characters, and `--task` to a single line of at most 240
+characters. `review --task` has the same boundary
+and `review --file` accepts detailed focus text. This is enforced by the CLI as well as
+the bundled request skill, so it carries into new sessions and other machines
+when the plugin is installed there.
+
+There is no turn cap by default. The work deadline plus bounded termination is
+the normal bound because tool-turn counts do not reliably measure useful progress
+and can cut Claude off immediately before it publishes. `--max-turns N` (or
+`SECONDOPINION_MAX_TURNS`) remains available as an explicit cost/work-budget
+guard when you actually want one. The default grace equals the primary timeout,
+so it can double a caller's previous wall-clock/cost ceiling; this is the
+intentional reliability tradeoff that protects a healthy but temporarily silent
+run. Set `--grace` and/or `--max-turns` explicitly when cost is the priority.
 
 Codex reaches Claude from inside its own sandbox only because the installer sets
 `[sandbox_workspace_write] network_access = true` in `~/.codex/config.toml`
@@ -77,8 +133,9 @@ git clone https://github.com/tsloper/secondopinion ~/tools/secondopinion
 ```
 
 Prerequisites: bash, GNU coreutils/sed/grep/awk/flock, git, python3 (installer
-+ `ask`), the `codex` CLI (default form), and the `claude` CLI on PATH for the
-headless responder (nothing is installed into Claude itself).
+and `ask`), the `codex` CLI (default form), and the `claude` CLI on PATH for the
+headless responder (nothing is installed into Claude itself). Claude Code must
+advertise `--safe-mode`; `ask` checks this before creating an exchange.
 
 Every form creates `~/.local/bin/secondopinion` (the checkout is the install —
 everything else is a symlink into it), the store (0700), the Codex sandbox
@@ -139,16 +196,13 @@ marketplace) and Codex's `plugin-creator/scripts/validate_plugin.py`.
 
 ## Beyond ask: jobs, result, cancel, review, follow-up, prune
 
-- `ask --background` records a verified responder identity (pid + kernel start
-  time), performs a 2 s startup handshake (`responder=startup-failed`, exit 1,
-  when the responder dies at once), and warns when the shell runs inside a
-  PID-namespaced sandbox (e.g. Codex's) whose teardown would kill a detached
-  responder. `ask --attach <ID>` re-launches a headless responder for an
-  existing published exchange — the recovery for exactly that case.
+- `ask` is foreground-only; `--background` is rejected before creating an
+  exchange. `ask --attach <ID>` re-launches a responder for an existing
+  published exchange after an interrupted, failed, or timed-out foreground run.
 - `secondopinion jobs` — repository-scoped table (id, state, age, responder
   liveness). `secondopinion result <ID>` prints the validated answer or an
   honest status + responder log path. `secondopinion cancel <ID>` stops a
-  background responder — it verifies the recorded pid *and* process start time
+  foreground responder from another session — it verifies the recorded pid *and* process start time
   (no PID-reuse kills), never demotes an answered exchange, and leaves the
   exchange published for another responder.
 - `secondopinion review [--adversarial] [--base REF]` — dedicated read-only
@@ -227,7 +281,14 @@ secondopinion respond <ID> --token <claim_token> --file "$tmp" && rm -f "$tmp"  
   is an error.
 - Two responders can't both answer (atomic claim + token; `respond` is
   write-once via `link(2)`); stale claims can be taken over after
-  `SECONDOPINION_STALE_CLAIM_SECS` (default 1800) with `--takeover`.
+  `SECONDOPINION_STALE_CLAIM_SECS` (default 1800) with `--takeover`. A
+  foreground `ask` reserves its run before launching Claude, so an unrelated
+  manual responder cannot steal the exchange during startup or execution.
+  `status` reports that short reservation as `launching`; if no responder PID
+  appears within five seconds it becomes `exited`, allowing normal recovery.
+- `show` emits a draft directly, but emits a published prompt only from a
+  snapshot matching its recorded hash; tampered published prompts are refused
+  without exposing their contents.
 - `read-response`/`wait`/`ask` succeed only when Exchange-ID, prompt hash, and
   response hash all validate — never by mtime.
 - Strict ID grammar (no path traversal). `list` does not follow symlinked
@@ -241,6 +302,11 @@ secondopinion respond <ID> --token <claim_token> --file "$tmp" && rm -f "$tmp"  
   remove `<exchange_dir>/response.md`, then re-run `respond`); an interrupted
   `archive` completes (or restores state) on retry. `respond` snapshots the
   candidate file before validating it.
+- Forced timeout reports only the bounded deadline result; Bash's internal
+  asynchronous-job `Killed (...)` notification is suppressed.
+- Responder process exit and answer completion are separate metadata: even an
+  exit code 0 is explicitly `no-valid-answer` unless a hash-validated response
+  was published.
 
 ## Threat model
 
@@ -264,7 +330,10 @@ exchange lock within this many seconds fails with `exchange busy` instead of
 waiting forever), `SECONDOPINION_BACKUP_DIR`
 (installer backups), `SECONDOPINION_CLAUDE` (responder binary, default `claude`),
 `SECONDOPINION_CLAUDE_ARGS` (extra responder flags), `SECONDOPINION_MAX_TURNS`
-(default 60), `SECONDOPINION_ASK_TIMEOUT` (default 1800),
+(optional explicit cost/work cap; unset by default), `SECONDOPINION_ASK_TIMEOUT`
+(primary deadline, default 1800), `SECONDOPINION_ASK_GRACE` (unconditional
+grace, default equal to the primary timeout), `SECONDOPINION_PROGRESS_SECS`
+(default 60), `SECONDOPINION_PROGRESS_MODE` (`quiet` by default or `verbose`),
 `SECONDOPINION_AUTO_PRUNE` (nonempty and not `0`/`false`/`no`: `archive`
 auto-prunes its own repository bucket, see prune above). Legacy `AGENT_MAILBOX_*`
 names are honoured with a deprecation warning.
