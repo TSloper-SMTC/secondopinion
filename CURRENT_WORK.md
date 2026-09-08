@@ -2,8 +2,11 @@
 
 Updated: 2026-08-27
 
-Status: **RELEASED LOCALLY** as `secondopinion--v1.0.2`. No Git remote is
-configured, so this is a local release commit/tag and has not been pushed.
+Status: **RELEASED LOCALLY** as `secondopinion--v1.0.2`. `origin` is configured
+as `https://github.com/TSloper/secondopinion.git`; the push is blocked because
+the active GitHub credential (`TSloper-SMTC`) does not have write access to the
+personal `TSloper/secondopinion` repository. The unpublished branch also has
+`b67a223` (`docs: use canonical GitHub repository URL`).
 
 ## Release
 
@@ -97,5 +100,6 @@ All actionable findings from the 1.0.1 adversarial audit are resolved:
 
 Restart any Codex session that was already open before installation so it loads
 the `1.0.2+codex.20260827162704` request/respond skills. No code action remains
-for this release. If publishing is later desired, configure an approved Git
-remote and push the release commit plus `secondopinion--v1.0.2` tag.
+for this release. To publish, authenticate GitHub CLI as `TSloper` or grant
+`TSloper-SMTC` write access, then push `main` and
+`secondopinion--v1.0.2` to `origin`.
