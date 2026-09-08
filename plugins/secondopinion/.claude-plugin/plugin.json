@@ -6,7 +6,7 @@
   "author": {
     "name": "Tim Sloper",
     "email": "tim.sloper@outlook.com",
-    "url": "https://github.com/tsloper"
+    "url": "https://github.com/TSloper"
   },
   "license": "MIT",
   "keywords": [
@@ -16,6 +16,6 @@
     "mailbox",
     "multi-agent"
   ],
-  "repository": "https://github.com/tsloper/secondopinion",
-  "homepage": "https://github.com/tsloper/secondopinion"
+  "repository": "https://github.com/TSloper/secondopinion",
+  "homepage": "https://github.com/TSloper/secondopinion"
 }

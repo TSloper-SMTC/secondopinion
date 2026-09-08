@@ -124,7 +124,7 @@ of the Codex sandbox for all workspace-write commands; an explicit
 ## Install
 
 ```bash
-git clone https://github.com/tsloper/secondopinion ~/tools/secondopinion
+git clone https://github.com/TSloper/secondopinion ~/tools/secondopinion
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh            # default: the Codex plugin; nothing in Claude
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --claude   # + the Claude Code plugin (optional)
 ~/tools/secondopinion/plugins/secondopinion/scripts/install.sh --skills   # symlink form instead of plugins
