@@ -5,10 +5,10 @@
   "author": {
     "name": "Tim Sloper",
     "email": "tim.sloper@outlook.com",
-    "url": "https://github.com/TSloper"
+    "url": "https://github.com/TSloper-SMTC"
   },
-  "homepage": "https://github.com/TSloper/secondopinion",
-  "repository": "https://github.com/TSloper/secondopinion",
+  "homepage": "https://github.com/TSloper-SMTC/secondopinion",
+  "repository": "https://github.com/TSloper-SMTC/secondopinion",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -36,7 +36,7 @@
       "Ask Claude to red-team the design decision I just made and refute it if it can",
       "Ask Claude to verify my last bug fix actually addresses the root cause"
     ],
-    "websiteURL": "https://github.com/TSloper/secondopinion",
+    "websiteURL": "https://github.com/TSloper-SMTC/secondopinion",
     "brandColor": "#2563EB"
   }
 }
