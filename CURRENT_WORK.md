@@ -1,17 +1,30 @@
 # Current Work
 
-## 1.2.0 — publication authorized, push in progress (2026-09-09)
+## 1.2.0 — published to GitHub main (2026-09-09 19:48 UTC)
 
-Tim explicitly approved publication with "push it" after reviewing readiness.
-Fresh preflight confirmed local HEAD and upstream main both
-`772b36e047abc5b5d11efb4519d00ff312554dfd`, the expected owned change set,
-all 44 release-manifest hashes, and no whitespace errors. The existing
-1186/1186 regression and two Claude Code approvals remain source-correspondent;
-no runtime or test changes were made during publication.
+Release commit **`6742ff9c6aef77c277aaf59e40b6be4fc551b989`** was pushed to
+`https://github.com/TSloper-SMTC/secondopinion.git`, branch **main**, without force.
+Fresh `git ls-remote origin refs/heads/main` confirmed that exact commit at
+19:48:15 UTC. Receipt: `out/release-1.2.0-publication.json`. This subsequent
+documentation-only handoff records the verified publication.
 
-Exact next action: commit the qualified 1.2.0 change set, push main without
-force, verify the remote commit, then record the publication receipt here.
-The readiness records below describe the earlier approval checkpoint.
+Tim explicitly approved with "push it" after reviewing readiness. Preflight
+confirmed local HEAD and upstream main both `772b36e`, the expected 28 owned
+files, all 44 release-manifest hashes (also checked against the staged content),
+matching changelogs and no whitespace errors. The existing **1186/1186**
+regression, live workflow qualification and two Claude Code **APPROVE** reviews
+remain applicable. Publication changed only approval/install/handoff text;
+runtime, test and installed plugin bytes remain bound by
+`docs/release-1.2.0.sha256`. No additional tag or GitHub Release was created.
+
+No implementation or release-push work remains. Recipient next action: from an
+existing clone, run `git pull --ff-only`, then
+`./plugins/secondopinion/scripts/install.sh`, and start a new Codex thread.
+Update participating installations together; 1.1.0 clients cannot use a migrated
+schema-2 mailbox. Details: `docs/install-shared-candidate.md` and
+`docs/robustness-validation.md`. The qualified archive in out/ retains its
+pre-publication handoff text and unchanged product/test bytes.
+The records below are historical and do not supersede this publication receipt.
 
 ## 1.2.0 — robust, reviewed, installed; awaiting publication approval (2026-09-09)
 
