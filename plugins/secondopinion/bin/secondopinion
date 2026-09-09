@@ -16,7 +16,7 @@ set -euo pipefail
 umask 077
 command -v flock >/dev/null 2>&1 || { echo "ERROR: flock(1) (util-linux) not found on PATH; secondopinion requires Linux with GNU coreutils and util-linux." >&2; exit 1; }
 
-VERSION="1.0.2+codex.20260827162704"
+VERSION="1.1.0"
 warn() { echo "WARNING: $*" >&2; }
 
 # ---- agent-mailbox compatibility (the tool's pre-release internal name) -----------------------
@@ -91,9 +91,19 @@ secondopinion $VERSION — sealed, verifiable second-opinion exchanges between c
 Store: $STORE   (override: SECONDOPINION_DIR)
 
 Requester (Codex) side:
+  workers                 list public existing Claude workers (JSON)
+  delegate --id TASK --worker-name NAME --file REQUEST [--timeout S] [--async]
+                          deliver to an existing Claude worker, then wait for its
+                          durable result (task --help for progress and recovery).
+                          --async registers automatic return to this Codex thread;
+                          unsupported hosts keep waiting in the call automatically.
+  task COMMAND            durable worker mailbox; separate from relay exchanges
+  wake COMMAND            automatic return service diagnostics and recovery
   ask --topic TOPIC (--file REQ.md | --file - | --task SHORT_TEXT) [--timeout S] [--grace S] [--write]
       [--model M] [--effort L] [--max-turns N] [--verbose-progress] [--json] [--persist]
       [--follow-up ID | --resume ID] [--fresh]
+      [--relay]            opt-in delivery responder with ListAgents/SendMessage;
+                          its answer proves only delivery, never worker completion
   ask --attach ID [--write] [--model M] [--effort L] [--max-turns N] [--timeout S] [--grace S]
                           [--verbose-progress]
                           re-launch a headless responder for an EXISTING published exchange
@@ -498,7 +508,10 @@ build_responder_argv() { # arrayname id write_mode model effort session_mode ses
         resume)  _argv+=(--resume "$7");;
         *)       _argv+=(--no-session-persistence);;
     esac
-    if [ "$3" = 1 ]; then
+    if [ "${ASK_RELAY:-0}" = 1 ]; then
+        _argv+=(--permission-mode dontAsk --allowedTools "Bash,Read,Grep,Glob,Write,ListAgents,SendMessage" \
+            --disallowedTools "Edit,NotebookEdit,WebFetch,WebSearch")
+    elif [ "$3" = 1 ]; then
         _argv+=(--permission-mode acceptEdits --allowedTools Bash)
     else
         _argv+=(--permission-mode dontAsk --allowedTools "Bash,Read,Grep,Glob,Write" \
@@ -648,7 +661,7 @@ recover_finished_headless_claim() { # dir id run-id reason -> released|answered|
 cmd_ask() {
     local topic="" file="" task="" timeout="${SECONDOPINION_ASK_TIMEOUT:-1800}" write=0 model="" json=""
     local grace="${SECONDOPINION_ASK_GRACE:-}" effort="" persist=0 followup="" resume="" fresh=0 review_mode="${ASK_REVIEW_MODE:-}" maxturns="" attach=""
-    local progress_mode="$PROGRESS_MODE"
+    local progress_mode="$PROGRESS_MODE" ASK_RELAY=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --topic) [ "$#" -ge 2 ] || die "--topic requires a value"; topic="$2"; shift 2;;
@@ -665,6 +678,7 @@ cmd_ask() {
             --persist) persist=1; shift;;
             --fresh) fresh=1; shift;;
             --write) write=1; shift;;
+            --relay) ASK_RELAY=1; shift;;
             --background) die "--background was removed because detached responders do not survive Codex's sandbox; keep this foreground command alive. No exchange was created";;
             --verbose-progress) progress_mode=verbose; shift;;
             --json) json=1; shift;;
@@ -680,6 +694,9 @@ cmd_ask() {
         [ -n "$topic" ] || die "ask requires --topic TOPIC"
         validate_topic "$topic"
         { [ -n "$file" ] && [ -z "$task" ]; } || { [ -z "$file" ] && [ -n "$task" ]; } || die "ask requires exactly one of --file REQ.md (or --file -) or --task TEXT"
+    fi
+    if [ "${ASK_RELAY:-0}" = 1 ]; then
+        [ "$write" = 0 ] || die "--relay cannot be combined with --write"
     fi
     if [ -n "$task" ] && [ -z "$review_mode" ]; then
         [ "${#task}" -le "$MAX_INLINE_TASK_CHARS" ] || die "--task is limited to $MAX_INLINE_TASK_CHARS characters so long-running terminal status cannot redisplay a large inline prompt; put detailed text in a private request file and use --file PATH. No exchange was created"
@@ -807,6 +824,10 @@ $parent_resp_txt
     # Responder in the checkout the exchange records (or the cwd for non-git requests).
     local repo; repo="$(meta_get "$dir" repo)"; [ -d "$repo" ] || repo="$PWD"
     local argv=() run_id
+    if [ -n "$attach" ] && [ "$(meta_get "$dir" relay_mode)" = yes ]; then
+        ASK_RELAY=1
+    fi
+    [ "${ASK_RELAY:-0}:$write" != "1:1" ] || die "a delivery relay cannot use --write"
     run_id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
     [[ "$run_id" =~ ^[0-9a-f]{32}$ ]] || die "could not generate a responder run id"
     mkdir -p "$STORE/responder-logs"; chmod 700 "$STORE/responder-logs"
@@ -877,9 +898,15 @@ $parent_resp_txt
     [ -n "$effort" ] && meta_set "$dir" requested_effort "$effort"
     [ -n "$maxturns" ] && meta_set "$dir" requested_max_turns "$maxturns"
     [ -n "$review_mode" ] && meta_set "$dir" review_mode "$review_mode"
+    [ "${ASK_RELAY:-0}" = 1 ] && meta_set "$dir" relay_mode yes
     case "$session_mode" in
         persist) meta_set "$dir" session_id "$session_arg" session_persist yes;;
         resume)  meta_set "$dir" session_id "$session_arg" session_persist yes;;
+        *)
+            if [ -n "$attach" ] && [ -n "$(meta_get "$dir" session_id)" ]; then
+                meta_set "$dir" previous_session_id "$(meta_get "$dir" session_id)" \
+                    session_id "" session_persist no session_resume_status fresh-attach
+            fi;;
     esac
     unlock
     local rc=0 started monitor_pid recovery="unchanged" outcome
@@ -927,6 +954,10 @@ $parent_resp_txt
     fi
     if grep -Eqi 'authentication_failed|OAuth access token has expired|API Error: 401' "$RESPONDER_LOG" 2>/dev/null; then
         die "Claude authentication failed in the headless responder. Run 'claude auth login' in a normal terminal, then retry this exact exchange with: secondopinion ask --attach $id"
+    fi
+    if [ "$session_mode" = resume ] && grep -Fqi 'No conversation found with session ID' "$RESPONDER_LOG"; then
+        lock "$dir"; meta_set "$dir" session_resume_status unavailable; unlock
+        die "Claude could not resume the recorded session. Its UUID does not prove a saved conversation exists. Recover this sealed request with: secondopinion ask --attach $id (fresh responder, parent context retained). For later requests use --follow-up instead of --resume"
     fi
     die "responder exited $rc without a valid answer; see the log above; $retry_hint"
 }
@@ -1869,6 +1900,12 @@ main() {
     [ "$#" -gt 0 ] || { usage; exit 2; }
     local cmd="$1"; shift
     case "$cmd" in
+        wake)
+            local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+            exec python3 -B "$(dirname "$self")/../scripts/codex_wakeup.py" --store "$STORE" "$@";;
+        task|delegate|workers)
+            local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+            exec python3 -B "$(dirname "$self")/../scripts/task_mailbox.py" --store "$STORE" --cli "$self" "$cmd" "$@";;
         new) cmd_new "$@";;
         ask) cmd_ask "$@";;
         publish) cmd_publish "$@";;

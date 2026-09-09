@@ -1,0 +1,182 @@
+# Existing Claude workers
+
+Use this mode for an authorized handoff to an existing Claude session on the
+same machine and Unix account, with access to the same checkout and mailbox.
+Native delivery requires the local Claude runtime to expose `ListAgents` and
+`SendMessage`. Their presence and worker reachability are runtime capabilities;
+an environment variable does not prove them. Never edit Claude's private inboxes.
+
+1. Use the user's exact worker name with `--worker-name`; the plugin resolves its
+   UUID and verifies the checkout automatically. `secondopinion workers` shows
+   the public mapping when needed. The installed service publishes a fresh public
+   Claude listing for PID-namespaced callers: do not substitute a sandboxed
+   `claude agents --json` empty list or ask the user for a UUID/host command.
+   Absent, duplicate, stale or wrong-checkout mappings fail closed; never guess a
+   peer or start a replacement. An explicitly verified UUID can still be supplied
+   using `--worker UUID`. The recorded task binding cannot be retargeted on retry.
+2. Write the authorized request into a private file. Include task scope, any
+   existing execution authority, required evidence, and restoration obligations.
+   Choose a stable task ID; retain it in the owning repository's work record.
+3. Run from the target checkout:
+
+   ```bash
+   secondopinion delegate --async --id TASK --worker-name EXACT_NAME --file request.md --timeout 900
+   ```
+
+   The installer configures the local return service. `--async` automatically
+   binds this calling Codex thread and the task before launching the delivery
+   relay, then returns when delivery is accepted. Do not ask the user to register
+   sockets, UUIDs or watchers. Worker results and blockers arrive as
+   `secondopinion_result` tool output, including when this Codex thread is idle.
+   If the host has no service or this conversation is not connected to the local
+   server, the command automatically waits in the foreground instead. Keep that
+   command session alive; no manual user setup is needed for fallback collection.
+   The bounded relay defaults to 120 seconds (`--delivery-timeout`), and fallback
+   waits up to `--timeout` seconds for the worker. The total bound includes both phases
+   and the relay's ten-second termination window. The relay is explicitly
+   allowed to use the native messaging tools. The worker receives absolute,
+   shell-quoted CLI/store paths and instructions to claim and report directly
+   to the mailbox. It must claim with `execute=true` before starting work.
+4. Read the JSON. With `notification=automatic`, exit 0 means delivery was
+   accepted, NOT that the worker completed. The registered service handles later
+   results; Codex may continue other authorized work or yield while it waits.
+   Without that field (foreground/fallback), exit 0 means a hash-validated
+   report (`state=complete`). Exit 3 means refusal, failure, or `needs_attention`;
+   report its reason/action_needed. Exit 124 means the foreground wait expired,
+   not that the worker stopped. Exit 1 means delivery is unconfirmed or a local
+   error occurred. Inspect the retained task and relay exchange before retrying.
+5. Consume the result and record its conclusion/evidence in the owning project.
+   Then explicitly acknowledge the exact revision:
+
+   ```bash
+   secondopinion task ack TASK --consumer CODEX_THREAD_ID --revision N
+   ```
+
+   Use your actual thread ID (or a stable, explicit consumer ID). `result` and
+   `wait` never acknowledge implicitly, so a caller dying before consuming the
+   result cannot make it disappear. Repeating an ack is idempotent. The relay's
+   sealed exchange can separately be read and archived through normal commands.
+
+## Several existing workers
+
+Start independent interactive sessions in separate terminals in the target checkout:
+
+```bash
+claude --name worker-a
+claude --name worker-b
+```
+
+Each command stays in its own terminal. The plugin verifies the public
+UUID/name/checkout mapping before sending. Use as many existing workers as the
+authorized task needs and the host supports; do not infer permission to create
+more workers or edit shared files merely from their availability.
+
+Give each distinct assignment its own stable task ID and request file. Launch
+the authorized `delegate` calls concurrently using the host's managed command
+sessions, keeping those sessions alive. Do not background them with an unowned
+shell `&` inside a sandbox. Separate file ownership or use independent checkouts
+for concurrent writers; the mailbox prevents duplicate claims, not edit conflicts
+or two different task IDs triggering the same external action.
+
+To collect ready outcomes without waiting behind the slowest worker:
+
+```bash
+secondopinion task wait-any TASK_A TASK_B TASK_C --consumer COORDINATOR_ID --timeout 900
+```
+
+This returns a JSON list of unacknowledged outcomes for **only those explicit
+task IDs**, ordered by update time. Exit 0 means the returned outcomes are all
+complete; exit 3 means at least one needs attention, failed, or refused. Neither
+code means every selected task is finished. Exit 124 returns an empty list when
+no new outcome arrives before the deadline. Unknown task IDs are errors, not
+silently omitted. Duplicate IDs are deduplicated; at most 256 distinct IDs can
+be selected, which is an input bound, not a qualified live-worker capacity.
+
+Consume each returned outcome and acknowledge its exact revision with the same
+consumer ID, then call `wait-any` again while other tasks remain outstanding.
+Handle a blocker's required action separately; it does not prevent collecting
+the other workers. A later completion becomes visible even if the earlier
+attention revision was acknowledged. After all selected tasks are terminal and
+consumed, stop waiting. Repeated waits do not acknowledge or execute anything.
+
+After resolving and acknowledging an approval blocker, use `wait-any` with that
+same consumer to wait for the next outcome. Plain `task wait` deliberately returns
+the currently recorded needs_attention immediately, even if a continuation message
+has just been delivered; delivery does not prove the worker has processed it yet.
+
+Without acknowledgment, the same outcome will be returned again intentionally.
+Use one stable consumer ID for a logical coordinator across recovery. Different
+consumer IDs each see their own unconsumed outcomes; acknowledgments are not a
+distributed leader-election or exactly-once downstream-processing mechanism.
+
+### Harmless manual acceptance test
+
+In a disposable checkout, open four named sessions (`worker-a` through `worker-d`)
+as above. After installing this candidate and starting a new Codex thread, ask:
+
+> Use these four existing workers for reporting-only tests. Give each a stable
+> task ID. A should return A_OK after a short delay; B should return B_OK after a
+> longer delay; C should report needs_attention because it needs my approval;
+> D should refuse. Collect and acknowledge outcomes as they arrive without
+> waiting for the slowest worker. Touch no hardware or production files.
+
+Then authorize C's harmless reporting continuation, and retry A using its
+original task ID/request/worker binding. Verify C's later completion appears,
+A is not executed again, and no result is attributed to another worker. To test
+coordinator recovery, stop a wait before completion and use the saved task IDs
+and consumer ID in a new wait; unacknowledged results must remain available.
+
+## Recovery and monitoring
+
+```bash
+secondopinion task status TASK
+secondopinion task wait TASK --timeout 900
+secondopinion task result TASK
+secondopinion task events TASK
+secondopinion task inbox --consumer CODEX_THREAD_ID
+```
+
+`inbox` shows unacknowledged terminal/attention tasks for the current exact
+checkout; `--repo PATH` selects another. Events and reports survive relay exit,
+worker exit, and monitor restart. Worker reports are snapshotted inside the
+mailbox; a disappearing `/tmp` report file cannot destroy the published result.
+
+A delivery receipt records acceptance only. `acknowledged` means a worker
+claimed the task; `running` means it reported execution; `complete` requires a
+report. Timestamp age is observable; process liveness is not inferred from it.
+A stale claim is never automatically released. A restarted worker must reconcile
+actual executor state before updating that same task; it must not rerun it.
+
+After unconfirmed delivery, reusing the same `delegate` ID, request, worker,
+checkout, and requester can retry delivery. Once delivery or a worker claim is
+recorded, `delegate` only waits. Duplicate delivery cannot grant another claim.
+Across a new Codex thread, use `task wait` or specify the original `--requester`
+when deliberately retrying delivery. Do not create a new ID to bypass a claim.
+
+Automatic idle wakeup is supported for saved conversations connected to the
+configured local Codex CLI server. The installer provisions two independent user
+services: `codex-local-app-server.service` (or reuses an existing public Codex
+server) and `secondopinion-wakeup.service`. No model, sandbox or approval override
+is supplied on notification turns. A closed/unloaded conversation is not resumed
+by the watcher; reopening it permits retained notifications to be delivered.
+Other clients, disabled services and legacy skill installations use foreground
+collection. If fallback times out while monitoring remains authorized, keep
+collecting the same task IDs; do not yield and leave the user to discover reports.
+Neither mode grants execution authority or bypasses a worker's approval blocker.
+
+For diagnostics, use `secondopinion wake status codex-CODEX_THREAD_ID`. The outbox
+distinguishes prepared, accepted, recorded and ambiguous delivery; recorded means
+present in Codex history, not consumed. Service restarts reconcile positive history
+evidence before sending. Ambiguous sends with no confirming evidence are retained
+for inspection, not blindly retried; `wake reconcile` and explicit `wake retry`
+are advanced recovery commands, not normal setup. Delivery/consumption cannot be
+promised exactly once across arbitrary failures. Acknowledge after consumption.
+If the user asks to stop automatic notifications, disable that route with
+`secondopinion wake disable codex-CODEX_THREAD_ID`; it does not cancel a worker or
+retract an in-flight notification. Duplicate claims prevent cooperative reruns,
+but external effects cannot be committed atomically with mailbox state.
+
+For hosts with their own supported delivery mechanism, `task create`,
+`task instructions`, and `task relay-prompt` expose the same protocol without
+launching a relay. Sending through such a mechanism still requires the user's
+delegation authority; a mailbox record alone does not grant bench authority.

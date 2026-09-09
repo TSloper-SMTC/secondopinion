@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.1.0 — 2026-09-09
+
+- Named-worker discovery uses a fresh public host listing; sandboxed callers need no manual UUID lookup.
+
+- Add automatic existing-worker return via `delegate --async`, exact calling
+  thread registration and an installer-supervised durable notification service.
+  Configure the public local Codex server automatically on user-systemd hosts;
+  other hosts retain foreground collection without manual watcher setup.
+- Separate delivery, recorded notification and explicit consumption. Reconcile
+  service crashes/lost receipts, retain ambiguous sends without blind replay,
+  and keep independent workers' outcomes flowing. Preserve session permissions.
+
+- Add `delegate` and `task` commands for existing Claude workers, with a
+  transactional mailbox, separate delivery receipts, atomic claims, progress,
+  immutable report snapshots, bounded foreground waits, and explicit result
+  acknowledgment. Duplicate claims cannot authorize another execution.
+- Support a verified worker name/UUID mapping when sandbox process visibility
+  differs from Claude's native messaging view. No private inbox access is used.
+- Add `task wait-any` for collecting selected workers' ready outcomes without
+  waiting behind slower workers. Preserve independent per-result acknowledgment,
+  explicit failures/blockers, and later completion after blocker acknowledgment.
+- Fix a multi-worker journal-check race: inspect each database object's type
+  with one `lstat` instead of treating a journal removed between two checks as
+  unsafe. Symlinks and non-regular database objects remain rejected.
+- Diagnose a missing resumed Claude session and clear its obsolete current
+  session ID when recovery uses a fresh `ask --attach` responder.
+- Reject non-regular request/report files before reading, preventing named pipes
+  from hanging task commands. Add multi-worker, recovery, and installed-cache
+  tests plus an opt-in live Claude canary. Keep the README to installation and
+  general usage; move advanced material to `docs/reference.md`.
+
 ## 1.0.2+codex.20260827162704 — 2026-08-27
 
 - Detailed Codex requests must now use a private request file so terminal wait

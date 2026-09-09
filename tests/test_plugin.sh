@@ -61,7 +61,7 @@ if command -v claude >/dev/null 2>&1; then
   cached="$(find "$HOME/.claude/plugins/cache" -path '*/skills/secondopinion-respond/SKILL.md' 2>/dev/null | head -1)"
   [ -n "$cached" ] && ok || fail "installed plugin lacks skills/secondopinion-respond/SKILL.md"
   cached_root="${cached%/skills/secondopinion-respond/SKILL.md}"
-  for rel in bin/secondopinion skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+  for rel in bin/secondopinion scripts/task_mailbox.py scripts/codex_rpc.py scripts/codex_wakeup.py scripts/wake_service.py scripts/worker_directory.py skills/secondopinion-request/references/delegated-workers.md skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .claude-plugin/plugin.json .codex-plugin/plugin.json; do
     cmp -s "$PLUGIN/$rel" "$cached_root/$rel" && ok || fail "Claude cache payload differs from source: $rel"
   done
   details="$(cd "$HOME" && claude plugin details secondopinion@secondopinion 2>&1)"
@@ -83,9 +83,19 @@ if command -v claude >/dev/null 2>&1; then
   codex_cached="$(find "$CODEX_HOME/plugins/cache" -path "*/$TOOL_VERSION/bin/secondopinion" 2>/dev/null | head -1)"
   [ -n "$codex_cached" ] && ok || fail "Codex cache lacks the versioned secondopinion payload"
   codex_cached_root="${codex_cached%/bin/secondopinion}"
-  for rel in bin/secondopinion skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .codex-plugin/plugin.json; do
+  for rel in bin/secondopinion scripts/task_mailbox.py scripts/codex_rpc.py scripts/codex_wakeup.py scripts/wake_service.py scripts/worker_directory.py skills/secondopinion-request/references/delegated-workers.md skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .codex-plugin/plugin.json; do
     cmp -s "$PLUGIN/$rel" "$codex_cached_root/$rel" && ok || fail "Codex cache payload differs from source: $rel"
   done
+  t "installed Codex cache can execute the worker mailbox without the source CLI"
+  printf 'Read-only installed-payload fixture.\n' > "$TMP/cached-task-request.md"
+  assert_rc 0 env SECONDOPINION_DIR="$TMP/cached-task-store" "$codex_cached" task create \
+    --id installed-task --worker installed-worker --file "$TMP/cached-task-request.md"
+  assert_rc 0 env SECONDOPINION_DIR="$TMP/cached-task-store" "$codex_cached" task claim \
+    installed-task --session installed-worker
+  assert_rc 0 env SECONDOPINION_DIR="$TMP/cached-task-store" "$codex_cached" task update \
+    installed-task --session installed-worker --revision 2 --state complete --message done --file "$TMP/cached-task-request.md"
+  assert_rc 0 env SECONDOPINION_DIR="$TMP/cached-task-store" "$codex_cached" task wait-any \
+    installed-task --consumer installed-coordinator --timeout 0
   [ ! -e "$HOME/.claude/skills/secondopinion-respond" ] && [ ! -L "$HOME/.claude/skills/secondopinion-respond" ] && ok || fail "user-level Claude skill still present after default install"
   assert_eq "$(cd "$HOME" && claude plugin list --json 2>/dev/null | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["id"]=="secondopinion@secondopinion"]))')" "0" "(Claude plugin removed: nothing stays installed in Claude)"
   ( cd "$HOME" && "$PLUGIN/scripts/install.sh" --check >/dev/null 2>&1 ) && ok || fail "--check rejects the default (Codex-plugin-only) install"

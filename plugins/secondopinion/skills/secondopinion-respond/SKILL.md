@@ -71,6 +71,11 @@ says otherwise.
    and `hard_deadline_epoch`. Prefer publishing a complete, concise answer with
    the best evidence already obtained well before the hard deadline; do not lose
    the whole result by holding publication for optional polish.
+   If the sealed request explicitly assigns you a **delivery relay** role,
+   your answer describes delivery only. Follow its exact worker-ID routing and
+   mailbox receipt instructions; do not claim or complete the worker's task.
+   Unavailable messaging tools or an unreachable worker are delivery failures.
+   Never use an unrelated peer as a guessed return channel.
 6. **Write the response** to a private temp file OUTSIDE the target repository
    (`mktemp` under your scratchpad or `/tmp`, mode 0600), starting exactly:
    ```text

@@ -188,6 +188,7 @@ Responder: Stub Claude
     if [ -n "${STUB_PLAIN_OUTPUT:-}" ]; then echo '{"is_error":false}'; else echo '{"is_error":false,"modelUsage":{"claude-stub-model-1":{"in":1}}}'; fi;;
   slow) sleep 60;;
   fail) echo boom >&2; exit 1;;
+  missing-session) echo 'No conversation found with session ID: 00000000-0000-0000-0000-000000000000' >&2; exit 1;;
 esac
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -350,6 +351,21 @@ assert_eq "$("$AM" status "$IDRES" | val parent_exchange)" "$IDPP"
 # default asks remain private
 (cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "private" --file "$TMP/request.md" --timeout 60 >/dev/null 2>&1)
 grep -qx -- "--no-session-persistence" "$STUB_ARGV_FILE" && ok || fail "default ask lost --no-session-persistence"
+
+t "missing native session: clear recovery and fresh attach do not retain a false current session id"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODE=missing-session "$AM" ask --resume "$IDPP" --topic "missing session" --task "recover context" --timeout 10 2>&1)"; rc=$?
+assert_eq "$rc" 1
+echo "$out" | grep -q -- 'UUID does not prove' && ok || fail "missing-session diagnosis absent"
+IDMISS="$(echo "$out" | sed -n 's/^exchange_id=//p' | head -1)"
+MDIR="$("$AM" path "$IDMISS")"
+assert_grep '^session_resume_status=unavailable$' "$MDIR/meta"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --attach "$IDMISS" --timeout 10 2>&1)"; rc=$?
+assert_eq "$rc" 0
+assert_grep '^session_id=$' "$MDIR/meta"
+assert_grep "^previous_session_id=$SID$" "$MDIR/meta"
+assert_grep '^session_resume_status=fresh-attach$' "$MDIR/meta"
+assert_grep 'recover context' "$MDIR/prompt.md"
+assert_grep '^parent_exchange=' "$MDIR/meta"
 
 t "resume: refused without a persisted session, with a malformed stored id, cross-repo, or combined with --fresh"
 out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --resume "$IDEFF" --topic "r1" --task t 2>&1)"; rc=$?

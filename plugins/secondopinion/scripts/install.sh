@@ -360,6 +360,9 @@ if [ "$UNINSTALL" = 1 ]; then
     if [ "$CHECK" = 1 ] || [ "$SKILLS" = 1 ] || [ "$CLAUDE" = 1 ]; then
         echo "usage: install.sh --uninstall   (cannot be combined with other options)" >&2; exit 1
     fi
+    # Stop only our notification bridge before touching its store/cache. Codex's
+    # shared daemon belongs to Codex and may host unrelated user conversations.
+    python3 -B "$ROOT/scripts/wake_service.py" uninstall --store "$STORE_DIR"
     if have_claude; then
         claude plugin uninstall --scope user "$PLUGIN_ID" >/dev/null 2>&1 && echo "removed   Claude plugin $PLUGIN_ID" || true
         claude plugin marketplace remove "$MARKETPLACE" >/dev/null 2>&1 && echo "removed   Claude marketplace $MARKETPLACE" || true
@@ -652,8 +655,12 @@ case ":$PATH:" in
 esac
 
 if [ "$CHECK" = 1 ]; then
+    python3 -B "$ROOT/scripts/wake_service.py" check --store "$STORE_DIR" || status=1
     [ "$status" = 0 ] && echo "installed=yes" || echo "installed=no"
 else
+    if [ "$SKILLS" = 0 ]; then
+        python3 -B "$ROOT/scripts/wake_service.py" install --store "$STORE_DIR" || status=1
+    fi
     echo "done: restart Codex sessions to load the plugin/skill (and Claude Code, if --claude was used)"
 fi
 exit "$status"
