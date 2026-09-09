@@ -1,11 +1,17 @@
 # Current Work
 
-## 1.1.0 release validation — complete, publication pending (2026-09-09)
+## 1.1.0 — published to GitHub main (2026-09-09 05:29 UTC)
+
+Release commit **`7cb3a1ba9184ab1639f7e6abda7f396698c3f6f2`** was pushed to
+`https://github.com/TSloper-SMTC/secondopinion.git`, branch **main**, without force.
+Fresh `git ls-remote origin refs/heads/main` confirmed that exact release commit
+at 05:29 UTC. This subsequent documentation-only handoff records the publication;
+runtime/installer bytes remain bound by `docs/release-1.1.0.sha256`.
 
 Owner asked to promote the validated functionality and push so the colleague can
 git pull and update. Fresh preflight confirmed HEAD and origin/main both ce14ec2,
-and all seven implementation/installer hashes match the previously qualified
-candidate. No unrelated dirty changes were found. Promoting to plain **1.1.0**
+and all seven implementation/installer hashes matched the previously qualified
+candidate. No unrelated dirty changes were found. Promoted to plain **1.1.0**
 in CLI/manifests/Claude marketplace/changelogs; this is a real feature-release
 increment, not another development cachebuster. Runtime logic remains unchanged.
 
@@ -32,10 +38,10 @@ Shareable archive: `out/secondopinion-1.1.0.tar.gz`, SHA-256
 Its checksum sidecar and selected evidence are retained locally; neither private
 stores/raw conversations nor generated out files are staged for Git publication.
 
-Exact next action: commit the scoped plugin/docs/tests and push main without
-force, verify remote main, then record confirmed publication. No GitHub release,
-new release tag, colleague-host mutation or changes to unrelated conversations
-are part of this publication. The recipient runs `git pull --ff-only`, then
+Exact next action: the colleague can update from main. No further release
+implementation/testing is pending for the qualified configuration. No GitHub
+Release object, new release tag, colleague-host mutation or changes to unrelated
+conversations were made. The recipient runs `git pull --ff-only`, then
 `./plugins/secondopinion/scripts/install.sh`, then starts a new Codex thread.
 No watcher/UUID setup. Preserve documented Linux/runtime/approval/closed-session
 boundaries. The records below retain the prior candidate's historical identity.
