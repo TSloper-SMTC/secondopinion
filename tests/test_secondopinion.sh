@@ -667,6 +667,9 @@ STUB_DIR="$TMP/claude-stub"; mkdir -p "$STUB_DIR"
 # and answers through the real tool exactly like the headless skill would.
 cat > "$STUB_DIR/claude" <<'STUB'
 #!/bin/bash
+if [ "${1:-}" = "--help" ] && [ -n "${STUB_LARGE_HELP:-}" ]; then
+  exec python3 -c 'import sys,time; print("--safe-mode",flush=True); time.sleep(.1); print("help padding "*65536)'
+fi
 if [ "${1:-}" = "--help" ]; then
   echo "  --safe-mode                            Disable hooks, plugins, auto-memory and startup files"
   echo "  --effort <level>                       Effort level (low, medium, high, xhigh, max)"
@@ -743,6 +746,11 @@ grep -qx -- "Edit,NotebookEdit,WebFetch,WebSearch" "$STUB_ARGV_FILE" && ok || fa
 grep -qx -- "stream-json" "$STUB_ARGV_FILE" && ok || fail "ask must request stream-json for observable progress"
 grep -qx -- "--verbose" "$STUB_ARGV_FILE" && ok || fail "stream-json requires --verbose"
 grep -qx -- "--safe-mode" "$STUB_ARGV_FILE" && ok || fail "headless responder must suppress user hooks/plugins and session-env setup"
+
+t "ask: safe-mode capability probe drains help output without killing its producer"
+out="$(cd "$TMP/repoA-wt" && STUB_LARGE_HELP=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "large help" --file "$TMP/request.md" --timeout 30 2>"$TMP/large-help.err")"; rc=$?
+assert_eq "$rc" 0 "(supported CLI with large delayed help output)"
+assert_grep "verdict: PROVEN stub-answer" <(echo "$out")
 
 t "ask: default progress is quiet while status retains detailed heartbeat/activity evidence"
 out="$(cd "$TMP/repoA-wt" && STUB_MODE=progress SECONDOPINION_PROGRESS_SECS=1 SECONDOPINION_CLAUDE="$STUB_DIR/claude" "$AM" ask --topic "ask progress" --file "$TMP/request.md" --timeout 30 2>"$TMP/progress.err")"; rc=$?

@@ -185,7 +185,9 @@ Responder: Stub Claude
 %s
 ' "$id" "${STUB_BODY:-verdict: PROVEN stub-answer}" > "$STUB_DIR/resp.md"
     "$STUB_AM" respond "$id" --token "$tok" --file "$STUB_DIR/resp.md" >/dev/null 2>&1
-    if [ -n "${STUB_PLAIN_OUTPUT:-}" ]; then echo '{"is_error":false}'; else echo '{"is_error":false,"modelUsage":{"claude-stub-model-1":{"in":1}}}'; fi;;
+    if [ -n "${STUB_MODEL_EVENTS:-}" ]; then cat "$STUB_MODEL_EVENTS";
+    elif [ -n "${STUB_PLAIN_OUTPUT:-}" ]; then echo '{"is_error":false}';
+    else echo '{"is_error":false,"modelUsage":{"claude-stub-model-1":{"in":1}}}'; fi;;
   slow) sleep 60;;
   fail) echo boom >&2; exit 1;;
   missing-session) echo 'No conversation found with session ID: 00000000-0000-0000-0000-000000000000' >&2; exit 1;;
@@ -310,6 +312,31 @@ assert_eq "$(echo "$st" | val realized_model)" "claude-stub-model-1" "(proven fr
 out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_PLAIN_OUTPUT=1 "$AM" ask --topic "mod unproven" --file "$TMP/request.md" --model m2 --timeout 60 2>/dev/null)"
 IDM2="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
 assert_eq "$("$AM" status "$IDM2" | val realized_model)" "unproven"
+
+t "model reporting uses the primary responder, not an alphabetically first helper model"
+EVENTS="$TMP/model-events.jsonl"
+cat > "$EVENTS" <<'EVENTS'
+[]
+{"type":"assistant","parent_tool_use_id":null,"message":{"model":"claude-sonnet-main"}}
+{"type":"assistant","parent_tool_use_id":"tool-child","message":{"model":"claude-haiku-helper"}}
+{"is_error":false,"modelUsage":{"claude-haiku-helper":{},"claude-sonnet-main":{}}}
+EVENTS
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODEL_EVENTS="$EVENTS" "$AM" ask --topic "primary model" --file "$TMP/request.md" --model sonnet --timeout 60 2>/dev/null)"
+IDPRIMARY="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+assert_eq "$("$AM" status "$IDPRIMARY" | val realized_model)" "claude-sonnet-main"
+
+t "ambiguous aggregate model usage without a primary stream does not guess a model"
+printf '%s\n' '{"is_error":false,"modelUsage":{"claude-haiku-helper":{},"claude-sonnet-main":{}}}' > "$EVENTS"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODEL_EVENTS="$EVENTS" "$AM" ask --topic "ambiguous model" --file "$TMP/request.md" --model sonnet --timeout 60 2>/dev/null)"
+IDAMBIG="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+assert_eq "$("$AM" status "$IDAMBIG" | val realized_model)" "unproven"
+
+t "model usage fallback rejects control characters without injecting metadata"
+printf '%s\n' '{"is_error":false,"modelUsage":{"bad\nstate=archived":{}}}' > "$EVENTS"
+out="$(cd "$TMP/repoA" && SECONDOPINION_CLAUDE="$STUB_DIR/claude" STUB_MODEL_EVENTS="$EVENTS" "$AM" ask --topic "unsafe model" --file "$TMP/request.md" --model sonnet --timeout 60 2>/dev/null)"
+IDUNSAFE="$(echo "$out" | sed -n 's/^Exchange-ID: //p' | head -1)"
+assert_eq "$("$AM" status "$IDUNSAFE" | val realized_model)" "unproven"
+assert_eq "$("$AM" status "$IDUNSAFE" | val state)" "answered"
 
 t "follow-up: a NEW linked exchange embeds the validated parent; the parent's files stay byte-identical"
 PD="$("$AM" path "$IDMOD")"

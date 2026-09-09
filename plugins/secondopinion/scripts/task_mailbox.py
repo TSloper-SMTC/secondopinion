@@ -95,7 +95,7 @@ class Mailbox:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=FULL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise ValueError(f"unsupported task database version {version}")
         with self.transaction():
             self.db.execute("""CREATE TABLE IF NOT EXISTS tasks (
@@ -118,18 +118,23 @@ class Mailbox:
                 updated_utc TEXT NOT NULL)""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS worker_routes (
                 task_id TEXT PRIMARY KEY REFERENCES tasks(id), name TEXT NOT NULL)""")
-            self.db.execute("PRAGMA user_version=1")
+            # Older clients must refuse a conversation-capable store instead
+            # of silently treating tasks with unread questions as outcome-only.
+            self.db.execute("PRAGMA user_version=2")
 
     @contextlib.contextmanager
     def transaction(self):
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        else:
             self.db.execute("COMMIT")
+        except BaseException:
+            # SQLite can roll back automatically on FULL/IOERR. A failed COMMIT
+            # can instead leave the transaction open: recover both cases while
+            # preserving the original error for the caller.
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
 
     def get(self, task_id):
         identifier(task_id)
@@ -245,16 +250,29 @@ class Mailbox:
 
     def status(self, task_id, stale_after=300):
         task = self.get(task_id)
+        # Also called inside pending()'s transaction. Status must not initialize
+        # conversation tables or acquire a nested write transaction.
+        counts = {}
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_messages'").fetchone():
+            counts = dict(self.db.execute('SELECT recipient,COUNT(*) FROM task_messages '
+                                         'WHERE task=? AND acknowledged_utc IS NULL GROUP BY recipient', (task_id,)))
+        task['unread_messages'] = {role: counts.get(task[role], 0) for role in ('requester', 'worker')}
         task["age_seconds"] = max(0, int(time.time() - task["updated_epoch"]))
         task["stale"] = task["state"] not in TERMINAL and task["age_seconds"] >= stale_after
         task["notification"] = "foreground polling; automatic return only with a registered wake service"
         return task
 
     def wait(self, task_id, timeout):
+        from task_conversation import Conversation
+        conversation = Conversation(self)
         deadline = time.monotonic() + timeout
         next_progress = time.monotonic() + 60
         while True:
             task = self.status(task_id)
+            messages = conversation.messages(task_id, task['requester'], unread=True)
+            if messages:
+                emit(dict(task=task, messages=messages))
+                return 4
             if task["state"] in TERMINAL | {"needs_attention"}:
                 emit(task)
                 return 0 if task["state"] == "complete" else 3
@@ -293,10 +311,18 @@ class Mailbox:
             return [self.status(row[0]) for row in rows.fetchall()]
 
     def wait_any(self, task_ids, consumer, timeout):
+        from task_conversation import Conversation
+        conversation = Conversation(self)
         deadline = time.monotonic() + timeout
         next_progress = time.monotonic() + 60
         while True:
             pending = self.pending(consumer, task_ids=task_ids)
+            messages = [message for task_id in dict.fromkeys(task_ids)
+                        if consumer == self.get(task_id)['requester']
+                        for message in conversation.messages(task_id, consumer, unread=True)]
+            if messages:
+                emit(dict(outcomes=pending, messages=messages))
+                return 4
             if pending:
                 emit(pending)
                 return 0 if all(task["state"] == "complete" for task in pending) else 3
@@ -327,6 +353,14 @@ reconcile actual executor state before continuing; this mailbox never grants a t
 Publish progress using the latest revision from status/claim, replacing N below:
   {command} update {task_id} --session {worker} --revision N --state running --message 'concise progress'
 For a blocker use --state needs_attention with --action-needed 'what is required'.
+To ask the lead a question or send an update while the task continues, write the text
+to a private file, then send it directly to the durable mailbox:
+  {command} message {task_id} --id UNIQUE_MESSAGE_ID --session {worker} --file /absolute/message.md
+Use the SAME message ID and content when retrying. To answer an incoming message,
+add --reply-to ITS_MESSAGE_ID. Read conversation history with:
+  {command} messages {task_id}
+If waiting for an answer, end your turn; the lead's reply notifies this same session.
+Messages do not complete tasks, grant new authority, or authorize duplicate execution.
 For refusal/failure use --state refused or failed with a meaningful --message.
 To complete, write your final report to a private scratch file and publish its contents:
   {command} update {task_id} --session {worker} --revision N --state complete --message 'done' --file /absolute/report.md
@@ -336,7 +370,7 @@ complete before the requested work and its required restoration/validation have 
 """
 
 
-def relay_prompt(task, cli, store):
+def relay_prompt(task, cli, store, content=None, receipt_command=None):
     command = shlex.join(["env", f"SECONDOPINION_DIR={store}", cli, "task"])
     route = ""
     if task["worker_name"]:
@@ -360,6 +394,10 @@ UUID resolution nor that unambiguous mapping works, fail delivery and explain th
 the requester can supply --worker-name after verifying the mapping on the host.
 An empty sandboxed CLI listing is not proof that the worker stopped.
 """
+    if content is None:
+        content = instructions(task, cli, store)
+    if receipt_command is None:
+        receipt_command = f"{command} delivered {shlex.quote(task['id'])} --receipt 'ACTUAL_MESSAGE_RECEIPT'"
     return f"""You are a delivery relay for an existing Claude worker, not its executor.
 Resolve ONLY the exact session {task['worker']}.
 {route}
@@ -369,10 +407,10 @@ SendMessage is unavailable, or that exact session is absent/ambiguous, publish a
 delivery explanation in your secondopinion response and stop; do not claim delivery.
 Send the following instructions to that exact session using SendMessage:
 
-{instructions(task, cli, store)}
+{content}
 
 After SendMessage confirms acceptance, record its message ID/receipt:
-  {command} delivered {shlex.quote(task['id'])} --receipt 'ACTUAL_MESSAGE_RECEIPT'
+  {receipt_command}
 Then publish your secondopinion response as a DELIVERY RECEIPT, explicitly saying worker
 completion is pending or unverified, and exit. Do not wait for an inbox reply. Do not
 claim/update/complete the worker task yourself. Codex waits on the worker mailbox.
@@ -448,6 +486,8 @@ def parser():
     root.add_parser("workers", help="fresh public worker names, UUIDs and checkouts; JSON")
     task = root.add_parser("task", help="durable worker tasks; JSON output")
     commands = task.add_subparsers(dest="command", required=True)
+    from task_conversation import add_commands
+    add_commands(commands)
     create = commands.add_parser("create", help="idempotent create with an owner-chosen stable ID")
     delivery = root.add_parser("delegate", help="deliver once, then foreground wait; reuse ID to recover")
     for sub in (create, delivery):
@@ -504,6 +544,10 @@ def main():
                 raise ValueError("--delivery-timeout must be positive")
             return delegate(box, args)
         command = args.command
+        if command in ('message', 'message-read', 'message-ack', 'message-delivered',
+                       'message-retry', 'messages', 'receive'):
+            from task_conversation import dispatch
+            return dispatch(box, args)
         if command == "create":
             emit(box.create(args.id, args.worker, args.requester, str(Path.cwd().resolve()), read_text(args.file), args.worker_name))
         elif command == "status":

@@ -54,7 +54,9 @@ and `claude --name reviewer`. Then ask Codex:
 
 Codex handles delivery, tracking, and collecting results. In the configured local
 Codex CLI, results wake the conversation automatically; no watcher commands are
-needed. Other hosts keep waiting in the active call. The [worker guide](plugins/secondopinion/skills/secondopinion-request/references/delegated-workers.md)
+needed. Workers can ask questions and send updates; Codex can answer or send
+direction to the same worker while the task continues. Each task keeps its
+conversation history. Other hosts keep waiting in the active call. The [worker guide](plugins/secondopinion/skills/secondopinion-request/references/delegated-workers.md)
 covers advanced usage and recovery.
 
 Run `secondopinion --help` for all commands. Additional installation options

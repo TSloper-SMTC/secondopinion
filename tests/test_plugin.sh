@@ -61,7 +61,7 @@ if command -v claude >/dev/null 2>&1; then
   cached="$(find "$HOME/.claude/plugins/cache" -path '*/skills/secondopinion-respond/SKILL.md' 2>/dev/null | head -1)"
   [ -n "$cached" ] && ok || fail "installed plugin lacks skills/secondopinion-respond/SKILL.md"
   cached_root="${cached%/skills/secondopinion-respond/SKILL.md}"
-  for rel in bin/secondopinion scripts/task_mailbox.py scripts/codex_rpc.py scripts/codex_wakeup.py scripts/wake_service.py scripts/worker_directory.py skills/secondopinion-request/references/delegated-workers.md skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+  for rel in bin/secondopinion scripts/task_mailbox.py scripts/task_conversation.py scripts/codex_rpc.py scripts/codex_wakeup.py scripts/wake_service.py scripts/worker_directory.py skills/secondopinion-request/references/delegated-workers.md skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .claude-plugin/plugin.json .codex-plugin/plugin.json; do
     cmp -s "$PLUGIN/$rel" "$cached_root/$rel" && ok || fail "Claude cache payload differs from source: $rel"
   done
   details="$(cd "$HOME" && claude plugin details secondopinion@secondopinion 2>&1)"
@@ -83,7 +83,7 @@ if command -v claude >/dev/null 2>&1; then
   codex_cached="$(find "$CODEX_HOME/plugins/cache" -path "*/$TOOL_VERSION/bin/secondopinion" 2>/dev/null | head -1)"
   [ -n "$codex_cached" ] && ok || fail "Codex cache lacks the versioned secondopinion payload"
   codex_cached_root="${codex_cached%/bin/secondopinion}"
-  for rel in bin/secondopinion scripts/task_mailbox.py scripts/codex_rpc.py scripts/codex_wakeup.py scripts/wake_service.py scripts/worker_directory.py skills/secondopinion-request/references/delegated-workers.md skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .codex-plugin/plugin.json; do
+  for rel in bin/secondopinion scripts/task_mailbox.py scripts/task_conversation.py scripts/codex_rpc.py scripts/codex_wakeup.py scripts/wake_service.py scripts/worker_directory.py skills/secondopinion-request/references/delegated-workers.md skills/secondopinion-request/SKILL.md skills/secondopinion-respond/SKILL.md .codex-plugin/plugin.json; do
     cmp -s "$PLUGIN/$rel" "$codex_cached_root/$rel" && ok || fail "Codex cache payload differs from source: $rel"
   done
   t "installed Codex cache can execute the worker mailbox without the source CLI"

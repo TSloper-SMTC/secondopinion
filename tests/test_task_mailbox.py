@@ -17,6 +17,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "plugins/secondopinion/bin/secondopinion"
 MODULE = ROOT / "plugins/secondopinion/scripts/task_mailbox.py"
+sys.path.insert(0, str(MODULE.parent))
 spec = importlib.util.spec_from_file_location("task_mailbox", MODULE)
 mailbox = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mailbox)
@@ -272,6 +273,45 @@ class Tasks(unittest.TestCase):
             box.claim("t", "worker-1")
         self.assertEqual(box.get("t")["state"], "created")
         self.assertEqual(len(self.run_cli("events", "t")), 1)
+
+    def test_failed_commit_releases_transaction_and_can_retry(self):
+        self.create()
+        box = mailbox.Mailbox(self.store)
+        self.addCleanup(box.db.close)
+        box.db.execute('PRAGMA busy_timeout=20')
+        reader = sqlite3.connect(self.store / 'tasks.sqlite3', isolation_level=None)
+        self.addCleanup(reader.close)
+        reader.execute('BEGIN')
+        reader.execute('SELECT * FROM tasks').fetchall()
+        # A real SQLite reader allows BEGIN/UPDATE but prevents COMMIT.
+        with self.assertRaisesRegex(sqlite3.OperationalError, 'locked'):
+            box.claim('t', 'worker-1')
+        self.assertFalse(box.db.in_transaction)
+        self.assertEqual(box.get('t')['state'], 'created')
+        reader.execute('ROLLBACK')
+        self.assertTrue(box.claim('t', 'worker-1')['execute'])
+        self.assertEqual(len(self.run_cli('events', 't')), 2)
+
+    def test_schema_one_upgrade_preserves_pending_completed_and_acknowledged_tasks(self):
+        self.create('pending')
+        self.create('finished')
+        self.claim('finished')
+        final = self.finish('finished')
+        self.run_cli('ack', 'finished', '--consumer', 'reader', '--revision', final['revision'])
+        box = mailbox.Mailbox(self.store)
+        before = {name: box.get(name) for name in ('pending', 'finished')}
+        events = [tuple(r) for r in box.db.execute('SELECT * FROM events ORDER BY task_id,revision')]
+        acks = [tuple(r) for r in box.db.execute('SELECT * FROM acknowledgments')]
+        box.db.execute('PRAGMA user_version=1')
+        box.db.close()
+        upgraded = mailbox.Mailbox(self.store)
+        self.addCleanup(upgraded.db.close)
+        self.assertEqual(upgraded.db.execute('PRAGMA user_version').fetchone()[0], 2)
+        self.assertEqual({name: upgraded.get(name) for name in before}, before)
+        self.assertEqual([tuple(r) for r in upgraded.db.execute('SELECT * FROM events ORDER BY task_id,revision')], events)
+        self.assertEqual([tuple(r) for r in upgraded.db.execute('SELECT * FROM acknowledgments')], acks)
+        self.assertFalse(upgraded.claim('finished', 'worker-1')['execute'])
+        self.assertTrue(upgraded.claim('pending', 'worker-1')['execute'])
 
     def test_corruption_and_symlinked_database_fail_closed(self):
         self.store.mkdir()

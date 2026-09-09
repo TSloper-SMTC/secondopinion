@@ -41,6 +41,36 @@ live in `~/.secondopinion/tasks.sqlite3`, separately from sealed review exchange
 and their archive retention. The Python standard library supplies SQLite; no
 new package is needed. Use a local filesystem for the store (not a shared NFS
 database), the same OS user, and cooperating workers. No task pruning is automatic.
+Version 1.2.0 upgrades the task database marker to schema 2, preserving existing
+tasks, reports and acknowledgments. Older 1.1.0 clients then refuse the store
+instead of silently overlooking conversation messages. Update every participating
+installation together and restart the plugin service with the installer; older
+already-running processes must also be restarted. Do not downgrade a migrated
+store to a 1.1.0 client.
+The migration occurs on the first mailbox open, including `task status` or the
+installed return service's startup. This deliberate eager migration provides
+one atomic upgrade point; mixed-version operation is not supported.
+
+Ongoing conversation uses `task message TASK --id MESSAGE_ID --session SESSION
+--file message.md` and `--reply-to MESSAGE_ID` for answers. Messages retain their
+own order, content hashes and recipient acknowledgments, independently of task
+revisions. Lead replies use the same verified worker route; worker messages wake
+the registered lead as `secondopinion_message`. Foreground collection returns
+exit 4 with a `messages` list when a conversation needs attention. See the
+[conversation guide](../plugins/secondopinion/skills/secondopinion-request/references/delegated-workers.md#ongoing-conversation)
+for consumption, reply and recovery commands.
+`task status TASK` includes `unread_messages.requester` and
+`unread_messages.worker` counts. Reading status never consumes those messages.
+
+Lead sends are serialized per task. An earlier queued or uncertain delivery
+must be delivered or reconciled before a newer message can be sent to that
+worker. Independent workers can receive messages concurrently.
+Worker notifications preserve message order before queued task results. An
+uncertain worker-message notification holds later notifications from that task
+for reconciliation; other workers continue independently.
+Discussion posted after task completion remains deliverable while an earlier
+outcome notification is uncertain. The report remains available through
+`task result`; such discussion cannot reopen the task or grant another execution.
 
 `--worker-name` automatically resolves a unique name to its exact UUID and checkout.
 The installed service publishes only Claude's public worker listing, refreshed
@@ -253,10 +283,15 @@ marketplace) and Codex's `plugin-creator/scripts/validate_plugin.py`.
   response; published exchanges are never mutated. `ask --persist` opts into a
   stored Claude session id so `ask --resume <ID>` can continue that native
   session later; the default stays `--no-session-persistence`.
+- `ask --model sonnet` or `review --model opus` selects the responder model;
+  full model IDs supported by the installed Claude CLI can also be passed.
+  Existing delegated workers retain their own session's model configuration.
 - `ask --effort low|medium|high|xhigh|max` — validated against the *live*
   `claude --help`; unsupported CLIs are refused, never silently ignored.
   Requested and (when the responder output proves them) realized models are
-  recorded in `status`.
+  recorded in `status`. The realized model is the last observed primary
+  responder model, or the sole usage model when no primary stream is available.
+  Aggregate usage may contain helper models; ambiguous identity is `unproven`.
 - `secondopinion prune` — bounded retention over `archive/` only, **per
   repository** (git common dir; separate non-git bucket; default keep newest
   50, `SECONDOPINION_RETAIN`/`--retain`). Dry-run by default with exact

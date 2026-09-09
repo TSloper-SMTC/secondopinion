@@ -16,7 +16,7 @@ set -euo pipefail
 umask 077
 command -v flock >/dev/null 2>&1 || { echo "ERROR: flock(1) (util-linux) not found on PATH; secondopinion requires Linux with GNU coreutils and util-linux." >&2; exit 1; }
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 warn() { echo "WARNING: $*" >&2; }
 
 # ---- agent-mailbox compatibility (the tool's pre-release internal name) -----------------------
@@ -98,6 +98,10 @@ Requester (Codex) side:
                           --async registers automatic return to this Codex thread;
                           unsupported hosts keep waiting in the call automatically.
   task COMMAND            durable worker mailbox; separate from relay exchanges
+                          message TASK --id MID --session SESSION --file TEXT [--reply-to MID]
+                          sends a question, update or reply within the same task.
+                          messages / message-read / message-ack / receive track conversation.
+                          Foreground task collection exits 4 when messages need attention.
   wake COMMAND            automatic return service diagnostics and recovery
   ask --topic TOPIC (--file REQ.md | --file - | --task SHORT_TEXT) [--timeout S] [--grace S] [--write]
       [--model M] [--effort L] [--max-turns N] [--verbose-progress] [--json] [--persist]
@@ -484,7 +488,9 @@ claude_effort_levels() { # bin -> space-separated levels from the live CLI's --h
 }
 
 claude_supports_safe_mode() { # bin -> current headless contract is available
-    "$1" --help 2>/dev/null | grep -q -- '--safe-mode'
+    # Drain help completely: grep -q can close the pipe after its first match,
+    # killing a still-writing CLI with SIGPIPE and falsely failing under pipefail.
+    "$1" --help 2>/dev/null | grep -- '--safe-mode' >/dev/null
 }
 
 new_session_uuid() { python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || uuidgen 2>/dev/null; }
@@ -967,7 +973,10 @@ record_realized_model() { # dir log — record the model the responder PROVED us
     if [ -f "$2" ] && [ ! -L "$2" ]; then
         m="$(python3 - "$2" 2>/dev/null <<'PYEOF'
 import json, sys
-best = ""
+primary = ""
+usage_models = set()
+def valid_model(model):
+    return isinstance(model, str) and bool(model) and not model.startswith("<") and model.isprintable()
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     line = line.strip()
     if not line.startswith("{"):
@@ -976,10 +985,19 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         d = json.loads(line)
     except Exception:
         continue
+    if not isinstance(d, dict):
+        continue
+    # Aggregate usage can include helper models. Only top-level assistant
+    # messages identify the responder; a child tool's model is not its model.
+    message = d.get("message")
+    if d.get("type") == "assistant" and d.get("parent_tool_use_id") is None and isinstance(message, dict):
+        model = message.get("model")
+        if valid_model(model):
+            primary = model
     mu = d.get("modelUsage")
-    if isinstance(mu, dict) and mu:
-        best = sorted(mu.keys())[0]
-print(best)
+    if isinstance(mu, dict):
+        usage_models.update(model for model in mu if valid_model(model))
+print(primary or (next(iter(usage_models)) if len(usage_models) == 1 else ""))
 PYEOF
 )" || m=""
     fi

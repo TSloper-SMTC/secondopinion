@@ -45,6 +45,8 @@ an environment variable does not prove them. Never edit Claude's private inboxes
    report its reason/action_needed. Exit 124 means the foreground wait expired,
    not that the worker stopped. Exit 1 means delivery is unconfirmed or a local
    error occurred. Inspect the retained task and relay exchange before retrying.
+   Exit 4 means worker conversation messages are ready; consume, acknowledge and
+   answer them as described below, then resume collection of the same task.
 5. Consume the result and record its conclusion/evidence in the owning project.
    Then explicitly acknowledge the exact revision:
 
@@ -56,6 +58,73 @@ an environment variable does not prove them. Never edit Claude's private inboxes
    `wait` never acknowledge implicitly, so a caller dying before consuming the
    result cannot make it disappear. Repeating an ack is idempotent. The relay's
    sealed exchange can separately be read and archived through normal commands.
+
+## Ongoing conversation
+
+Once the worker has claimed a task, either participant can send questions,
+answers, updates or direction without replacing the task's original request:
+
+```bash
+secondopinion task message TASK --id MESSAGE_ID --session YOUR_SESSION_ID --file message.md
+secondopinion task message TASK --id REPLY_ID --session YOUR_SESSION_ID --reply-to MESSAGE_ID --file reply.md
+```
+
+For the lead, `YOUR_SESSION_ID` is the original calling `CODEX_THREAD_ID`; for
+the worker, it is the assigned Claude session UUID. Run from the task's exact
+checkout. IDs are unique within a task. Retry with the SAME ID, sender, reply
+target and file contents; changing any of them is rejected. Message files must
+be nonempty UTF-8, at most 16 KiB. The mailbox snapshots them immediately.
+
+Lead messages invoke a bounded relay to the same existing worker. The plugin
+rechecks its UUID, unique name and checkout on every attempt. Worker messages
+are stored immediately and automatically notify the registered lead, including
+when idle, as `secondopinion_message`. Workers waiting for answers can end their
+turn; the lead's reply notifies that same worker through native delivery.
+
+Read and consume messages separately from task completion:
+
+```bash
+secondopinion task messages TASK
+secondopinion task messages TASK --session YOUR_SESSION_ID --unread
+secondopinion task message-read TASK MESSAGE_ID
+secondopinion task message-ack TASK MESSAGE_ID --session YOUR_SESSION_ID --sha256 EXACT_SHA256
+secondopinion task receive TASK --session YOUR_SESSION_ID --timeout 900
+```
+
+The recipient acknowledges only after consuming the exact message. `sha256`
+binds its task, ID, sender, recipient, reply target and body. Repeated acks are
+idempotent. Reading/delivery does not acknowledge implicitly. To answer a worker
+question, consume it, acknowledge it, then send your answer with `--reply-to`.
+If the work needs owner approval, retain that blocker until approval is given.
+
+Without automatic return, foreground `delegate`, `task wait`, and `wait-any`
+return **exit 4** with a JSON `messages` list. `wait`/`delegate` also include the
+current `task`; `wait-any` includes any ready `outcomes`. Handle both, then resume
+waiting. `receive` waits only for messages (0 when ready, 124 on timeout). It
+does not consume them. Existing task result acknowledgments remain separate.
+
+Message delivery exit 0 means the message is stored (worker to lead), or native
+delivery/consumption is confirmed (lead to worker). It does not mean the work is
+complete. Exit 1 also covers a contended send: if another delivery is active,
+wait for it to finish and inspect `message-read`. A still-queued message can be
+retried with the original ID and content. Scripts must inspect stored delivery
+state rather than infer ambiguity from exit 1 alone. `task status` exposes unread
+counts for the requester and worker without consuming anything.
+
+An interrupted/unconfirmed lead relay retains an ambiguous attempt;
+inspect `message-read` and the worker before explicitly retrying:
+
+```bash
+secondopinion task message-retry TASK MESSAGE_ID --session LEAD_SESSION_ID --confirm-not-delivered
+```
+
+Only use that confirmation after establishing that delivery did not occur.
+An acknowledged message or recorded receipt is never automatically redelivered.
+Messages and their notifications survive restarts and later task state changes;
+questions cannot be overwritten by subsequent progress. Conversation can discuss
+a terminal result, but cannot reopen a terminal task or grant another execution.
+No automatic message pruning. Delivery/consumption is not promised exactly once
+across arbitrary failures. Existing approval and sandbox boundaries still apply.
 
 ## Several existing workers
 

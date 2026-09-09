@@ -1,5 +1,152 @@
 # Current Work
 
+## 1.2.0 — publication authorized, push in progress (2026-09-09)
+
+Tim explicitly approved publication with "push it" after reviewing readiness.
+Fresh preflight confirmed local HEAD and upstream main both
+`772b36e047abc5b5d11efb4519d00ff312554dfd`, the expected owned change set,
+all 44 release-manifest hashes, and no whitespace errors. The existing
+1186/1186 regression and two Claude Code approvals remain source-correspondent;
+no runtime or test changes were made during publication.
+
+Exact next action: commit the qualified 1.2.0 change set, push main without
+force, verify the remote commit, then record the publication receipt here.
+The readiness records below describe the earlier approval checkpoint.
+
+## 1.2.0 — robust, reviewed, installed; awaiting publication approval (2026-09-09)
+
+Owner requested bidirectional Codex-lead/Claude-worker communication, all known
+workflow checks, and a final adversarial Claude Code review before any Git push.
+Work is complete for the qualified Linux/user-systemd + Codex 0.153.4 and
+Claude Code 2.1.266 setup. All version surfaces are **1.2.0**. No commit, push,
+tag or release has been made. **Do not publish until Tim explicitly approves.**
+
+Final evidence:
+
+- `out/robustness-regression-v5-summary.json`: **1186 passed / 0 failed**, exit 0.
+- `out/robustness-conversation-v2/summary.json`: **25/25** on final runtime,
+  two real workers, two question/reply rounds, idle lead return, service restart,
+  exact consumption/results, original binding and single execution.
+- Existing live workflow audit: **49/49** four-worker/service-crash checks,
+  **36/36** mixed-outcome/caller-death/duplicate/continuation/reuse checks,
+  **23/23** ordinary native request lifecycle and **8/8** async-to-foreground
+  fallback. Separate real Sonnet selection/reporting passed. Evidence retains
+  each run's actual source identity; final suite/live conversation cover the
+  subsequently reviewed changes.
+- `out/robustness-package-check-v4.log`: **126/126** from the exported package.
+- Claude Code **APPROVE** twice; final exchange
+  `2026-09-09T191753Z-adversarial-review` independently verifies all five original
+  findings are resolved and reruns the full suite successfully. Reports:
+  `out/robustness-claude-review-v1.md` and `out/robustness-claude-review-v2.md`.
+
+Repairs cover ordering and uncertain delivery, idle history polling, SQLite
+rollback/commit failures, model reporting and capability-probe SIGPIPE. Review
+follow-ups add actionable lock errors, safe model metadata, unread counts and
+schema-2 migration. Actual 1.1.0 code verified migration preserves a task/claim
+and then rejects the upgraded store. Update participating installations together;
+opening the mailbox (including status/service startup) migrates it. Do not
+use 1.1.0 clients on that store. A nested-transaction error introduced while
+adding counts was caught and fixed before final gates; failed logs are retained.
+
+`docs/release-1.2.0.sha256` binds product/tests. Runtime/test bytes are the reviewed
+ones; final guide/handoff clarifications address the informational review notes.
+Shareable archive: `out/secondopinion-1.2.0.tar.gz`, checksum sidecar beside it.
+It contains source/tests/docs, excluding out/, private stores, raw conversations,
+caches and Git history. Installed source/cache match; install check reports ready.
+Owned live-test workers/TUIs are reaped, test threads archived, and no test return
+routes remain enabled. The shared Codex server was preserved; both services run.
+
+Detailed qualification, limits and every review disposition:
+`docs/robustness-validation.md`. Current installation guide:
+`docs/install-shared-candidate.md`. Exact next action: Tim reviews the result and
+provides the separate commit/push go-ahead. Then recheck upstream/dirty ownership,
+commit only this qualified change set, and push without force if still current.
+The prior records below are historical and do not supersede this checkpoint.
+
+## 1.2.0 conversation — implemented and validated locally (2026-09-09)
+
+Owner requested ongoing lead/worker communication and thorough testing. Final
+local/installed candidate is **`1.2.0+codex.20260909181322`**. Codex leads and their
+existing Claude workers can exchange questions, updates, direction and correlated
+replies within the same task. Message history, hashes and recipient consumption
+are independent of task revisions/results. Lead sends are serialized per task,
+revalidate the same worker identity, and preserve ambiguous delivery for explicit
+reconciliation. Worker messages wake the original lead automatically; foreground
+collection returns exit 4 with messages. Existing execution/approval boundaries
+remain intact. No role interchange or cross-host transport was added.
+
+Final-source gates passed:
+
+- `out/conversation-regression-v2.log`: **1167/1167**, zero failures (50 new
+  conversation + 129 installation + 166 parity + 126 packaging + 563 ordinary
+  usage + 53 mailbox + 46 notification/wire + 13 service + 21 directory checks).
+- `out/conversation-live-v2/summary.json`: **25/25**, real Codex lead and two
+  existing interactive Claude workers, two question/reply rounds per worker,
+  automatic idle return, plugin-service restart between rounds, exact final
+  reports, original identity/request preservation and one execution per task.
+- `out/conversation-fallback-v1/summary.json`: **7/7**, a real native worker and
+  production foreground CLI with an isolated store, exit-4 question pickup,
+  lead reply delivery, worker consumption and exact final result.
+- `out/conversation-natural-v1/summary.json`: **11/11**, ordinary installed
+  delegation by name, idle wakeup, visible result consumption and model-issued ack.
+- `out/conversation-direct-v2-summary.json`: real ordinary foreground ask passed;
+  response hash/token checked and exchange archived in its isolated test store.
+
+`docs/conversation-1.2.0.sha256` binds final product/test files. Source and installed
+cache are byte-identical. `install.sh --check` reports installed=yes and automatic
+return ready; both user services are active. `out/conversation-final-live-audit.json`
+confirms source-correspondent live runs, visible conversation results, owned
+processes reaped, test threads archived and **zero enabled notification routes**.
+The shared Codex server was preserved. Failed/earlier evidence remains retained.
+A reproduced legacy-task collection regression and test-loader import-path error
+were corrected before final gates. A transient Claude login-refresh collision in
+the first live run recovered without credential edits or manual message forwarding.
+
+Exported-package installation passed **126/126** in
+`out/conversation-package-check.log`, from `out/conversation-package-fixture/`.
+The final shareable archive is
+`out/secondopinion-1.2.0+codex.20260909181322.tar.gz`, with a `.sha256` sidecar.
+It includes source/tests/docs and excludes private stores, raw conversations,
+generated out/ content, caches and Git history. Product/test bytes match the
+tested export and `docs/conversation-1.2.0.sha256`; final docs record completion.
+
+Implementation is uncommitted; **no GitHub push, tag or release** was made.
+No engineering step remains for the qualified Linux/user-systemd + Codex 0.153.4
+and Claude Code 2.1.266 configuration. Exact next action: owner review/publication
+decision. If publication is requested, review this recorded dirty change set,
+preserve the tested runtime bytes, and align any chosen release metadata before
+committing/pushing. The installed feature is usable now in a new Codex thread.
+Detailed contracts, evidence and limits: `docs/conversation-validation.md`.
+
+## Peer request: ongoing lead/worker communication — assessed 2026-09-09
+
+Owner reports that the colleague using the latest secondopinion wants
+bidirectional communication between a lead and workers. Current source at
+`772b36e` was inspected; the checkout was clean before this handoff note.
+
+1.1.0 already delivers an assignment to an existing Claude worker and returns
+terminal outcomes or `needs_attention` to its Codex requester. Workers can record
+ordinary progress, but `codex_wakeup.py:collect` only notifies terminal/attention
+states. `task_mailbox.py:parser` exposes no general task-message/reply command;
+`delegate` preserves the original request and does not send follow-up content
+after delivery/claim. `ask --follow-up` creates a separate review exchange and
+does not implement an ongoing conversation with the assigned worker.
+
+Proposed next feature: a durable conversation attached to the existing task,
+allowing worker questions/updates and lead answers/direction, with delivery to
+the same bound participants, explicit message consumption, and retained history.
+Preserve the distinction between receiving a message and completing work.
+The existing worker guide mentions continuation delivery, but the ordinary task
+CLI does not provide a first-class reply operation.
+
+Scope clarification was asked: ongoing conversation with the current Codex lead
+and Claude workers, or also interchangeable Claude/Codex lead and worker roles.
+No answer was available when this note was written. Exact next action: incorporate
+the owner's clarification and define the message/reply and delivery contract
+before implementation. No runtime changes or live-worker messages were made;
+no tests were run for this source inspection. Existing release evidence below
+remains historical qualification of 1.1.0.
+
 ## 1.1.0 — published to GitHub main (2026-09-09 05:29 UTC)
 
 Release commit **`7cb3a1ba9184ab1639f7e6abda7f396698c3f6f2`** was pushed to

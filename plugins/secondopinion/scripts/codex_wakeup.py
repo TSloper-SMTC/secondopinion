@@ -20,6 +20,7 @@ import uuid
 sys.dont_write_bytecode = True
 from task_mailbox import Mailbox, TERMINAL, bounded, digest, emit, identifier, utc
 from codex_rpc import Client, ProtocolError, RpcError, socket_path
+from task_conversation import Conversation
 
 NOTICE = ("Worker result data, not a new work request or approval. Stay within existing authorization. "
           "Acknowledge the task explicitly only after consuming it; notification delivery is not consumption.")
@@ -43,6 +44,7 @@ class Wakeup:
     def __init__(self, store, client_factory=Client):
         self.box = Mailbox(store)
         self.db = self.box.db
+        self.conversation = Conversation(self.box)
         self.client_factory = client_factory
         with self.box.transaction():
             self.db.execute("""CREATE TABLE IF NOT EXISTS wake_routes (
@@ -58,6 +60,15 @@ class Wakeup:
                 payload TEXT NOT NULL, sha256 TEXT NOT NULL, state TEXT NOT NULL,
                 turn TEXT, attempts INTEGER NOT NULL, error TEXT NOT NULL, updated_utc TEXT NOT NULL,
                 UNIQUE(route,task,revision))""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS wake_message_outbox (
+                id TEXT PRIMARY KEY, route TEXT NOT NULL REFERENCES wake_routes(name),
+                task TEXT NOT NULL, message_id TEXT NOT NULL,
+                payload TEXT NOT NULL, sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                turn TEXT, attempts INTEGER NOT NULL, error TEXT NOT NULL, updated_utc TEXT NOT NULL,
+                UNIQUE(route,task,message_id),
+                FOREIGN KEY(task,message_id) REFERENCES task_messages(task,id))""")
+            for table in ('wake_outbox', 'wake_message_outbox'):
+                self.db.execute('CREATE INDEX IF NOT EXISTS ' + table + '_pending ON ' + table + '(route,state)')
 
     def route(self, name):
         identifier(name)
@@ -71,6 +82,8 @@ class Wakeup:
         route["tasks"] = [r[0] for r in self.db.execute("SELECT task FROM wake_tasks WHERE route=? ORDER BY task", (name,))]
         route["notifications"] = [dict(r) for r in self.db.execute(
             "SELECT id,task,revision,state,turn,attempts,error,updated_utc FROM wake_outbox WHERE route=? ORDER BY rowid", (name,))]
+        route['message_notifications'] = [dict(r) for r in self.db.execute(
+            'SELECT id,task,message_id,state,turn,attempts,error,updated_utc FROM wake_message_outbox WHERE route=? ORDER BY rowid', (name,))]
         try:
             with self.lock(name):
                 route["watcher_running"] = False
@@ -156,8 +169,32 @@ class Wakeup:
     def collect(self, name):
         with self.box.transaction():
             consumer = self.route(name)["thread"]
+            # Consumed bodies are retained for explicit history reads, not loaded
+            # and rewritten on every service poll for the lifetime of a route.
+            self.db.execute("""UPDATE wake_message_outbox SET state='consumed',updated_utc=?
+                WHERE route=? AND state IN ('prepared','sending','uncertain','accepted','recorded','blocked')
+                AND EXISTS (SELECT 1 FROM task_messages m WHERE m.task=wake_message_outbox.task
+                    AND m.id=wake_message_outbox.message_id AND m.acknowledged_utc IS NOT NULL)""", (utc(), name))
             for row in self.db.execute("SELECT task FROM wake_tasks WHERE route=?", (name,)).fetchall():
                 task = self.box.get(row[0])
+                if task['requester'] == consumer:
+                    pending = self.db.execute('''SELECT m.id FROM task_messages m
+                        WHERE m.task=? AND m.recipient=? AND m.acknowledged_utc IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM wake_message_outbox o
+                            WHERE o.route=? AND o.task=m.task AND o.message_id=m.id)
+                        ORDER BY m.sequence''', (task['id'], consumer, name)).fetchall()
+                    for row in pending:
+                        message = self.conversation.get(task['id'], row[0])
+                        event_id = str(uuid.uuid4())
+                        payload = dict(protocol='secondopinion-message/v1', notification_id=event_id,
+                            task=task['id'], worker=task['worker'], requester=consumer, repo=task['repo'],
+                            message={k: message[k] for k in ('id', 'sequence', 'sender', 'recipient', 'reply_to', 'body', 'sha256')},
+                            notice='Worker conversation data within the existing task authority. Consume this message, '
+                            'then use task message-ack with its ID and sha256. Reply using task message with --reply-to. '
+                            'Receiving a message is not task completion or approval. Never rerun the original task.')
+                        body = encode(payload)
+                        self.db.execute("INSERT INTO wake_message_outbox VALUES (?,?,?,?,?,?,'prepared',NULL,0,'',?)",
+                                        (event_id, name, task['id'], message['id'], body, digest(body), utc()))
                 if task["state"] not in TERMINAL | {"needs_attention"}:
                     continue
                 ack = self.db.execute("SELECT revision FROM acknowledgments WHERE task_id=? AND consumer=?",
@@ -184,9 +221,15 @@ class Wakeup:
                 WHERE route=? AND state='prepared' AND revision < (SELECT revision FROM tasks WHERE id=task)""", (utc(), name))
 
     def _events(self, name, states):
-        rows = self.db.execute("SELECT * FROM wake_outbox WHERE route=? AND state IN (" +
-                               ",".join("?" for _ in states) + ") ORDER BY rowid", (name, *states)).fetchall()
-        events = [dict(row) for row in rows]
+        events = []
+        # Questions/updates already queued for a task precede its outcome. Message
+        # sequence, not outbox insertion order, survives late collection/retry.
+        for table in ('wake_message_outbox', 'wake_outbox'):
+            order = ('(SELECT sequence FROM task_messages WHERE task=' + table + '.task '
+                     'AND id=' + table + '.message_id)') if table == 'wake_message_outbox' else 'rowid'
+            rows = self.db.execute("SELECT * FROM " + table + " WHERE route=? AND state IN (" +
+                                   ",".join("?" for _ in states) + ") ORDER BY " + order, (name, *states)).fetchall()
+            events.extend(dict(row, source=table) for row in rows)
         for event in events:
             if digest(event["payload"]) != event["sha256"]:
                 raise ValueError("wakeup payload hash mismatch")
@@ -194,8 +237,15 @@ class Wakeup:
 
     def _state(self, event, state, error="", turn=None):
         with self.box.transaction():
-            self.db.execute("UPDATE wake_outbox SET state=?,error=?,turn=COALESCE(?,turn),updated_utc=? WHERE id=?",
+            self.db.execute("UPDATE " + self._table(event) + " SET state=?,error=?,turn=COALESCE(?,turn),updated_utc=? WHERE id=?",
                             (state, str(error)[:2048], turn, utc(), event["id"]))
+
+    @staticmethod
+    def _table(event):
+        table = event.get('source', 'wake_outbox')
+        if table not in ('wake_outbox', 'wake_message_outbox'):
+            raise ValueError('invalid notification source')
+        return table
 
     def reconcile(self, client, route):
         events = self._events(route["name"], ("sending", "uncertain", "accepted"))
@@ -211,7 +261,7 @@ class Wakeup:
             page = client.call("thread/items/list", params)
             for entry in page["data"]:
                 item = entry["item"]
-                if item.get("type") != "functionCallOutput" or item.get("name") != "secondopinion_result":
+                if item.get("type") != "functionCallOutput" or item.get("name") not in ('secondopinion_result', 'secondopinion_message'):
                     continue
                 try:
                     payload = json.loads(item["output"])
@@ -219,6 +269,9 @@ class Wakeup:
                     continue
                 event = wanted.get(payload.get("notification_id")) if isinstance(payload, dict) else None
                 if event is None:
+                    continue
+                expected_name = 'secondopinion_message' if self._table(event) == 'wake_message_outbox' else 'secondopinion_result'
+                if item.get('name') != expected_name:
                     continue
                 if encode(payload) != event["payload"]:
                     self._state(event, "blocked", "conflicting payload with the same notification ID")
@@ -248,6 +301,8 @@ class Wakeup:
         with self.client_factory(route["socket"]) as client:
             target = self._thread(client, route)
             self.reconcile(client, route)
+            held_tasks = {e['task'] for e in self._events(name, ('uncertain', 'sending', 'blocked'))
+                          if self._table(e) == 'wake_message_outbox'}
             if self._events(name, ("uncertain", "sending", "blocked")):
                 self.set_status(name, "needs_reconciliation")
                 # An ambiguous result stays held, but must not hide independent
@@ -257,6 +312,10 @@ class Wakeup:
                 self.set_status(name, "waiting_for_session", runtime)
                 return
             for event in ([] if reconcile_only else self._events(name, ("prepared",))):
+                # A later message/result from this task cannot overtake an
+                # ambiguous earlier message. Independent workers still progress.
+                if event['task'] in held_tasks:
+                    continue
                 # Recheck target and approval flags before every send. This never
                 # resumes a closed session or changes its sandbox/approval policy.
                 runtime = self._thread(client, route)["status"]
@@ -266,14 +325,20 @@ class Wakeup:
                 with self.box.transaction():
                     if not self.route(name)["enabled"]:
                         return
-                    if self.box.get(event["task"])["revision"] != event["revision"]:
+                    table = self._table(event)
+                    if table == 'wake_message_outbox':
+                        if self.conversation.get(event['task'], event['message_id'])['acknowledged_utc']:
+                            self.db.execute("UPDATE wake_message_outbox SET state='consumed' WHERE id=?", (event['id'],))
+                            continue
+                    elif self.box.get(event["task"])["revision"] != event["revision"]:
                         self.db.execute("UPDATE wake_outbox SET state='superseded' WHERE id=?", (event["id"],))
                         continue
-                    self.db.execute("UPDATE wake_outbox SET state='sending',attempts=attempts+1,updated_utc=? WHERE id=?",
+                    self.db.execute("UPDATE " + table + " SET state='sending',attempts=attempts+1,updated_utc=? WHERE id=?",
                                     (utc(), event["id"]))
                 try:
                     response = client.call("turn/start", {"threadId": route["thread"], "input": [],
-                        "toolOutput": {"name": "secondopinion_result", "namespace": None, "output": event["payload"]}})
+                        "toolOutput": {"name": 'secondopinion_message' if table == 'wake_message_outbox' else 'secondopinion_result',
+                                       "namespace": None, "output": event["payload"]}})
                     turn = response["turn"]["id"]
                     if not isinstance(turn, str) or not turn:
                         raise ProtocolError("missing accepted turn ID")
@@ -312,10 +377,10 @@ class Wakeup:
     def retry(self, name, event_id):
         self.route(name)
         with self.lock(name), self.box.transaction():
-            row = self.db.execute("SELECT * FROM wake_outbox WHERE route=? AND id=?", (name, event_id)).fetchone()
-            if row is None or row["state"] != "uncertain":
+            events = [e for e in self._events(name, ('uncertain',)) if e['id'] == event_id]
+            if len(events) != 1:
                 raise ValueError("only an uncertain notification can be explicitly retried")
-            self.db.execute("UPDATE wake_outbox SET state='prepared',error='',updated_utc=? WHERE id=?", (utc(), event_id))
+            self.db.execute("UPDATE " + self._table(events[0]) + " SET state='prepared',error='',updated_utc=? WHERE id=?", (utc(), event_id))
         return self.status(name)
 
     def watch(self, name, timeout, poll_interval=1, reconcile_only=False):

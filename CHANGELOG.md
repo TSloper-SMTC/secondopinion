@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0 — 2026-09-09
+
+- Add ongoing task conversations: worker questions/updates, lead direction and
+  correlated replies delivered to the same bound participants. Keep immutable
+  message history and exact recipient acknowledgments separate from task results.
+- Automatically wake the lead for every unconsumed worker message; retain
+  messages across task transitions and service restarts. Foreground collection
+  returns messages with exit 4. Revalidate worker identity before lead delivery
+  and retain ambiguous sends for explicit reconciliation rather than blind replay.
+- Preserve worker-message order before task results, including recovery from
+  uncertain notifications, while allowing independent workers to progress.
+- Avoid repeatedly loading or rewriting consumed conversation history during
+  polling. Recover cleanly from SQLite storage exhaustion and failed commits.
+- Report the observed primary responder model instead of guessing from aggregate
+  usage that can include helper models; leave ambiguous model identity unproven.
+- Drain CLI capability-probe output to prevent a SIGPIPE race from falsely
+  reporting that a supported responder lacks `--safe-mode`.
+- Harden adversarial-review findings: actionable concurrent-send recovery,
+  sanitized model metadata, unread counts in task status, and a schema-2 marker
+  that makes older clients refuse a migrated conversation store explicitly.
+
 ## 1.1.0 — 2026-09-09
 
 - Named-worker discovery uses a fresh public host listing; sandboxed callers need no manual UUID lookup.
