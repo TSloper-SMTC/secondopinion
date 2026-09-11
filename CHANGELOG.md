@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1 — 2026-09-11
+
+- Add an optional Claude worker mailbox hook that wakes the bound session for
+  tasks and unread messages without a relay model call. Enable with
+  `install.sh --claude` and restart/resume workers; retain `--claude` on updates.
+  Existing relay-only installations remain supported.
+- Add `task available` so the original lead can queue a fixed reminder for an
+  unclaimed task without changing its request or granting execution authority.
+- Preserve structured relay diagnostics, including API retries before tool use,
+  tool availability, native send observations, public worker matching, and fallback
+  state. Capture failed-relay exchange IDs from the CLI's diagnostic stream.
+- Distinguish queued hook notifications, native receipts, worker claims and
+  completed work. Keep original task/message identities and claim authority.
+
 ## 1.2.0 — 2026-09-09
 
 - Add ongoing task conversations: worker questions/updates, lead direction and

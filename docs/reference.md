@@ -17,9 +17,9 @@ States: `draft → published → claimed → answered → archived`.
 
 ## Delegate to an existing Claude worker
 
-The optional worker mailbox supports a longer handoff: a temporary Claude relay
-delivers the task, then the existing worker publishes progress and its final
-report directly to a durable mailbox. The relay can exit before the worker.
+The worker mailbox supports a longer handoff: an installed Claude worker hook
+or a temporary Claude relay notifies the worker, which publishes progress and its
+final report directly to the durable mailbox. The hook needs no relay inference.
 
 ```bash
 secondopinion workers  # optional public name/UUID/checkout listing
@@ -28,8 +28,9 @@ secondopinion task result review-123
 secondopinion task ack review-123 --consumer YOUR_CODEX_THREAD_ID --revision N
 ```
 
-With `--async` and `notification=automatic`, exit 0 means delivery acceptance;
-worker results arrive separately in this Codex conversation. No user registration
+With `--async` and `notification=automatic`, exit 0 means tracking is active;
+`delivery` distinguishes a queued hook notice, native acceptance and an independent worker claim.
+Worker results arrive separately in this Codex conversation. No user registration
 or watcher command is required. Otherwise keep `delegate` running: foreground
 exit 0 requires a worker report. Exit 3 reports refusal, failure,
 or a blocker; exit 124 means the foreground wait expired without stopping the worker. Reuse
@@ -49,7 +50,8 @@ already-running processes must also be restarted. Do not downgrade a migrated
 store to a 1.1.0 client.
 The migration occurs on the first mailbox open, including `task status` or the
 installed return service's startup. This deliberate eager migration provides
-one atomic upgrade point; mixed-version operation is not supported.
+one atomic upgrade point; mixing 1.1.0 clients with schema-2 clients is not supported.
+Version 1.2.1 keeps schema 2 and requires no further migration from 1.2.0.
 
 Ongoing conversation uses `task message TASK --id MESSAGE_ID --session SESSION
 --file message.md` and `--reply-to MESSAGE_ID` for answers. Messages retain their
@@ -62,9 +64,11 @@ for consumption, reply and recovery commands.
 `task status TASK` includes `unread_messages.requester` and
 `unread_messages.worker` counts. Reading status never consumes those messages.
 
-Lead sends are serialized per task. An earlier queued or uncertain delivery
-must be delivered or reconciled before a newer message can be sent to that
-worker. Independent workers can receive messages concurrently.
+Lead relay sends are serialized per task. An earlier queued or uncertain relay
+must be delivered or reconciled before a newer relay send. A worker hook can
+instead discover the retained unread messages in sequence without resending
+their contents or recording a native receipt. Independent workers can receive
+messages concurrently.
 Worker notifications preserve message order before queued task results. An
 uncertain worker-message notification holds later notifications from that task
 for reconciliation; other workers continue independently.
@@ -80,8 +84,10 @@ An explicit `--worker UUID` remains available. The relay also checks its native
 listing; no guessed peers, private inbox writes or automatic replacement workers.
 Names are routing information, not authentication against another same-user process.
 
-This mode requires native `ListAgents`/`SendMessage` support and a reachable
-existing worker. The installer configures automatic idle return for ordinary local
+This mode requires a reachable existing worker. For notifications without a relay
+model call, install with `install.sh --claude` and restart/resume workers; see the
+[1.2.1 repair and activation notes](delivery-relay-1.2.1.md). Otherwise relay delivery
+requires native `ListAgents`/`SendMessage` support. The installer configures automatic idle return for ordinary local
 Codex CLI conversations on Linux with user systemd. Closed/unloaded conversations
 are not resumed automatically. Unsupported clients use foreground waiting;
 stored results remain available for later pickup. No notification overrides
@@ -201,7 +207,7 @@ git clone https://github.com/TSloper-SMTC/secondopinion ~/tools/secondopinion
 
 Prerequisites: bash, GNU coreutils/sed/grep/awk/flock, git, python3 (installer
 and `ask`), the `codex` CLI (default form), and the `claude` CLI on PATH for the
-headless responder (nothing is installed into Claude itself). Claude Code must
+headless responder (the default install adds nothing to Claude itself). Claude Code must
 advertise `--safe-mode`; `ask` checks this before creating an exchange.
 
 Every form creates `~/.local/bin/secondopinion` (the checkout is the install —
@@ -222,7 +228,9 @@ side at most one form is active, as `--check` verifies.
 - **`--claude`** — additionally installs the Claude Code plugin
   (`claude plugin marketplace add` + `claude plugin install`), so a human
   Claude session can run `/secondopinion:secondopinion-respond [ID]`
-  interactively. `--plugin` is a deprecated alias.
+  interactively and receive task/message reminders through its mailbox hook.
+  Restart/resume workers after installation and retain `--claude` on updates.
+  `--plugin` is a deprecated alias.
 - **`--skills`** — symlink form for setups without plugin support:
   `~/.codex/skills/secondopinion-request` (and, with `--claude`,
   `~/.claude/skills/secondopinion-respond`, invoked as
@@ -415,6 +423,19 @@ names are honoured with a deprecation warning.
 ```bash
 tests/run.sh
 ```
+
+For the native worker-hook qualification with a local deterministic API fixture:
+
+```bash
+python3 -B tests/native_delivery_hook.py --output out/native-hook-acceptance
+python3 -B tests/native_interactive_delivery.py --output out/interactive-hook-acceptance
+```
+
+Use new output directories. These run isolated Claude sessions against a local
+API fixture, including an injected 503. The interactive test exercises actual
+worker discovery, delegation, Bash tool execution, task retries and follow-up
+messages. It qualifies runtime integration, not real-model interpretation or
+provider availability. See the [1.2.1 validation record](delivery-relay-1.2.1.md).
 
 For the optional end-to-end existing-worker canary, run on the host from the
 repository root, using a new output directory for each run:

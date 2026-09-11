@@ -6,7 +6,7 @@
 #                        needs only the `claude` CLI on PATH (the mirror of the Claude->Codex plugin,
 #                        which installs nothing in Codex).
 #   install.sh --claude  additionally install the Claude Code plugin secondopinion@secondopinion, for
-#                        interactive responding (/secondopinion:secondopinion-respond). Optional.
+#                        interactive responding and inference-free worker mailbox hooks. Optional.
 #   install.sh --skills  symlink form instead of plugins: ~/.codex/skills/secondopinion-request
 #                        (with --claude: ~/.claude/skills/secondopinion-respond). For setups without
 #                        plugin support. Mutually exclusive with the plugin form; switching retires
@@ -422,12 +422,12 @@ if [ "$CHECK" = 0 ] && { [ "$CLAUDE" = 0 ] || [ "$SKILLS" = 1 ]; } && plugin_pre
         echo "ERROR: could not confirm that $PLUGIN_ID is absent after uninstall (inspection=$PLUGIN_INSPECT, state='$PLUGIN_STATE'); stopping before creating anything in its place. Re-run install.sh." >&2; exit 1
     fi
     if [ "$CLAUDE" = 1 ]; then echo "removed   Claude plugin $PLUGIN_ID (--skills uses the user-level /secondopinion-respond skill instead)"
-    else echo "removed   Claude plugin $PLUGIN_ID (nothing needs to be installed in Claude; re-add with install.sh --claude)"; fi
+    else echo "removed   Claude plugin $PLUGIN_ID (worker hooks disabled; re-add with install.sh --claude)"; fi
 fi
 # The Claude user-level skill stays ONLY for `--skills --claude`.
 if [ "$CHECK" = 0 ] && ! { [ "$SKILLS" = 1 ] && [ "$CLAUDE" = 1 ]; }; then
     if [ -L "$CLAUDE_SKILL_LINK" ]; then
-        rm -f -- "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (nothing needs to be installed in Claude; re-add with install.sh --skills --claude)"
+        rm -f -- "$CLAUDE_SKILL_LINK"; echo "retired   $CLAUDE_SKILL_LINK (re-add the interactive respond skill with install.sh --skills --claude)"
     elif [ -e "$CLAUDE_SKILL_LINK" ]; then
         mkdir -p "$BACKUP_DIR"; bak="$(backup_path secondopinion-respond)"
         mv -T -- "$CLAUDE_SKILL_LINK" "$bak"; echo "backed-up $CLAUDE_SKILL_LINK -> $bak"
@@ -655,6 +655,11 @@ case ":$PATH:" in
 esac
 
 if [ "$CHECK" = 1 ]; then
+    if plugin_current; then
+        echo "worker_notifications=hook_available (restart/resume Claude workers to load it; requires asyncRewake)"
+    else
+        echo "worker_notifications=relay_only (optional mailbox hooks: install.sh --claude, then restart/resume workers)"
+    fi
     python3 -B "$ROOT/scripts/wake_service.py" check --store "$STORE_DIR" || status=1
     [ "$status" = 0 ] && echo "installed=yes" || echo "installed=no"
 else

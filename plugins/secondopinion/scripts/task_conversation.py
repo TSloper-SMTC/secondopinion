@@ -205,6 +205,13 @@ def deliver(conversation, task_id, message_id, session, cli, timeout, retry=Fals
         message = conversation.get(task_id, message_id)
         if message['acknowledged_utc'] or message['delivery']['state'] == 'delivered':
             return message
+        # A hook reads the durable, ordered conversation itself; it does not
+        # resend arbitrary content or invent a native delivery receipt. Even an
+        # uncertain relay can be discovered this way without repeating execution.
+        from worker_hook import notify
+        notification = notify(box, task)
+        if notification['state'] == 'queued':
+            return dict(message, notification=notification)
         if message['delivery']['state'] != 'queued' and not retry:
             raise ValueError('message delivery is ambiguous; inspect the worker and receipt before message-retry --confirm-not-delivered')
         for previous in conversation.messages(task_id, task['worker'], unread=True):
@@ -214,13 +221,7 @@ def deliver(conversation, task_id, message_id, session, cli, timeout, retry=Fals
         # A name can now belong to a replacement session. Check UUID and checkout
         # again for every new attempt, even though the original task route is fixed.
         from worker_directory import Directory
-        rows = Directory(box).rows()
-        matches = [r for r in rows if r['sessionId'] == task['worker']]
-        if len(matches) != 1 or matches[0]['cwd'] != task['repo']:
-            raise ValueError('bound worker is absent, ambiguous or in a different checkout')
-        name = matches[0]['name']
-        if (task['worker_name'] and name != task['worker_name']) or len([r for r in rows if r['name'] == name]) != 1:
-            raise ValueError('bound worker name changed or became ambiguous')
+        name = Directory(box).bound(task)['name']
         task = dict(task, worker_name=name)
         attempt = str(uuid.uuid4())
         with box.transaction():
@@ -302,11 +303,11 @@ def dispatch(box, args):
         if message['recipient'] == task['worker']:
             message = deliver(conversation, args.id, args.message_id, args.session, args.cli, args.delivery_timeout)
         emit(message)
-        return 0 if not message['delivery'] or message['acknowledged_utc'] or message['delivery']['state'] == 'delivered' else 1
+        return 0 if not message['delivery'] or message['acknowledged_utc'] or message['delivery']['state'] == 'delivered' or message.get('notification', {}).get('state') == 'queued' else 1
     if command == 'message-retry':
         message = deliver(conversation, args.id, args.message_id, args.session, args.cli, args.delivery_timeout, retry=True)
         emit(message)
-        return 0 if message['acknowledged_utc'] or message['delivery']['state'] == 'delivered' else 1
+        return 0 if message['acknowledged_utc'] or message['delivery']['state'] == 'delivered' or message.get('notification', {}).get('state') == 'queued' else 1
     if command == 'message-read':
         emit(conversation.get(args.id, args.message_id))
     elif command == 'message-ack':

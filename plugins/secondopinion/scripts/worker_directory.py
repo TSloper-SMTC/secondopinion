@@ -16,6 +16,10 @@ import uuid
 MAX_AGE = 10
 
 
+class WorkerMismatch(ValueError):
+    """A successful public listing did not contain the bound unique worker."""
+
+
 class Directory:
     def __init__(self, box):
         self.box = box
@@ -97,4 +101,14 @@ class Directory:
         row = matches[0]
         if row["cwd"] != str(Path(repo).resolve()):
             raise ValueError("named worker belongs to a different checkout")
+        return row
+
+    def bound(self, task):
+        rows = self.rows()
+        matches = [row for row in rows if row['sessionId'] == task['worker']]
+        if len(matches) != 1 or matches[0]['cwd'] != task['repo']:
+            raise WorkerMismatch('bound worker is absent, ambiguous or in a different checkout')
+        row = matches[0]
+        if (task['worker_name'] and row['name'] != task['worker_name']) or len([r for r in rows if r['name'] == row['name']]) != 1:
+            raise WorkerMismatch('bound worker name changed or became ambiguous')
         return row

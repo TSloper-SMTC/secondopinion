@@ -37,6 +37,12 @@ exchange = re.findall(r"^Exchange-ID: (.+)$", prompt, re.M)[-1]
 request = Path(os.environ["SECONDOPINION_DIR"], "exchanges", exchange, "prompt.md").read_text()
 task_id, worker = re.search(r"Delegated task ([\w.-]+); assigned worker session ([\w.-]+)\.", request).groups()
 scenario = os.environ["TASK_FIXTURE_SCENARIO"]
+if scenario == 'api-timeout':
+    print(json.dumps(dict(type='system',subtype='init',tools=['ListAgents','SendMessage'])),flush=True)
+    for _ in range(10):
+        print(json.dumps(dict(type='system',subtype='api_retry',error='unknown')),flush=True)
+    time.sleep(30)
+    sys.exit(1)
 if scenario != "no-tools":
     call("task", "delivered", task_id, "--receipt", "fixture-message-" + task_id)
 if scenario not in ("delivery-only", "no-tools"):

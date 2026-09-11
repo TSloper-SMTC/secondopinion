@@ -20,7 +20,8 @@ access unless you explicitly disabled it. No Claude-side plugin is required.
 On Linux with user systemd, it also configures the local Codex server and
 automatic worker-result delivery. Existing Codex conversations must be restarted.
 
-To update, run `git pull --ff-only`, rerun the installer, and start a new Codex thread.
+To update, run `git pull --ff-only`, rerun the installer with your original options
+(including `--claude` for worker hooks), and start a new Codex thread.
 
 ## Usage
 
@@ -46,6 +47,13 @@ secondopinion ask --attach EXCHANGE_ID  # retry an interrupted request
 ```
 
 ### Existing Claude workers
+
+For worker notifications that do not need a relay model call, install with
+`./plugins/secondopinion/scripts/install.sh --claude` and restart/resume the
+workers to load their mailbox hooks (validated on Claude Code 2.1.268).
+Use `--claude` on subsequent updates too. Workers still need model access to do
+their work; notification can arrive during an API outage.
+See the [update and shared-archive steps](docs/install-shared-candidate.md).
 
 Start named Claude sessions in your project, for example `claude --name bench`
 and `claude --name reviewer`. Then ask Codex:

@@ -1,5 +1,119 @@
 # Current Work
 
+## 1.2.1 — publication authorized, in progress (2026-09-11)
+
+Tim explicitly authorized publication with "ok push it" after the readiness
+review. Local main and remote main both start at
+`44e68064322539621b8309a37e19a4175226877f`; the reviewed change set is owned by this
+delivery repair. The GitHub CLI's stored HTTPS login is invalid, but existing
+SSH authentication succeeds as `TSloper-SMTC` and verifies the same repository.
+Push using `git@github.com:TSloper-SMTC/secondopinion.git` without changing origin
+or credentials, and without force.
+
+Release dates and install/qualification text are finalized for 1.2.1.
+`docs/release-1.2.1.sha256` binds all 51 product/test files. Its only difference
+from the retained candidate manifest is the plugin changelog's release date.
+The **1213/1213** regression, **129/129** fresh installer, **132/132** fresh package,
+**8/8** native stream and **15/15** native interactive checks remain applicable.
+The release archive is `out/secondopinion-1.2.1.tar.gz` with a SHA-256 sidecar;
+the earlier candidate archive and evidence are preserved.
+
+Exact next action: commit the reviewed release files, push main through SSH,
+verify remote HEAD, then record the publication receipt here. Peer activation
+requires `install.sh --claude`, a new Codex thread and restart/resume of the
+original Claude workers. Peer-host acceptance and real-provider/model behavior
+remain rollout checks. The records below are historical and do not supersede
+this authorization.
+
+## 1.2.1 delivery repair — qualified local candidate, awaiting publication (2026-09-11)
+
+Owner requested review and resolution of the peer's
+`SECONDOPINION_DELIVERY_RELAY_PATH_ISSUE.md`. Base checkout was clean at
+`44e6806`. The report exposes a real dependency: notifying an existing worker
+requires a new relay inference. API retries can prevent any native tool call.
+Raw peer logs were not supplied beyond the report; the precise API cause remains
+unproven. Review, implementation, limits and peer steps:
+`docs/delivery-relay-1.2.1.md`.
+
+Implemented optional Claude `asyncRewake` worker hooks, durable typed pre-claim
+`task available` notices, structured relay diagnostics, reliable failed-relay
+exchange-ID capture, and separate queued/accepted/worker-claimed reporting.
+Worker hooks also discover unread conversation messages. Merely drafting a task
+does not notify; eligibility follows requester/return-registration checks.
+Claims, authority, message acknowledgment, task revisions and native receipts
+remain separate. All version surfaces are **1.2.1**, marked unreleased.
+
+Runtime/test files are bound by `docs/candidate-1.2.1.sha256` (51 files).
+New deterministic tests pass **21/21**. Native source-plugin qualification on
+Claude Code **2.1.268** passes **8/8** using a persistent stream session and an
+isolated local fake API: the reminder reaches the idle session before its next
+request receives an injected 503. No real model-executed job is claimed by this
+test. Evidence: `out/delivery-relay-investigation/native-async/summary.json`.
+Its owned runtime/watcher were stopped. Exported-package install checks pass
+**132/132** in `out/delivery-relay-investigation/package-install.log`.
+
+Owner challenged certainty and regression coverage. Added
+`tests/native_interactive_delivery.py`, which passed **15/15** on the unchanged
+production bytes in `out/delivery-relay-investigation/interactive-v4/summary.json`.
+This uses an actual interactive Claude PTY, actual public worker discovery,
+production `delegate`/message commands and permitted native Bash tool execution.
+The hook delivered during an injected 503; the worker claimed/completed two
+successive tasks; same-ID retries preserved single execution; a follow-up was
+consumed, acknowledged and answered without reopening completed work. A trap
+proved no headless relay launched. The runtime and watcher were stopped.
+API responses are controlled fixture responses, so this qualifies transport,
+tool execution and mailbox integration, not real-model interpretation or the
+peer's environment. The first three harness runs stopped at fresh-fixture UI
+setup (theme/API-key confirmation), before exercising delegation; these are
+retained and are not product failures. No transport or mailbox runtime repair was
+needed after the 1213-check gate; later changes added the interactive test,
+updated documentation and clarified installer status wording.
+
+Final full regression passed **1213/1213**, exit 0:
+`out/delivery-relay-investigation/regression-final.log` and
+`regression-summary.json` (129 install + 170 parity + 132 package + 565 ordinary
+usage + 61 conversation + 21 delivery/hook + 55 mailbox + 46 wakeup/wire + 13
+service + 21 directory checks). Earlier failed fixture assertions were corrected;
+their logs remain in the investigation directory. The final native hook run and
+exported-package checks cover the final hook configuration, including explicit
+`async=true` to avoid blocking on runtimes without `asyncRewake` support.
+Plugin, skill, Bash syntax and whitespace checks passed. No active owner/peer worker, credentials,
+global configuration, installed cache, Git commit, push, tag or release was changed.
+The default CLI symlink may read the working source; active sessions were not
+restarted or enrolled in worker hooks.
+
+Shareable candidate: `out/secondopinion-1.2.1-candidate.tar.gz`, with adjacent
+SHA-256 sidecar. It contains source/tests/docs only, excluding Git history,
+private stores, raw native sessions, caches and generated evidence. Exported
+product/test bytes match all 51 hashes in the candidate manifest. The archive
+was refreshed to include the additional interactive test and the readiness audit.
+
+Publication-readiness audit (2026-09-11): corrected the active install guide's
+stale 1.2.0 instructions, documented retaining `--claude` on updates, and aligned
+worker/message success semantics with queued versus accepted notifications.
+README, technical reference, both matching changelogs and all version metadata
+now describe 1.2.1. All relative Markdown file links resolve. The installer now
+says removing the optional Claude plugin disables worker hooks. Fresh installer
+checks pass **129/129** and refreshed exported-package checks pass **132/132**:
+`out/delivery-relay-investigation/readiness-install.log` and
+`readiness-package-install.log`. Native qualification's recorded runtime hashes
+still match; all 51 current candidate hashes match source and exported files.
+Whitespace and Bash syntax checks pass. Read-only `git ls-remote` confirmed
+upstream main still equals local HEAD `44e68064322539621b8309a37e19a4175226877f`.
+The candidate is ready to commit/push; no publication has occurred.
+
+Exact next action: owner reviews and approves publication. Publication is a
+separate owner approval step, consistent with prior releases. After approval, recheck
+upstream/dirty ownership, date the 1.2.1 changelog entries, update unpublished
+status text and candidate hashes/archive for the publication, commit only this
+reviewed change, and push without force. Record the verified remote commit.
+The peer then runs `install.sh --claude` and restarts/resumes workers
+with their original UUIDs; use `--claude` on subsequent updates too. Retrying
+the original task IDs preserves single-claim execution. Peer-host acceptance
+and real-provider/model behavior remain rollout checks. No regressions were
+detected in the covered workflows; neither the test count nor local native
+qualification establishes universal correctness across every host/runtime.
+
 ## 1.2.0 — published to GitHub main (2026-09-09 19:48 UTC)
 
 Release commit **`6742ff9c6aef77c277aaf59e40b6be4fc551b989`** was pushed to

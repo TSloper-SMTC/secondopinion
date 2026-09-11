@@ -2,9 +2,42 @@
 
 Use this mode for an authorized handoff to an existing Claude session on the
 same machine and Unix account, with access to the same checkout and mailbox.
-Native delivery requires the local Claude runtime to expose `ListAgents` and
-`SendMessage`. Their presence and worker reachability are runtime capabilities;
+Workers with the Claude plugin can receive mailbox reminders through its
+`asyncRewake` hook without a relay model call. Relay delivery requires the local
+Claude runtime to expose `ListAgents` and `SendMessage`.
+Their presence and worker reachability are runtime capabilities;
 an environment variable does not prove them. Never edit Claude's private inboxes.
+
+To enable worker hooks, run `./plugins/secondopinion/scripts/install.sh --claude`
+from the plugin clone, then restart/resume each worker to load the updated plugin.
+Use `--claude` for future updates too: the plain installer intentionally removes
+the optional Claude plugin. Confirm the resumed UUID with `secondopinion workers`.
+Skill-only installs and `--safe-mode` do not load these hooks. Native hook wakeup
+is validated on Claude Code 2.1.268. Each watcher lasts at most 23 hours; ordinary
+session, prompt, tool and stop events rearm it. After an idle watcher expires,
+relay delivery remains available; resume interaction to rearm the hook.
+
+The hook discovers only tasks/messages for its own session UUID and checkout.
+It emits fixed mailbox-reading instructions, never claims a task or writes a
+native delivery receipt. A duplicate notice still requires the original atomic
+claim or exact message acknowledgment. Worker model access is needed to process
+the notice, even though notification itself does not depend on inference.
+
+`delegate` makes the task available after requester/return-registration checks.
+Merely running `task create` does not notify a worker. To queue a fixed notice
+for an existing unclaimed task, its original lead can run from its checkout:
+
+```bash
+secondopinion task available TASK --session REQUESTER_ID
+```
+
+This works before claim, accepts no arbitrary message text, and preserves task
+state and authority. It returns exit 1 if no hook is currently listening; the
+durable notice can still be discovered when that worker loads/rearms its hook.
+After a failed relay, `task status TASK` includes `delivery_diagnostics`: exchange
+ID, observed stage, API retry count, tool calls/availability, public-directory
+match and fallback state. Null/unknown means the evidence was unavailable;
+`claude_api_retries_before_tool_use` does not establish the underlying API cause.
 
 1. Use the user's exact worker name with `--worker-name`; the plugin resolves its
    UUID and verifies the checkout automatically. `secondopinion workers` shows
@@ -24,8 +57,9 @@ an environment variable does not prove them. Never edit Claude's private inboxes
    ```
 
    The installer configures the local return service. `--async` automatically
-   binds this calling Codex thread and the task before launching the delivery
-   relay, then returns when delivery is accepted. Do not ask the user to register
+   binds this calling Codex thread and the task before notifying the worker,
+   then returns when a hook notice is queued, native delivery is accepted, or
+   the worker has independently claimed the task. Do not ask the user to register
    sockets, UUIDs or watchers. Worker results and blockers arrive as
    `secondopinion_result` tool output, including when this Codex thread is idle.
    If the host has no service or this conversation is not connected to the local
@@ -37,8 +71,10 @@ an environment variable does not prove them. Never edit Claude's private inboxes
    allowed to use the native messaging tools. The worker receives absolute,
    shell-quoted CLI/store paths and instructions to claim and report directly
    to the mailbox. It must claim with `execute=true` before starting work.
-4. Read the JSON. With `notification=automatic`, exit 0 means delivery was
-   accepted, NOT that the worker completed. The registered service handles later
+4. Read the JSON. With `notification=automatic`, exit 0 means tracking is active:
+   `delivery=queued` means a hook reminder is pending, `accepted` means a native
+   receipt exists, and `worker_acknowledged` means the worker claimed independently.
+   None means the worker completed. The registered service handles later
    results; Codex may continue other authorized work or yield while it waits.
    Without that field (foreground/fallback), exit 0 means a hash-validated
    report (`state=complete`). Exit 3 means refusal, failure, or `needs_attention`;
@@ -75,11 +111,16 @@ checkout. IDs are unique within a task. Retry with the SAME ID, sender, reply
 target and file contents; changing any of them is rejected. Message files must
 be nonempty UTF-8, at most 16 KiB. The mailbox snapshots them immediately.
 
-Lead messages invoke a bounded relay to the same existing worker. The plugin
+Lead messages use a listening worker hook or a bounded relay to the same existing worker. The plugin
 rechecks its UUID, unique name and checkout on every attempt. Worker messages
 are stored immediately and automatically notify the registered lead, including
 when idle, as `secondopinion_message`. Workers waiting for answers can end their
-turn; the lead's reply notifies that same worker through native delivery.
+turn; the lead's reply notifies that same worker through its hook or native relay.
+
+With `notification.transport=worker_hook`, a successful send means the durable
+message is queued for worker discovery. Its native receipt stays null; recipient
+acknowledgment remains the proof of consumption. The hook reads unread messages
+in sequence, including messages from an uncertain earlier relay.
 
 Read and consume messages separately from task completion:
 
@@ -103,9 +144,11 @@ current `task`; `wait-any` includes any ready `outcomes`. Handle both, then resu
 waiting. `receive` waits only for messages (0 when ready, 124 on timeout). It
 does not consume them. Existing task result acknowledgments remain separate.
 
-Message delivery exit 0 means the message is stored (worker to lead), or native
-delivery/consumption is confirmed (lead to worker). It does not mean the work is
-complete. Exit 1 also covers a contended send: if another delivery is active,
+Message delivery exit 0 means the message is stored (worker to lead), or a hook
+notice is queued, native delivery is accepted, or consumption is confirmed
+(lead to worker). Inspect `notification` and the stored delivery/acknowledgment
+fields to distinguish them. It does not mean the work is complete.
+Exit 1 also covers a contended send: if another delivery is active,
 wait for it to finish and inspect `message-read`. A still-queued message can be
 retried with the original ID and content. Scripts must inspect stored delivery
 state rather than infer ambiguity from exit 1 alone. `task status` exposes unread

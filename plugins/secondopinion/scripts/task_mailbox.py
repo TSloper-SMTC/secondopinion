@@ -260,6 +260,8 @@ class Mailbox:
         task["age_seconds"] = max(0, int(time.time() - task["updated_epoch"]))
         task["stale"] = task["state"] not in TERMINAL and task["age_seconds"] >= stale_after
         task["notification"] = "foreground polling; automatic return only with a registered wake service"
+        from relay_diagnostics import latest
+        task["delivery_diagnostics"] = latest(self, task_id)
         return task
 
     def wait(self, task_id, timeout):
@@ -428,6 +430,7 @@ def delegate(box, args):
         args.worker = Directory(box).resolve(args.worker_name, Path.cwd())["sessionId"]
     task = box.create(args.id, args.worker, args.requester, str(Path.cwd().resolve()), request, args.worker_name)
     notification = None
+    delivery_state = 'accepted'
     if args.async_delivery:
         # Registration is completed before the relay can cause worker execution.
         # It never starts/resumes a Codex conversation or bypasses a permission.
@@ -445,34 +448,63 @@ def delegate(box, args):
         except BlockingIOError:
             raise ValueError("a delivery attempt is already active; use task wait for this ID")
         task = box.get(args.id)
+        delivery_state = ('accepted' if task['delivery_receipt'] else
+                          'worker_acknowledged' if task['state'] != 'created' else 'unconfirmed')
         if not task["delivery_receipt"] and task["state"] == "created":
+            from worker_hook import make_available, notify
+            from relay_diagnostics import observe, record, run_relay
+            make_available(box, task)
+            fallback = notify(box, task)
+            if fallback['state'] == 'queued':
+                delivery_state = 'queued'
+                record(box, args.id, dict(fallback, stage='worker_hook', reason='worker_mailbox_notice_queued',
+                                         tools_called=[], relay_exit_code=None))
+            else:
+                delivery_state = 'unconfirmed'
+        if not task["delivery_receipt"] and task["state"] == "created" and delivery_state == 'unconfirmed':
             with tempfile.TemporaryDirectory(prefix="task-relay-", dir=box.store) as tmp:
                 prompt = Path(tmp) / "request.md"
                 prompt.write_text(relay_prompt(task, args.cli, box.store), encoding="utf-8")
-                env = os.environ.copy()
-                env["SECONDOPINION_DIR"] = str(box.store)
-                env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
                 # The sealed relay answer remains in its exchange. Do not print its
                 # narrative as if it were the delegated worker's final result.
-                with tempfile.TemporaryFile(mode="w+", dir=tmp) as relay_output:
-                    result = subprocess.run([args.cli, "ask", "--relay", "--topic", "delivery " + args.id[:100],
-                                             "--file", str(prompt), "--timeout", str(args.delivery_timeout),
-                                             "--grace", "0"], env=env, stdout=relay_output)
-                    relay_output.seek(0)
-                    header = relay_output.readline().strip()
-                    if header.startswith("Exchange-ID: "):
-                        print("Relay exchange: " + header[len("Exchange-ID: "):], file=sys.stderr)
+                exchange, exit_code = run_relay(args.cli, prompt, box.store, 'delivery ' + args.id[:100], args.delivery_timeout)
                 task = box.get(args.id)
+                diagnostics = observe(box.store, exchange, exit_code)
+                diagnostics['worker_directory_match'] = None
+                try:
+                    from worker_directory import Directory, WorkerMismatch
+                    Directory(box).bound(task)
+                    diagnostics['worker_directory_match'] = True
+                except WorkerMismatch as error:
+                    diagnostics['worker_directory_match'] = False
+                    diagnostics['worker_directory_reason'] = str(error)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    pass
                 if task["state"] == "created" and not task["delivery_receipt"]:
-                    emit({"task": task, "delivery": "unconfirmed", "relay_exit_code": result.returncode})
-                    print("Worker delivery is unconfirmed. Inspect the relay exchange; retry with the SAME task ID.", file=sys.stderr)
-                    return 1
+                    # A worker can load/rearm its hook while the relay is failing.
+                    fallback = notify(box, task)
+                    diagnostics['fallback'] = fallback
+                    record(box, args.id, diagnostics)
+                    if fallback['state'] == 'queued':
+                        delivery_state = 'queued'
+                    else:
+                        emit({"task": box.status(args.id), "delivery": "unconfirmed",
+                              "relay_exit_code": exit_code, "diagnostics": diagnostics})
+                        print("Worker delivery is unconfirmed (" + diagnostics['reason'] + "). "
+                              "Retry with the SAME task ID; a worker with the Claude plugin can discover it automatically.", file=sys.stderr)
+                        return 1
+                else:
+                    diagnostics['worker_state_observed'] = task['state']
+                    if task['delivery_receipt']:
+                        diagnostics.update(stage='receipt', reason='receipt_persisted')
+                    record(box, args.id, diagnostics)
+                    delivery_state = 'accepted' if task['delivery_receipt'] else 'worker_acknowledged'
     finally:
         os.close(fd)
     # Relay failure cannot erase a worker acknowledgment/result that already landed.
     if notification is not None:
         emit({"task": box.status(args.id), "notification": "automatic",
-              "registration": notification["name"], "delivery": "accepted",
+              "registration": notification["name"], "delivery": delivery_state,
               "notice": "Delivery acceptance is not worker completion. Results and blockers arrive separately."})
         return 0
     return box.wait(args.id, args.timeout)
@@ -500,12 +532,12 @@ def parser():
     delivery.add_argument("--delivery-timeout", type=bounded, default=120)
     delivery.add_argument("--async", dest="async_delivery", action="store_true",
                           help="automatically return outcomes to this Codex thread; requires installer service")
-    for name in ("status", "instructions", "relay-prompt", "claim", "update", "delivered", "events", "ack", "wait", "result"):
+    for name in ("status", "instructions", "relay-prompt", "claim", "update", "delivered", "events", "ack", "wait", "result", "available"):
         sub = commands.add_parser(name)
         sub.add_argument("id")
         if name == "status":
             sub.add_argument("--stale-after", type=bounded, default=300)
-        if name in ("claim", "update"):
+        if name in ("claim", "update", "available"):
             sub.add_argument("--session", required=True)
         if name == "update":
             sub.add_argument("--revision", type=int, required=True)
@@ -552,6 +584,20 @@ def main():
             emit(box.create(args.id, args.worker, args.requester, str(Path.cwd().resolve()), read_text(args.file), args.worker_name))
         elif command == "status":
             emit(box.status(args.id, args.stale_after))
+        elif command == "available":
+            task = box.get(args.id)
+            if args.session != task['requester'] or str(Path.cwd().resolve()) != task['repo']:
+                raise ValueError('task-available notice requires the bound requester and checkout')
+            caller = os.environ.get('CODEX_THREAD_ID')
+            if caller and caller != args.session:
+                raise ValueError('calling Codex thread does not match the task lead')
+            if task['state'] != 'created':
+                raise ValueError('task is already claimed; use task messages or status')
+            from worker_hook import make_available, notify
+            make_available(box, task)
+            notification = notify(box, task)
+            emit(dict(task=box.status(args.id), notification=notification, delivery='queued'))
+            return 0 if notification['state'] == 'queued' else 1
         elif command in ("instructions", "relay-prompt"):
             fn = instructions if command == "instructions" else relay_prompt
             print(fn(box.get(args.id), args.cli, box.store))

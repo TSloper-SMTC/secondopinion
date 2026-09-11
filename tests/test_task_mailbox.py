@@ -625,6 +625,8 @@ time.sleep(30)
                                             "--file", str(self.req), "--requester", "local", "--timeout", "0"])
         with mock.patch.object(mailbox.Path, "cwd", return_value=self.repo), \
              mock.patch.object(mailbox.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+             mock.patch("relay_diagnostics.run_relay", return_value=(None, 0)), \
+             mock.patch("worker_directory.Directory.bound", return_value={}), \
              mock.patch.object(mailbox, "emit"):
             self.assertEqual(mailbox.delegate(box, args), 1)
         self.assertEqual(box.get("t")["state"], "created")

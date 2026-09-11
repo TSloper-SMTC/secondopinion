@@ -1,0 +1,72 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/worker_hook.py"
+            ],
+            "asyncRewake": true,
+            "timeout": 86400,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/worker_hook.py"
+            ],
+            "asyncRewake": true,
+            "timeout": 86400,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/worker_hook.py"
+            ],
+            "asyncRewake": true,
+            "timeout": 86400,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/worker_hook.py"
+            ],
+            "asyncRewake": true,
+            "timeout": 86400,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
