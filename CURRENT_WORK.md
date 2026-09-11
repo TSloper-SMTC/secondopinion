@@ -1,29 +1,39 @@
 # Current Work
 
-## 1.2.1 — publication authorized, in progress (2026-09-11)
+## 1.2.1 — published to GitHub main (2026-09-11 20:06 UTC)
 
-Tim explicitly authorized publication with "ok push it" after the readiness
-review. Local main and remote main both start at
-`44e68064322539621b8309a37e19a4175226877f`; the reviewed change set is owned by this
-delivery repair. The GitHub CLI's stored HTTPS login is invalid, but existing
-SSH authentication succeeds as `TSloper-SMTC` and verifies the same repository.
-Push using `git@github.com:TSloper-SMTC/secondopinion.git` without changing origin
-or credentials, and without force.
+Release commit **`f07ecd1e6ece74f6a4d5e666dc8421ff2fdcca77`** was pushed to
+`https://github.com/TSloper-SMTC/secondopinion`, branch **main**, without force.
+Fresh `git ls-remote origin refs/heads/main` confirmed that exact commit at
+20:06:53 UTC. Receipt: `out/release-1.2.1-publication.json`. This subsequent
+documentation-only handoff records the verified publication.
 
-Release dates and install/qualification text are finalized for 1.2.1.
-`docs/release-1.2.1.sha256` binds all 51 product/test files. Its only difference
-from the retained candidate manifest is the plugin changelog's release date.
-The **1213/1213** regression, **129/129** fresh installer, **132/132** fresh package,
-**8/8** native stream and **15/15** native interactive checks remain applicable.
-The release archive is `out/secondopinion-1.2.1.tar.gz` with a SHA-256 sidecar;
-the earlier candidate archive and evidence are preserved.
+Tim explicitly authorized publication with "ok push it" after reviewing
+readiness. Preflight confirmed local HEAD and upstream main both `44e6806`,
+the expected 28 reviewed files, all 51 release hashes in staged and committed
+content, matching dated changelogs and no whitespace errors. The **1213/1213**
+regression, **129/129** fresh installer, **132/132** fresh package, **8/8** native
+stream and **15/15** native interactive checks remain applicable. Publishing
+changed only release dates and documentation. `docs/release-1.2.1.sha256` binds
+the release product/test bytes; its only difference from the retained candidate
+manifest is the plugin changelog's release date.
 
-Exact next action: commit the reviewed release files, push main through SSH,
-verify remote HEAD, then record the publication receipt here. Peer activation
-requires `install.sh --claude`, a new Codex thread and restart/resume of the
-original Claude workers. Peer-host acceptance and real-provider/model behavior
-remain rollout checks. The records below are historical and do not supersede
-this authorization.
+Publication used the existing SSH key authenticated as `TSloper-SMTC`; origin
+and credentials were not changed. Git LFS required an unsandboxed push to write
+its local lock cache. No tag or GitHub Release was created. The release archive
+is `out/secondopinion-1.2.1.tar.gz` with its SHA-256 sidecar, refreshed with this
+publication record. The earlier candidate archive and test evidence are retained.
+
+No release implementation or owner approval step remains. Recipient next action:
+run `git pull --ff-only`, `./plugins/secondopinion/scripts/install.sh --claude`,
+then `./plugins/secondopinion/scripts/install.sh --check`; start a new Codex
+thread and restart/resume the original Claude workers. Retain `--claude` on
+future updates and retry interrupted delegations with their original task IDs.
+Peer-host acceptance and real-provider/model behavior remain rollout checks.
+The owner's active plugin cache and worker sessions were not refreshed during
+publication. Details: `docs/install-shared-candidate.md` and
+`docs/delivery-relay-1.2.1.md`. The records below are historical and do not
+supersede this publication receipt.
 
 ## 1.2.1 delivery repair — qualified local candidate, awaiting publication (2026-09-11)
 

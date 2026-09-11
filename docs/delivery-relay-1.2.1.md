@@ -1,7 +1,7 @@
 # Delivery relay repair — 1.2.1
 
-Status: qualified for release; publication authorized on 2026-09-11. The release
-has not been installed into the owner's active sessions. Base: `44e6806` (1.2.0).
+Status: published to GitHub main on 2026-09-11 as `f07ecd1`. The release has not
+been installed into the owner's active sessions. Base: `44e6806` (1.2.0).
 See `CURRENT_WORK.md` for the publication receipt and current handoff.
 
 ## Peer report assessment
