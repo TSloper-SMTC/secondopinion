@@ -1,7 +1,8 @@
 # Uncertain message recovery — 1.2.2
 
-Status: release-qualified locally on 2026-09-17 and ready to push. Not yet
-published or installed. Base: published 1.2.1 at `d10b4d4`.
+Status: published to GitHub `main` on 2026-09-17 as release commit
+`af3e38f803d85cedcbb328ce1fe228137297c8f4`. Not installed locally or on the
+peer host. Base: published 1.2.1 at `d10b4d4`.
 
 ## Incident addressed
 

@@ -1,12 +1,16 @@
 # Current Work
 
-## 1.2.2 uncertain-message recovery — release ready (2026-09-17)
+## 1.2.2 — published to GitHub main (2026-09-17 16:02 UTC)
 
 Owner asked to correct and thoroughly test the peer incident in
 `/mnt/hgfs/Downloads/secondopinion-delivery-issue-20260916.md`. The candidate is
 implemented on published 1.2.1 base `d10b4d4`; all version surfaces are dated
-**1.2.2**. No push, tag, active installation, live mailbox, or peer host was
-changed.
+**1.2.2**. Tim explicitly authorized publication with "push it". Release commit
+**`af3e38f803d85cedcbb328ce1fe228137297c8f4`** was pushed without force to
+`https://github.com/TSloper-SMTC/secondopinion`, branch **main**. Independent
+`git ls-remote` and GitHub API reads confirmed that exact remote commit at
+16:02:47 UTC. Receipt: `out/release-1.2.2-publication.json`. No tag, GitHub
+Release, active installation, live mailbox, or peer host was changed.
 
 The repair adds prominent uncertain-delivery warnings and task-status alerts,
 message-relay structured diagnostics, compare-and-swap receipt protection,
@@ -29,11 +33,13 @@ The exported release's fresh installer passed **129/129** and its plugin/package
 suite passed **132/132**. Shareable archive: `out/secondopinion-1.2.2.tar.gz`,
 with adjacent SHA-256 sidecar.
 
-Exact next action: after owner authorization, push the prepared release commit
-without force and verify that remote `main` resolves to the exact local commit.
-Then record the publication receipt in a documentation-only follow-up. Update
-all participating installations together and restart existing services/sessions;
-schema 3 is intentionally incompatible with 1.2.1 clients.
+No release implementation or publication step remains. Recipient next action:
+run `git pull --ff-only`, then
+`./plugins/secondopinion/scripts/install.sh --claude` and
+`./plugins/secondopinion/scripts/install.sh --check`; start a new Codex thread
+and restart/resume existing Claude workers. Update all participating
+installations together; schema 3 is intentionally incompatible with 1.2.1
+clients. Peer-host acceptance and real-provider behavior remain rollout checks.
 
 ## 1.2.1 — published to GitHub main (2026-09-11 20:06 UTC)
 
