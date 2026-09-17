@@ -20,6 +20,7 @@ from task_mailbox import Mailbox, digest, identifier
 LIFETIME = 23 * 60 * 60
 MAX_AGE = 5
 REPEAT_AFTER = 60
+HOOK_PROTOCOL = 3
 
 
 def make_available(box, task):
@@ -39,7 +40,8 @@ def ready(box, task):
     if not box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_hooks'").fetchone():
         return False
     row = box.db.execute('SELECT * FROM worker_hooks WHERE session=?', (task['worker'],)).fetchone()
-    if not row or row['repo'] != task['repo'] or not 0 <= time.time() - row['heartbeat'] < MAX_AGE:
+    if (not row or 'protocol' not in row.keys() or row['protocol'] != HOOK_PROTOCOL or
+            row['repo'] != task['repo'] or not 0 <= time.time() - row['heartbeat'] < MAX_AGE):
         return False
     try:
         fd = os.open(lock_path(box, task['worker']), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -62,10 +64,15 @@ def notify(box, task):
     # The hook may have emitted and exited between task creation and this check.
     # Its recent attempt is observable but is still not a native receipt.
     emitted = False
-    if not listening and box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_hook_notices'").fetchone():
+    hook_columns = ([row['name'] for row in box.db.execute('PRAGMA table_info(worker_hooks)')]
+                    if box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                      "AND name='worker_hooks'").fetchone() else [])
+    if (not listening and 'protocol' in hook_columns and
+            box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                           "AND name='worker_hook_notices'").fetchone()):
         row = box.db.execute('SELECT n.emitted FROM worker_hook_notices n JOIN worker_hooks h ON h.session=n.session '
-            'WHERE n.session=? AND h.repo=? AND n.notice=?',
-            (task['worker'],task['repo'],'task:' + task['id'])).fetchone()
+            'WHERE n.session=? AND h.repo=? AND h.protocol=? AND n.notice=?',
+            (task['worker'],task['repo'],HOOK_PROTOCOL,'task:' + task['id'])).fetchone()
         emitted = task['state'] == 'created' and row is not None and 0 <= time.time()-row['emitted'] < REPEAT_AFTER
     if not listening and not emitted:
         return dict(transport='worker_hook', state='not_listening')
@@ -97,6 +104,8 @@ def reminder(task_ids, session, cli, store):
              'For each task below, read its instructions and status. Claim only if state=created;',
              'execute only when the atomic claim returns execute=true. Never repeat claimed work.',
              'Read unread messages in order and acknowledge their exact hashes after consumption.',
+             'Before acting on a message, inspect its current delivery fields. If state is superseded',
+             'or superseded_by is set, do not act on its stale body; read the named correction.',
              'Do not reopen terminal work or bypass repository policies or approval requirements.']
     for task_id in dict.fromkeys(task_ids):
         task_id = shlex.quote(task_id)
@@ -116,7 +125,13 @@ def watch(box, session, repo, cli, lifetime=LIFETIME):
         except BlockingIOError:
             return 0
         with box.transaction():
-            box.db.execute('CREATE TABLE IF NOT EXISTS worker_hooks (session TEXT PRIMARY KEY, repo TEXT NOT NULL, heartbeat REAL NOT NULL)')
+            box.db.execute('CREATE TABLE IF NOT EXISTS worker_hooks (session TEXT PRIMARY KEY, '
+                           'repo TEXT NOT NULL, heartbeat REAL NOT NULL, protocol INTEGER NOT NULL)')
+            columns = [row['name'] for row in box.db.execute('PRAGMA table_info(worker_hooks)')]
+            if 'protocol' not in columns:
+                # A pre-1.2.2 watcher then fails its three-value heartbeat and
+                # exits; ready() refuses its unversioned registration meanwhile.
+                box.db.execute('ALTER TABLE worker_hooks ADD COLUMN protocol INTEGER')
             box.db.execute('CREATE TABLE IF NOT EXISTS worker_hook_notices (session TEXT NOT NULL, notice TEXT NOT NULL, emitted REAL NOT NULL, PRIMARY KEY(session,notice))')
             box.db.execute('CREATE TABLE IF NOT EXISTS worker_hook_tasks (task TEXT PRIMARY KEY REFERENCES tasks(id))')
         from task_conversation import Conversation
@@ -125,7 +140,8 @@ def watch(box, session, repo, cli, lifetime=LIFETIME):
         while time.monotonic() < deadline and os.getppid() == parent:
             now = time.time()
             with box.transaction():
-                box.db.execute('INSERT OR REPLACE INTO worker_hooks VALUES (?,?,?)', (session, repo, now))
+                box.db.execute('INSERT OR REPLACE INTO worker_hooks VALUES (?,?,?,?)',
+                               (session, repo, now, HOOK_PROTOCOL))
             pending = candidates(box, session, repo, conversation)
             selected = []
             for key, task_id in pending:

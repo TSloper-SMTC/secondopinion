@@ -137,9 +137,30 @@ def record(box, task_id, details):
                        (task_id, utc(), json.dumps(details, sort_keys=True)))
 
 
+def record_message(box, task_id, message_id, details):
+    with box.transaction():
+        box.db.execute('''CREATE TABLE IF NOT EXISTS message_delivery_diagnostics (
+            sequence INTEGER PRIMARY KEY, task TEXT NOT NULL, message TEXT NOT NULL,
+            observed_utc TEXT NOT NULL, details TEXT NOT NULL,
+            FOREIGN KEY(task,message) REFERENCES task_messages(task,id))''')
+        box.db.execute('INSERT INTO message_delivery_diagnostics(task,message,observed_utc,details) '
+                       'VALUES (?,?,?,?)',
+                       (task_id, message_id, utc(), json.dumps(details, sort_keys=True)))
+
+
 def latest(box, task_id):
     if not box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_delivery_diagnostics'").fetchone():
         return None
     row = box.db.execute('SELECT observed_utc,details FROM task_delivery_diagnostics '
                          'WHERE task=? ORDER BY sequence DESC LIMIT 1', (task_id,)).fetchone()
+    return dict(json.loads(row['details']), observed_utc=row['observed_utc']) if row else None
+
+
+def latest_message(box, task_id, message_id):
+    if not box.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                          "AND name='message_delivery_diagnostics'").fetchone():
+        return None
+    row = box.db.execute('SELECT observed_utc,details FROM message_delivery_diagnostics '
+                         'WHERE task=? AND message=? ORDER BY sequence DESC LIMIT 1',
+                         (task_id, message_id)).fetchone()
     return dict(json.loads(row['details']), observed_utc=row['observed_utc']) if row else None

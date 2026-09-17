@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Failure-before-tool-use and inference-free worker mailbox notification."""
 import contextlib
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import time
@@ -139,6 +141,20 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(self.box.claim('task',self.worker)['execute'])
         self.assertFalse(self.box.claim('task',self.worker)['execute'])
 
+    def test_message_relay_retains_exchange_and_structured_failure_diagnostics(self):
+        self.box.claim('task', self.worker)
+        conversation = Conversation(self.box)
+        conversation.post('task', 'm', 'lead', 'Direction')
+        exchange = self.api_failure()
+        with mock.patch('task_conversation.Path.cwd', return_value=self.root), \
+             mock.patch.object(Directory, 'bound', return_value={'name': 'peer'}), \
+             mock.patch('relay_diagnostics.run_relay', return_value=(exchange, 124)):
+            message = deliver(conversation, 'task', 'm', 'lead', str(self.cli), 1)
+        self.assertEqual(message['delivery']['state'], 'uncertain')
+        self.assertEqual(message['delivery_diagnostics']['exchange'], exchange)
+        self.assertEqual(message['delivery_diagnostics']['stage'], 'relay_inference')
+        self.assertEqual(message['delivery_diagnostics']['api_retries'], 10)
+
     def test_hook_emits_fixed_notice_without_claim_or_receipt(self):
         hook.make_available(self.box,self.task)
         output = io.StringIO()
@@ -178,7 +194,7 @@ class DeliveryTests(unittest.TestCase):
         conversation.post('task','m','lead','Question')
         with mock.patch('task_conversation.Path.cwd',return_value=self.root), \
              mock.patch.object(hook,'notify',return_value=dict(transport='worker_hook',state='queued')), \
-             mock.patch('task_conversation.subprocess.run') as run:
+             mock.patch('relay_diagnostics.run_relay') as run:
             message = deliver(conversation,'task','m','lead',str(self.cli),1)
         run.assert_not_called()
         self.assertEqual(message['notification']['state'],'queued')
@@ -250,6 +266,34 @@ class DeliveryTests(unittest.TestCase):
         for timestamp in (time.time()-100,time.time()+100):
             self.box.db.execute('UPDATE worker_hooks SET heartbeat=?',(timestamp,))
             self.assertFalse(hook.ready(self.box,self.task))
+
+    def test_unversioned_old_watcher_is_refused_and_heartbeat_schema_fails_closed(self):
+        self.box.db.execute('CREATE TABLE worker_hooks (session TEXT PRIMARY KEY, repo TEXT NOT NULL, heartbeat REAL NOT NULL)')
+        self.box.db.execute('INSERT INTO worker_hooks VALUES (?,?,?)',
+                            (self.worker, str(self.root), time.time()))
+        self.box.db.execute('CREATE TABLE worker_hook_notices '
+                            '(session TEXT NOT NULL, notice TEXT NOT NULL, emitted REAL NOT NULL, '
+                            'PRIMARY KEY(session,notice))')
+        self.box.db.execute('INSERT INTO worker_hook_notices VALUES (?,?,?)',
+                            (self.worker, 'task:task', time.time()))
+        path = hook.lock_path(self.box, self.worker)
+        with path.open('a') as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(hook.ready(self.box, self.task))
+            self.assertEqual(hook.notify(self.box, self.task)['state'], 'not_listening')
+            migrated = Mailbox(self.box.store)
+            migrated.db.close()
+            columns = [row['name'] for row in self.box.db.execute('PRAGMA table_info(worker_hooks)')]
+            self.assertIn('protocol', columns)
+            with self.assertRaises(sqlite3.OperationalError):
+                self.box.db.execute('INSERT OR REPLACE INTO worker_hooks VALUES (?,?,?)',
+                                    (self.worker, str(self.root), time.time()))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(hook.watch(self.box, self.worker, str(self.root), self.cli, lifetime=.01), 0)
+        columns = [row['name'] for row in self.box.db.execute('PRAGMA table_info(worker_hooks)')]
+        self.assertIn('protocol', columns)
+        self.assertEqual(self.box.db.execute('SELECT protocol FROM worker_hooks').fetchone()[0],
+                         hook.HOOK_PROTOCOL)
 
     def test_symlink_worker_lease_cannot_be_opened_for_writing(self):
         hook.lock_path(self.box,self.worker).symlink_to(self.request)

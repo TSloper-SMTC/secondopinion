@@ -306,7 +306,7 @@ class Tasks(unittest.TestCase):
         box.db.close()
         upgraded = mailbox.Mailbox(self.store)
         self.addCleanup(upgraded.db.close)
-        self.assertEqual(upgraded.db.execute('PRAGMA user_version').fetchone()[0], 2)
+        self.assertEqual(upgraded.db.execute('PRAGMA user_version').fetchone()[0], 3)
         self.assertEqual({name: upgraded.get(name) for name in before}, before)
         self.assertEqual([tuple(r) for r in upgraded.db.execute('SELECT * FROM events ORDER BY task_id,revision')], events)
         self.assertEqual([tuple(r) for r in upgraded.db.execute('SELECT * FROM acknowledgments')], acks)

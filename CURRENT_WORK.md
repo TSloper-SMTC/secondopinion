@@ -1,5 +1,40 @@
 # Current Work
 
+## 1.2.2 uncertain-message recovery — release ready (2026-09-17)
+
+Owner asked to correct and thoroughly test the peer incident in
+`/mnt/hgfs/Downloads/secondopinion-delivery-issue-20260916.md`. The candidate is
+implemented on published 1.2.1 base `d10b4d4`; all version surfaces are dated
+**1.2.2**. No push, tag, active installation, live mailbox, or peer host was
+changed.
+
+The repair adds prominent uncertain-delivery warnings and task-status alerts,
+message-relay structured diagnostics, compare-and-swap receipt protection,
+audited bound-lead reconciliation, and explicit full-set supersession. One
+complete correction atomically replaces the exact ordered unresolved set named
+by `--expect-superseded`; stale content leaves worker queues but remains audited.
+Late receipts/acks remain visible, replaced-attempt receipts are retained, and a
+failed correction delivery reports that supersession committed. Schema 3 and
+versioned hook registration make old clients/routes fail closed.
+
+Final regression: **1231/1231**, exit 0, at
+`out/delivery-recovery-1.2.2/regression.log`. Native Claude Code 2.1.274 local-API
+fixtures passed **8/8** hook/outage and **15/15** interactive task/conversation
+checks. Two adversarial reviews found and drove closure of race, exact-incident,
+worker-visibility, mixed-version, provenance, idempotency and audit gaps. Details:
+`docs/delivery-recovery-1.2.2.md`. The candidate manifest remains as historical
+qualification evidence; `docs/release-1.2.2.sha256` binds the dated release
+product/test files (**51/51** verified in source and the extracted release).
+The exported release's fresh installer passed **129/129** and its plugin/package
+suite passed **132/132**. Shareable archive: `out/secondopinion-1.2.2.tar.gz`,
+with adjacent SHA-256 sidecar.
+
+Exact next action: after owner authorization, push the prepared release commit
+without force and verify that remote `main` resolves to the exact local commit.
+Then record the publication receipt in a documentation-only follow-up. Update
+all participating installations together and restart existing services/sessions;
+schema 3 is intentionally incompatible with 1.2.1 clients.
+
 ## 1.2.1 — published to GitHub main (2026-09-11 20:06 UTC)
 
 Release commit **`f07ecd1e6ece74f6a4d5e666dc8421ff2fdcca77`** was pushed to

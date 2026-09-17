@@ -9,7 +9,7 @@
     {
       "name": "secondopinion",
       "source": "./plugins/secondopinion",
-      "version": "1.2.1",
+      "version": "1.2.2",
       "description": "Global file-based mailbox for Codex\u2192Claude Code review exchanges (secondopinion-respond skill).",
       "author": {
         "name": "Tim Sloper"

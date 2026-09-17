@@ -16,7 +16,7 @@ set -euo pipefail
 umask 077
 command -v flock >/dev/null 2>&1 || { echo "ERROR: flock(1) (util-linux) not found on PATH; secondopinion requires Linux with GNU coreutils and util-linux." >&2; exit 1; }
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 warn() { echo "WARNING: $*" >&2; }
 
 # ---- agent-mailbox compatibility (the tool's pre-release internal name) -----------------------

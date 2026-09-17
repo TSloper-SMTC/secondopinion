@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.2 — 2026-09-17
+
+- Make uncertain lead-message delivery immediately actionable: print the exact
+  task/message recovery commands, retain structured relay diagnostics, and show
+  every queued, sending, or uncertain blocker in `task status`, including after
+  the task itself reaches a terminal state.
+- Add bound-lead `message-reconcile` for recording independently verified native
+  acceptance without resending; its lead-asserted provenance stays auditable.
+- Add explicit `message-supersede` for atomically replacing all unresolved lead
+  messages with one complete correction. Superseded content remains auditable
+  but is excluded from worker work queues and cannot be retried; late receipts
+  and acknowledgments remain prominent without reactivating stale content.
+- Upgrade task stores to schema 3 so older clients cannot ignore supersession
+  semantics. Version hook registrations so already-running older watchers fail
+  closed. Update all participating installations together.
+
 ## 1.2.1 — 2026-09-11
 
 - Add an optional Claude worker mailbox hook that wakes the bound session for

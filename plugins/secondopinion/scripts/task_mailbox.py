@@ -95,7 +95,7 @@ class Mailbox:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA synchronous=FULL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, 3):
             raise ValueError(f"unsupported task database version {version}")
         with self.transaction():
             self.db.execute("""CREATE TABLE IF NOT EXISTS tasks (
@@ -118,9 +118,17 @@ class Mailbox:
                 updated_utc TEXT NOT NULL)""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS worker_routes (
                 task_id TEXT PRIMARY KEY REFERENCES tasks(id), name TEXT NOT NULL)""")
-            # Older clients must refuse a conversation-capable store instead
-            # of silently treating tasks with unread questions as outcome-only.
-            self.db.execute("PRAGMA user_version=2")
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                               "AND name='worker_hooks'").fetchone():
+                columns = [row['name'] for row in self.db.execute('PRAGMA table_info(worker_hooks)')]
+                if 'protocol' not in columns:
+                    # This invalidates a pre-opened old watcher's three-value
+                    # heartbeat even when it still owns its session lease.
+                    self.db.execute('ALTER TABLE worker_hooks ADD COLUMN protocol INTEGER')
+            # Schema 3 adds explicit conversation supersession. Older clients
+            # must refuse the store because they could otherwise redeliver a
+            # stale instruction that a newer correction replaced.
+            self.db.execute("PRAGMA user_version=3")
 
     @contextlib.contextmanager
     def transaction(self):
@@ -253,10 +261,47 @@ class Mailbox:
         # Also called inside pending()'s transaction. Status must not initialize
         # conversation tables or acquire a nested write transaction.
         counts = {}
+        delivery_alerts = []
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_messages'").fetchone():
-            counts = dict(self.db.execute('SELECT recipient,COUNT(*) FROM task_messages '
-                                         'WHERE task=? AND acknowledged_utc IS NULL GROUP BY recipient', (task_id,)))
+            counts = dict(self.db.execute('SELECT m.recipient,COUNT(*) FROM task_messages m '
+                "LEFT JOIN message_delivery d ON d.task=m.task AND d.message=m.id "
+                "WHERE m.task=? AND m.acknowledged_utc IS NULL AND COALESCE(d.state,'')!='superseded' "
+                'GROUP BY m.recipient', (task_id,)))
+            rows = self.db.execute("SELECT m.id,m.sequence,m.acknowledged_utc,d.state,d.attempt,d.receipt,d.error,d.updated_utc "
+                "FROM task_messages m JOIN message_delivery d ON d.task=m.task AND d.message=m.id "
+                "WHERE m.task=? AND ((m.acknowledged_utc IS NULL AND d.state IN ('queued','sending','uncertain')) "
+                "OR (d.state='superseded' AND (d.receipt IS NOT NULL OR m.acknowledged_utc IS NOT NULL))) "
+                'ORDER BY m.sequence', (task_id,)).fetchall()
+            unresolved_ids = [row['id'] for row in rows if row['state'] != 'superseded']
+            for row in rows:
+                alert = dict(row)
+                from relay_diagnostics import latest_message
+                alert['diagnostics'] = latest_message(self, task_id, row['id'])
+                alert['blocks_later_relay_messages'] = row['state'] != 'superseded'
+                alert['inspect_command'] = f'secondopinion task message-read {task_id} {row["id"]}'
+                if row['state'] == 'superseded':
+                    correction = self.db.execute('SELECT superseded_by FROM message_supersessions '
+                        'WHERE task=? AND message=?', (task_id, row['id'])).fetchone()
+                    alert['risk'] = 'superseded_message_reached_or_was_consumed_by_worker'
+                    alert['superseded_by'] = correction['superseded_by'] if correction else None
+                    delivery_alerts.append(alert)
+                    continue
+                if row['state'] == 'uncertain':
+                    alert['retry_after_proving_non_delivery'] = (
+                        f'secondopinion task message-retry {task_id} {row["id"]} '
+                        f'--session {task["requester"]} --confirm-not-delivered')
+                    alert['reconcile_after_proving_acceptance'] = (
+                        f'secondopinion task message-reconcile {task_id} {row["id"]} '
+                        f'--session {task["requester"]} --attempt {row["attempt"] or "ATTEMPT"} '
+                        '--receipt ACTUAL_RECEIPT --confirm-accepted')
+                alert['supersede_with_complete_correction'] = (
+                    f'secondopinion task message-supersede {task_id} {row["id"]} '
+                    f'--id CORRECTION_ID --session {task["requester"]} --file CORRECTION_FILE '
+                    f'--expect-superseded {",".join(unresolved_ids)} '
+                    '--confirm-ambiguous-prior-delivery')
+                delivery_alerts.append(alert)
         task['unread_messages'] = {role: counts.get(task[role], 0) for role in ('requester', 'worker')}
+        task['message_delivery_alerts'] = delivery_alerts
         task["age_seconds"] = max(0, int(time.time() - task["updated_epoch"]))
         task["stale"] = task["state"] not in TERMINAL and task["age_seconds"] >= stale_after
         task["notification"] = "foreground polling; automatic return only with a registered wake service"
@@ -577,7 +622,8 @@ def main():
             return delegate(box, args)
         command = args.command
         if command in ('message', 'message-read', 'message-ack', 'message-delivered',
-                       'message-retry', 'messages', 'receive'):
+                       'message-reconcile', 'message-retry', 'message-supersede',
+                       'messages', 'receive'):
             from task_conversation import dispatch
             return dispatch(box, args)
         if command == "create":

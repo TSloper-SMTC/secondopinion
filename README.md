@@ -50,7 +50,7 @@ secondopinion ask --attach EXCHANGE_ID  # retry an interrupted request
 
 For worker notifications that do not need a relay model call, install with
 `./plugins/secondopinion/scripts/install.sh --claude` and restart/resume the
-workers to load their mailbox hooks (validated on Claude Code 2.1.268).
+workers to load their mailbox hooks (validated on Claude Code 2.1.274).
 Use `--claude` on subsequent updates too. Workers still need model access to do
 their work; notification can arrive during an API outage.
 See the [update and shared-archive steps](docs/install-shared-candidate.md).

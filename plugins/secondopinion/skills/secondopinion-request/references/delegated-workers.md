@@ -13,7 +13,7 @@ from the plugin clone, then restart/resume each worker to load the updated plugi
 Use `--claude` for future updates too: the plain installer intentionally removes
 the optional Claude plugin. Confirm the resumed UUID with `secondopinion workers`.
 Skill-only installs and `--safe-mode` do not load these hooks. Native hook wakeup
-is validated on Claude Code 2.1.268. Each watcher lasts at most 23 hours; ordinary
+is validated on Claude Code 2.1.274. Each watcher lasts at most 23 hours; ordinary
 session, prompt, tool and stop events rearm it. After an idle watcher expires,
 relay delivery remains available; resume interaction to rearm the hook.
 
@@ -162,6 +162,35 @@ secondopinion task message-retry TASK MESSAGE_ID --session LEAD_SESSION_ID --con
 ```
 
 Only use that confirmation after establishing that delivery did not occur.
+`task status TASK` lists every unresolved worker-message delivery under
+`message_delivery_alerts`, with retained relay diagnostics and exact recovery
+commands. If independent evidence proves native acceptance, reconcile the
+recorded attempt without resending:
+
+```bash
+secondopinion task message-reconcile TASK MESSAGE_ID --session LEAD_SESSION_ID \
+  --attempt ATTEMPT --receipt ACTUAL_RECEIPT --confirm-accepted
+```
+
+If old direction is obsolete, send one complete correction while atomically
+suppressing every unresolved lead message for that task:
+
+```bash
+secondopinion task message-supersede TASK OLD_MESSAGE_ID --id CORRECTION_ID \
+  --session LEAD_SESSION_ID --file /absolute/correction.md \
+  --expect-superseded OLD_MESSAGE_ID,NEWER_BLOCKED_MESSAGE_ID \
+  --confirm-ambiguous-prior-delivery
+```
+
+That confirmation is required because an ambiguous old send may already have
+arrived. Old messages remain auditable but cannot be retried and are excluded
+from the worker's unread work queue. The correction identifies the full replaced
+set and has its own delivery state; inspect it before sending anything later.
+A live `sending` attempt is rejected; an orphaned `sending` state becomes
+replaceable after its OS delivery lock is gone. Late receipts or acknowledgments
+for superseded content remain visible in status as non-blocking risk alerts.
+Copy the ordered expected set from `message_delivery_alerts`; the command fails
+without changing either message if another unresolved lead message appeared.
 An acknowledged message or recorded receipt is never automatically redelivered.
 Messages and their notifications survive restarts and later task state changes;
 questions cannot be overwritten by subsequent progress. Conversation can discuss
@@ -224,7 +253,7 @@ distributed leader-election or exactly-once downstream-processing mechanism.
 ### Harmless manual acceptance test
 
 In a disposable checkout, open four named sessions (`worker-a` through `worker-d`)
-as above. After installing this candidate and starting a new Codex thread, ask:
+as above. After installing this release and starting a new Codex thread, ask:
 
 > Use these four existing workers for reporting-only tests. Give each a stable
 > task ID. A should return A_OK after a short delay; B should return B_OK after a

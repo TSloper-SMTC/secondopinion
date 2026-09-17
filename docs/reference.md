@@ -52,6 +52,11 @@ The migration occurs on the first mailbox open, including `task status` or the
 installed return service's startup. This deliberate eager migration provides
 one atomic upgrade point; mixing 1.1.0 clients with schema-2 clients is not supported.
 Version 1.2.1 keeps schema 2 and requires no further migration from 1.2.0.
+Version 1.2.2 upgrades the marker to schema 3 and adds durable message
+supersession records. It preserves existing content, but every participating
+installation must be updated together. Fresh older clients refuse schema 3;
+versioned hook registration also makes a pre-opened older watcher fail closed
+instead of advertising an unusable notification route.
 
 Ongoing conversation uses `task message TASK --id MESSAGE_ID --session SESSION
 --file message.md` and `--reply-to MESSAGE_ID` for answers. Messages retain their
@@ -62,13 +67,43 @@ exit 4 with a `messages` list when a conversation needs attention. See the
 [conversation guide](../plugins/secondopinion/skills/secondopinion-request/references/delegated-workers.md#ongoing-conversation)
 for consumption, reply and recovery commands.
 `task status TASK` includes `unread_messages.requester` and
-`unread_messages.worker` counts. Reading status never consumes those messages.
+`unread_messages.worker` counts plus `message_delivery_alerts` for every queued,
+sending, or uncertain worker-directed message. Alerts include the exact message,
+attempt, retained relay diagnostics, and safe inspection/retry command. Reading
+status never consumes a message, even after the task is complete.
 
 Lead relay sends are serialized per task. An earlier queued or uncertain relay
 must be delivered or reconciled before a newer relay send. A worker hook can
 instead discover the retained unread messages in sequence without resending
 their contents or recording a native receipt. Independent workers can receive
 messages concurrently.
+When independent transport evidence proves that an uncertain attempt was
+accepted, the bound lead can record its actual receipt without resending:
+
+```bash
+secondopinion task message-reconcile TASK MESSAGE --session LEAD \
+  --attempt ATTEMPT --receipt ACTUAL_RECEIPT --confirm-accepted
+```
+
+If queued, sending-orphaned, or uncertain lead direction is stale, atomically
+replace the entire unresolved lead-message set with one complete correction:
+
+```bash
+secondopinion task message-supersede TASK OLD_MESSAGE --id CORRECTION_ID \
+  --session LEAD --file correction.md --expect-superseded OLD_MESSAGE,NEWER_BLOCKED_MESSAGE \
+  --confirm-ambiguous-prior-delivery
+```
+
+The explicit confirmation acknowledges that any ambiguous old send may already
+have arrived. Old content remains auditable but leaves the worker's unread work
+queue and cannot be retried; the correction names everything it replaces and
+must obtain its own delivery or acknowledgment. A currently active send cannot
+be superseded; a `sending` state orphaned by a killed sender can be replaced
+after its OS delivery lock is gone. Late receipts or acknowledgments for stale
+content remain visible as non-blocking risk alerts. Reconciliation provenance
+distinguishes a relay callback from a lead assertion; neither implies consumption.
+The ordered `--expect-superseded` list must exactly match the set shown by
+`message_delivery_alerts`; the transaction refuses if that set changed.
 Worker notifications preserve message order before queued task results. An
 uncertain worker-message notification holds later notifications from that task
 for reconciliation; other workers continue independently.
@@ -86,7 +121,8 @@ Names are routing information, not authentication against another same-user proc
 
 This mode requires a reachable existing worker. For notifications without a relay
 model call, install with `install.sh --claude` and restart/resume workers; see the
-[1.2.1 repair and activation notes](delivery-relay-1.2.1.md). Otherwise relay delivery
+[1.2.1 repair and activation notes](delivery-relay-1.2.1.md). Version 1.2.2 adds
+[uncertain-message recovery](delivery-recovery-1.2.2.md). Otherwise relay delivery
 requires native `ListAgents`/`SendMessage` support. The installer configures automatic idle return for ordinary local
 Codex CLI conversations on Linux with user systemd. Closed/unloaded conversations
 are not resumed automatically. Unsupported clients use foreground waiting;

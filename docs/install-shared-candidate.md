@@ -1,8 +1,9 @@
-# Install or update to 1.2.1
+# Install or update to secondopinion 1.2.2
 
-Version 1.2.1 adds optional Claude worker hooks so task and message notifications
-can arrive without a relay model call. It also adds structured diagnostics for
-failed relay delivery. Workers still need model access to process notifications
+Version 1.2.2 adds explicit recovery for uncertain lead-message delivery:
+prominent status alerts, structured message-relay diagnostics, receipt-based
+reconciliation without resend, and atomic replacement of a stale instruction
+with its correction. Workers still need model access to process notifications
 and do their work.
 
 From an existing clone of `https://github.com/TSloper-SMTC/secondopinion`:
@@ -25,11 +26,11 @@ Claude `--safe-mode` do not enable worker hooks.
 
 ## Shared archive alternative
 
-Use the shared `secondopinion-1.2.1.tar.gz` and its `.sha256` sidecar.
+Use the shared `secondopinion-1.2.2.tar.gz` and its `.sha256` sidecar.
 From the directory containing both files:
 
 ```bash
-sha256sum -c secondopinion-1.2.1.tar.gz.sha256
+sha256sum -c secondopinion-1.2.2.tar.gz.sha256
 ```
 
 Extract the archive into a permanent tools directory. Keep its extracted
@@ -47,13 +48,14 @@ On the qualified local Linux/user-systemd setup it reports `installed=yes` and
 `automatic_worker_return: ready`. With the Claude plugin installed, it also
 reports `worker_notifications=hook_available`; this checks the installation,
 not whether a particular running worker has loaded its hook. Native worker
-wakeup is validated on Claude Code 2.1.268. No manual UUID registration is needed.
+wakeup is validated on Claude Code 2.1.274. No manual UUID registration is needed.
 
-Version 1.2.1 retains the schema-2 mailbox from 1.2.0; no further migration is
-needed. If upgrading from 1.1.0, update all participating installations together:
-opening the mailbox upgrades it to schema 2 while preserving tasks, messages and
-acknowledgments, and 1.1.0 clients then refuse that store. Do not downgrade a
-migrated store.
+Version 1.2.2 upgrades the mailbox to schema 3 while preserving tasks, messages,
+reports and acknowledgments. Update every participating installation and restart
+already-running services/sessions together: 1.2.1 and older clients refuse a
+schema-3 store because they do not understand message supersession. Do not
+downgrade a migrated store.
 
-See [the repair, validation and remaining rollout checks](delivery-relay-1.2.1.md)
+See [the recovery behavior and qualification](delivery-recovery-1.2.2.md),
+[the 1.2.1 relay repair](delivery-relay-1.2.1.md),
 and the [worker guide](../plugins/secondopinion/skills/secondopinion-request/references/delegated-workers.md).
