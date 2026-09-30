@@ -1,6 +1,17 @@
 # Current Work
 
-## 1.2.3 — cut locally, NOT published (2026-09-29)
+## 1.2.3 — published to GitHub main and installed here (2026-09-30 03:06 UTC)
+
+Tim authorized publication and local update with "push it and update to 1.2.3".
+Release commit **`313d0259361739716b97112a04068e9144116478`** was pushed without
+force to `https://github.com/TSloper-SMTC/secondopinion`, branch **main**
+(previous `8f02c30`). Independent `git ls-remote` and GitHub API reads confirmed
+that exact commit at 03:06:25 UTC. Receipt: `out/release-1.2.3-publication.json`.
+No tag or GitHub Release. This host then ran the plain installer (its Claude side
+was already empty and stays so): `--check` reports `installed=yes`, Codex plugin
+1.2.3, `codex_runtime: codex_managed` 0.159.2; the wakeup service restarted with
+no enabled routes or unconsumed deliveries; Codex's managed server was untouched.
+Restart Codex sessions to load the 1.2.3 plugin/skill.
 
 Owner reported that Codex did not offer GPT-6.1-Sol. Root cause, proven on this
 host: Codex windows take their model list from the shared app server, which
@@ -43,9 +54,11 @@ archive. Live `check` and install's
 npm-installed Codex host (Codex may refuse to build its server without a local
 package; install then reports the error and foreground mode remains).
 
-Next action: owner decides publication ("push it"). A peer on 1.1.0-1.2.2 then
-runs `git pull --ff-only` and `install.sh --claude`, which retires the pinned
-unit; Codex windows open during that update must be restarted.
+Next action: none for this host. A peer on 1.1.0-1.2.2 runs `git pull --ff-only`
+and `install.sh --claude` (or uses the 1.2.3 share archive), which retires the
+pinned unit; Codex windows open during that update must be restarted. First real
+proof of Codex's hourly server updater arrives with the next Codex release:
+`codex app-server daemon version` should then show both versions advanced.
 
 ## 1.2.2 — published to GitHub main (2026-09-17 16:02 UTC)
 
