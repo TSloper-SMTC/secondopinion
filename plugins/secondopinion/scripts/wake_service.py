@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Installer lifecycle for the local worker-result bridge (Linux user systemd).
 
-Codex's public app-server runs in a separate user service (or an existing
-daemon is reused). Removing this plugin stops only secondopinion's bridge.
+Codex owns its app server: `codex app-server daemon start` reuses a running one
+or launches Codex's managed server, which Codex keeps updated. Removing this
+plugin stops only secondopinion's bridge.
 """
 import argparse
 import hashlib
@@ -14,10 +15,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 UNIT = "secondopinion-wakeup.service"
-CODEX_UNIT = "codex-local-app-server.service"
+# Written by 1.1.0-1.2.2. It pinned the Codex binary found at install time, and
+# Codex never updates a server it did not start, so new Codex releases (and the
+# models the backend offers only to them) stayed hidden. Install retires it.
+LEGACY_CODEX_UNIT = "codex-local-app-server.service"
+LEGACY_CODEX_HEADER = "# Shared Codex runtime provisioned by secondopinion; retained on plugin removal.\n"
+UNMANAGED_WARNING = ("the running Codex app server was not started by Codex, so Codex will not update it and "
+                     "newer models stay hidden; stop whatever runs it, then run `codex app-server daemon start`")
 
 
 def run(argv, check=True):
@@ -43,34 +49,55 @@ def unit_text(script, store, python, path):
             "NoNewPrivileges=yes\n\n[Install]\nWantedBy=default.target\n")
 
 
-def codex_unit_text(codex, path):
-    return ("# Shared Codex runtime provisioned by secondopinion; retained on plugin removal.\n"
-            "[Unit]\nDescription=Codex local app server\n\n[Service]\nType=simple\n"
-            "ExecStart=:" + quote(codex) + " app-server --listen unix://\n"
-            "Environment=" + quote("PATH=" + path) + "\n"
-            "Restart=always\nRestartSec=3\nTimeoutStopSec=30\nUMask=0077\n"
-            "\n[Install]\nWantedBy=default.target\n")
+def legacy_codex_unit(unit_dir):
+    legacy = unit_dir / LEGACY_CODEX_UNIT
+    if legacy.is_symlink() or not legacy.is_file():
+        return None
+    return legacy if legacy.read_text().startswith(LEGACY_CODEX_HEADER) else None
 
 
-def ensure_codex(unit_dir, codex, path):
-    # Reuse an existing public server. Never stop/restart it or change its policy.
-    probe = [codex, "app-server", "daemon", "version"]
-    if run(probe, False).returncode == 0:
-        return "existing"
-    runtime_unit = unit_dir / CODEX_UNIT
-    text = codex_unit_text(codex, path)
-    if runtime_unit.is_symlink() or (runtime_unit.exists() and runtime_unit.read_text() != text):
-        raise ValueError("existing Codex runtime unit differs; preserved without overwriting")
-    unit_dir.mkdir(parents=True, exist_ok=True)
-    if not runtime_unit.exists():
-        atomic_text(runtime_unit, text)
+def retire_legacy_codex_unit(unit_dir):
+    # Only the exact unit this installer wrote; a same-named user unit is left alone.
+    legacy = legacy_codex_unit(unit_dir)
+    if legacy is None:
+        return False
+    run(["systemctl", "--user", "disable", "--now", LEGACY_CODEX_UNIT])
+    legacy.unlink()
     run(["systemctl", "--user", "daemon-reload"])
-    run(["systemctl", "--user", "enable", "--now", CODEX_UNIT])
-    for _ in range(30):
-        if run(probe, False).returncode == 0:
-            return CODEX_UNIT
-        time.sleep(0.5)
-    raise RuntimeError("local Codex server did not become ready; inspect " + CODEX_UNIT)
+    return True
+
+
+def version_key(value):
+    try:
+        return tuple(int(part) for part in str(value).split("-")[0].split("."))
+    except ValueError:
+        return None
+
+
+def codex_runtime(output):
+    """Summarize `codex app-server daemon start|version` JSON; flag a server Codex will not update."""
+    try:
+        info = json.loads(output.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"codex_runtime": "unknown"}
+    report = {"codex_runtime": "codex_managed" if info.get("backend") else "unmanaged",
+              "codex_cli_version": info.get("cliVersion"), "codex_app_server_version": info.get("appServerVersion")}
+    cli, server = version_key(info.get("cliVersion")), version_key(info.get("appServerVersion"))
+    if not info.get("backend"):
+        report["warning"] = UNMANAGED_WARNING
+    elif cli and server and server < cli:
+        # Codex's updater normally closes this within its hourly check.
+        report["warning"] = ("Codex app server " + str(info.get("appServerVersion")) + " is older than CLI " +
+                             str(info.get("cliVersion")) + "; if this persists, run `codex app-server daemon update`")
+    return report
+
+
+def ensure_codex(codex):
+    # Never pin a Codex binary or supervise Codex here: that is what hid updates.
+    result = run([codex, "app-server", "daemon", "start"], False)
+    if result.returncode:
+        raise RuntimeError("Codex could not start its local app server: " + (result.stderr or result.stdout).strip()[:1200])
+    return codex_runtime(result.stdout)
 
 
 def sha(text):
@@ -132,10 +159,17 @@ def manage(action, store):
         healthy = (record.exists() and unit.exists() and
                    run(["systemctl", "--user", "is-enabled", UNIT], False).returncode == 0 and
                    run(["systemctl", "--user", "is-active", UNIT], False).returncode == 0)
+        runtime = {}
         if healthy:
             check_owned(unit, record)
-            healthy = run(["codex", "app-server", "daemon", "version"], False).returncode == 0
-        return {"automatic_worker_return": "ready" if healthy else "unavailable"}
+            version = run(["codex", "app-server", "daemon", "version"], False)
+            healthy = version.returncode == 0
+            runtime = codex_runtime(version.stdout) if healthy else {
+                "reason": "no Codex app server is running; opening Codex starts it"}
+        if legacy_codex_unit(unit.parent):
+            runtime["warning"] = ("legacy " + LEGACY_CODEX_UNIT + " pins an old Codex binary and blocks Codex "
+                                  "updates; rerun install.sh to retire it")
+        return dict({"automatic_worker_return": "ready" if healthy else "unavailable"}, **runtime)
     check_owned(unit, record)
     if action == "uninstall":
         run(["systemctl", "--user", "disable", "--now", UNIT])
@@ -149,9 +183,12 @@ def manage(action, store):
     if not codex or not python:
         raise RuntimeError("automatic worker return requires codex and python3")
     text = unit_text(Path(__file__).with_name("codex_wakeup.py"), store, python, os.environ.get("PATH", "/usr/bin:/bin"))
-    # Public runtime only; no standalone installation, CLI update, remote-control
-    # switch, credential copying, shell wrapper, or permission override.
-    runtime = ensure_codex(unit.parent, codex, os.environ.get("PATH", "/usr/bin:/bin"))
+    # Codex's own server lifecycle only; no CLI update, remote-control switch,
+    # credential copying, shell wrapper, or permission override.
+    retired = retire_legacy_codex_unit(unit.parent)
+    runtime = ensure_codex(codex)
+    if retired:
+        runtime["legacy_codex_unit"] = "retired"
     store.mkdir(mode=0o700, parents=True, exist_ok=True)
     unit.parent.mkdir(parents=True, exist_ok=True)
     # Journal both allowed generations before replacement. A crash between the
@@ -165,7 +202,7 @@ def manage(action, store):
     run(["systemctl", "--user", "enable", "--now", UNIT])
     run(["systemctl", "--user", "restart", UNIT])
     run(["systemctl", "--user", "is-active", UNIT])
-    return {"automatic_worker_return": "ready", "unit": UNIT, "codex_runtime": runtime}
+    return dict({"automatic_worker_return": "ready", "unit": UNIT}, **runtime)
 
 
 def main():

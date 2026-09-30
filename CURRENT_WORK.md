@@ -1,5 +1,52 @@
 # Current Work
 
+## 1.2.3 — cut locally, NOT published (2026-09-29)
+
+Owner reported that Codex did not offer GPT-6.1-Sol. Root cause, proven on this
+host: Codex windows take their model list from the shared app server, which
+calls `/backend-api/codex/models?client_version=<server version>`; the backend
+offers new models only to new enough clients. The server was the 1.1.0-era
+`codex-local-app-server.service`, pinned to the npm Codex 0.156.1 found at
+install time. The CLI had moved to standalone 0.159.2 and the npm files were
+deleted, but the unit kept the old image running. Codex reuses any server on
+its socket without a version check and auto-updates only servers it started
+(Codex source at tag `rust-v0.159.2`: `tui/src/startup_orchestration.rs`,
+`app-server-daemon/src/lib.rs`, `update_loop.rs`; hourly checks, 60 s drain).
+So the unit blocked Codex's own updater. Supersedes the 1.1.0 note that vendor
+daemon management needed an unavailable standalone install: current Codex
+builds its managed server from the calling CLI's package.
+
+Host remediation (owner-approved): unit stopped, disabled and deleted; then
+`codex app-server daemon start` installed Codex's managed server with its
+`pid-update-loop`. `daemon version` reports CLI = server = 0.159.2 with
+backend `pid`; `model/list` over the socket lists `gpt-6.1-sol` first;
+`secondopinion-wakeup.service` untouched and `check` reports ready.
+
+Change: `wake_service.py` no longer writes or supervises any Codex unit. Install
+retires the exact unit earlier releases wrote (header match; a same-named user
+unit is preserved), then runs `codex app-server daemon start`; failure installs
+nothing and foreground delegation remains. `check` stays read-only and reports
+Codex versions, warning on an unmanaged or older server or a leftover unit.
+Deliberately NOT done: starting Codex's server from the wakeup service at boot.
+It would run inside that service's cgroup (killed on every reinstall/restart)
+and inherit `NoNewPrivileges`; it is also unneeded, because return targets only
+conversations open in a Codex window, and opening one starts the server.
+
+Evidence: 7 of the new wake-service tests fail on the 1.2.2 code and all 19
+pass on 1.2.3. Final 1.2.3-tree regression **1236/1236**, exit 0, at
+`out/release-1.2.3/regression.log`. `docs/release-1.2.3.sha256` binds the same
+51 product/test files as 1.2.2. Share archive `out/secondopinion-1.2.3.tar.gz`
+(`git archive` of the release commit) with a bare-filename sidecar; the 1.2.2
+sidecar recorded `out/...`, so its documented `sha256sum -c` fails beside the
+archive. Live `check` and install's
+`daemon start` path verified against the running managed server. Untested: an
+npm-installed Codex host (Codex may refuse to build its server without a local
+package; install then reports the error and foreground mode remains).
+
+Next action: owner decides publication ("push it"). A peer on 1.1.0-1.2.2 then
+runs `git pull --ff-only` and `install.sh --claude`, which retires the pinned
+unit; Codex windows open during that update must be restarted.
+
 ## 1.2.2 — published to GitHub main (2026-09-17 16:02 UTC)
 
 Owner asked to correct and thoroughly test the peer incident in

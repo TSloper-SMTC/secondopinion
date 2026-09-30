@@ -295,9 +295,11 @@ Across a new Codex thread, use `task wait` or specify the original `--requester`
 when deliberately retrying delivery. Do not create a new ID to bypass a claim.
 
 Automatic idle wakeup is supported for saved conversations connected to the
-configured local Codex CLI server. The installer provisions two independent user
-services: `codex-local-app-server.service` (or reuses an existing public Codex
-server) and `secondopinion-wakeup.service`. No model, sandbox or approval override
+configured local Codex CLI server. Codex owns that server: the installer runs
+`codex app-server daemon start` (reusing a running server, else Codex's managed,
+self-updating one) and supervises only `secondopinion-wakeup.service`. It retires
+the `codex-local-app-server.service` unit earlier releases wrote, whose pinned
+binary hid Codex updates and new models. No model, sandbox or approval override
 is supplied on notification turns. A closed/unloaded conversation is not resumed
 by the watcher; reopening it permits retained notifications to be delivered.
 Other clients, disabled services and legacy skill installations use foreground

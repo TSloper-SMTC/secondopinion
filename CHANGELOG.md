@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.3 — 2026-09-29
+
+- Let Codex own its local app server. The installer now runs
+  `codex app-server daemon start`, which reuses a running server or starts
+  Codex's managed one that Codex keeps updated. Earlier releases installed
+  `codex-local-app-server.service` pinned to the Codex binary found at install
+  time; Codex never updates a server it did not start, so later Codex releases,
+  and models the backend offers only to them, stayed hidden. The installer
+  retires that exact unit (a same-named unit it did not write is left alone).
+  Restart Codex windows that were connected to the retired server.
+- `install.sh --check` reports the Codex server's versions and warns when the
+  running server is not Codex-managed, is older than the CLI, or when the
+  retired unit is still present. With no server running it explains that
+  opening Codex starts one.
+
 ## 1.2.2 — 2026-09-17
 
 - Make uncertain lead-message delivery immediately actionable: print the exact
