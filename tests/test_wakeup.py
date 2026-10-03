@@ -18,7 +18,7 @@ import uuid
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins/secondopinion/scripts"))
 from codex_wakeup import Wakeup, encode, thread_uuid, automatic_registration
-from codex_rpc import Client, ProtocolError, RpcError, socket_path, MAX_FRAME
+from codex_rpc import Client, ProtocolError, RpcError, socket_path, socket_target, MAX_FRAME
 
 
 class FakeServer:
@@ -116,9 +116,9 @@ class WakeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.register()
 
-    def test_symlink_and_regular_file_rejected(self):
+    def test_regular_file_rejected_directly_or_through_link(self):
         link = self.root / "alias"
-        link.symlink_to(self.socket)
+        link.symlink_to(self.report)
         for path in (link, self.report):
             with self.assertRaises(ValueError):
                 socket_path(str(path))
@@ -409,6 +409,132 @@ class WakeTests(unittest.TestCase):
         self.wake.tick("route")
         self.assertEqual(self.events()[0]["state"], "consumed")
         self.assertEqual(self.server.sent, [])
+
+
+class SocketLinkTests(unittest.TestCase):
+    """The managed Codex daemon publishes a stable link to a per-start private socket."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="so-link-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.control = self.root / "control"  # $CODEX_HOME/app-server-control
+        self.daemon = self.root / "daemon"    # /tmp/codex-daemon-$UID
+        for directory in (self.control, self.daemon):
+            directory.mkdir()
+            directory.chmod(0o700)
+        self.link = self.control / "app-server-control.sock"
+        self.listener = None
+        self.start("a1")
+
+    def start(self, name):
+        """Simulate a daemon (re)start: a fresh hashed socket and a retargeted link."""
+        if self.listener:
+            self.listener.close()
+            os.unlink(os.readlink(self.link))
+            self.link.unlink()
+        target = self.daemon / name
+        self.listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(self.listener.close)
+        self.listener.bind(str(target))
+        self.listener.listen(1)
+        self.listener.settimeout(1)
+        target.chmod(0o600)
+        self.link.symlink_to(target)
+        return target
+
+    def test_private_daemon_link_registers_unresolved(self):
+        self.assertEqual(socket_path(str(self.link)), str(self.link))
+        self.assertEqual(socket_target(str(self.link)), str(self.daemon / "a1"))
+
+    def test_link_rejected_when_another_user_could_swap_it(self):
+        for directory in (self.control, self.daemon):
+            for mode in (0o770, 0o777, 0o1777):
+                with self.subTest(directory=directory.name, mode=oct(mode)):
+                    directory.chmod(mode)
+                    try:
+                        with self.assertRaisesRegex(ValueError, "directories"):
+                            socket_target(str(self.link))
+                    finally:
+                        directory.chmod(0o700)
+
+    def test_link_rejected_for_foreign_owner(self):
+        real = Path.lstat
+        for foreign in (self.control, self.link, self.daemon, self.daemon / "a1"):
+            def lstat(path, foreign=foreign, **kw):
+                info = real(path, **kw)
+                if path != foreign:
+                    return info
+                fields = list(info)
+                fields[4] = os.getuid() + 1  # st_uid
+                return os.stat_result(fields)
+            with self.subTest(owned_by_other=foreign.name), mock.patch.object(Path, "lstat", lstat):
+                with self.assertRaises(ValueError):
+                    socket_target(str(self.link))
+
+    def test_only_a_direct_absolute_link_is_followed(self):
+        chained = self.control / "chained"
+        chained.symlink_to(self.link)
+        relative = self.control / "relative"
+        relative.symlink_to(os.path.join("..", "daemon", "a1"))
+        via = self.root / "via"
+        via.symlink_to(self.daemon)
+        for path in (chained, relative, via / "a1", self.control / ".." / "daemon" / "a1"):
+            with self.subTest(path=str(path)), self.assertRaises(ValueError):
+                socket_target(str(path))
+
+    def test_link_target_must_be_a_private_socket(self):
+        target = self.daemon / "a1"
+        target.chmod(0o660)
+        with self.assertRaisesRegex(ValueError, "private"):
+            socket_target(str(self.link))
+        self.listener.close()
+        target.unlink()
+        target.write_text("not a socket")
+        target.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "private"):
+            socket_target(str(self.link))
+
+    def test_stopped_daemon_is_unavailable_not_invalid(self):
+        # automatic_registration reports this as AutomaticUnavailable.
+        self.listener.close()
+        (self.daemon / "a1").unlink()
+        with self.assertRaises(FileNotFoundError):
+            socket_target(str(self.link))
+
+    def test_connect_follows_link_after_daemon_restart(self):
+        for restart in (False, True):
+            if restart:
+                self.start("b2")
+            with self.subTest(restart=restart):
+                with self.assertRaises(TimeoutError):  # silent daemon: handshake times out
+                    Client(str(self.link), timeout=0.2)
+                self.listener.accept()[0].close()
+
+    def test_registration_survives_daemon_restart(self):
+        thread = str(uuid.uuid4())
+        repo = self.root / "repo"
+        repo.mkdir()
+        server, connected = FakeServer(thread, repo), []
+
+        def factory(path):
+            connected.append(socket_target(path))
+            return server
+        wake = Wakeup(self.root / "store", factory)
+        self.addCleanup(wake.db.close)
+        wake.box.create("a", "worker-a", thread, str(repo), "authorized reporting-only task")
+        self.assertEqual(wake.register("route", str(self.link), thread, ["a"], repo)["socket"], str(self.link))
+        self.start("b2")
+        # A stored resolved path would now be stale and refuse as a retarget.
+        wake.register("route", str(self.link), thread, ["a"], repo)
+        report = self.root / "result"
+        report.write_text("verified result")
+        wake.box.claim("a", "worker-a")
+        wake.box.update(SimpleNamespace(id="a", session="worker-a", revision=wake.box.get("a")["revision"],
+            state="complete", message="test outcome", action_needed="", file=str(report)))
+        wake.tick("route")
+        self.assertEqual(len(server.sent), 1)
+        self.assertEqual(connected, [str(self.daemon / "a1")] + [str(self.daemon / "b2")] * 2)
 
 
 class WireTests(unittest.TestCase):

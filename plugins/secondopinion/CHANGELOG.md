@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Accept the managed Codex daemon's control-socket symlink for automatic
+  return. Only a final-component link pointing directly at an absolute
+  canonical socket is followed, and both the link's and the socket's
+  directories must be owned by this user and not group/world-writable. Routes
+  store the link and re-resolve it on every connect, so daemon restarts do not
+  strand them. Restart the wakeup service to load the fix.
+
 ## 1.2.3 — 2026-09-29
 
 - Let Codex own its local app server. The installer now runs
