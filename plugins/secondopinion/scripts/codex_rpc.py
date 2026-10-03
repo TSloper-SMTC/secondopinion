@@ -26,16 +26,45 @@ class RpcError(ProtocolError):
         super().__init__("Codex rejected request: " + str(error.get("message", error)))
 
 
-def socket_path(value):
-    path = Path(value)
-    if not path.is_absolute() or str(path) != str(path.resolve()):
-        raise ValueError("socket must be an absolute canonical path, without symlinks")
-    if len(str(path).encode()) >= 104:
-        raise ValueError("Unix socket path is too long")
+def _private_directory(path):
     info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError("Codex socket link and target directories must be owned by this user "
+                         "and not group/world-writable")
+
+
+def socket_target(value):
+    """Validate a same-user private socket; return the canonical path to connect to.
+
+    Only the final component may be a symlink: the managed daemon's stable control
+    link to its per-start socket. It must point directly at an absolute canonical
+    path, and neither directory may be writable by anyone else, so the checked
+    target is what connect() reaches. Resolved on every connect, never stored.
+    """
+    path = Path(value)
+    if not path.is_absolute() or path.name in ("", "..") or str(path.parent) != str(path.parent.resolve()):
+        raise ValueError("socket must be an absolute path in a canonical directory, without symlinks")
+    target = path
+    if path.is_symlink():
+        _private_directory(path.parent)
+        target = Path(os.readlink(path))
+        if path.lstat().st_uid != os.getuid() or not target.is_absolute() or \
+                str(target) != str(target.resolve()):
+            raise ValueError("socket link must be owned by this user and point directly at an "
+                             "absolute canonical path")
+        _private_directory(target.parent)
+    if len(str(target).encode()) >= 104:
+        raise ValueError("Unix socket path is too long")
+    info = target.lstat()
     if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("Codex socket must be owned by this user and private (mode 0600)")
-    return str(path)
+    return str(target)
+
+
+def socket_path(value):
+    """Validate; return the stable path to register, which may be the daemon's link."""
+    socket_target(value)
+    return str(Path(value))
 
 
 class Client:
@@ -46,7 +75,7 @@ class Client:
         self.deadline = time.monotonic() + timeout
         try:
             self.sock.settimeout(timeout)
-            self.sock.connect(socket_path(path))
+            self.sock.connect(socket_target(path))
             _, uid, _ = struct.unpack("3i", self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
             if uid != os.getuid():
                 raise ValueError("Codex endpoint peer belongs to another user")
