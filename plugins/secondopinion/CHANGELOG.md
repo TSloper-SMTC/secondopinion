@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- Accept the managed Codex daemon's control-socket symlink for automatic
+  return. Only a final-component link pointing directly at an absolute
+  canonical socket is followed, and both the link's and the socket's
+  directories must be owned by this user and not group/world-writable. Routes
+  store the link and re-resolve it on every connect, so daemon restarts do not
+  strand them. Restart the wakeup service to load the fix.
+- Bind automatic-return registrations to the Codex conversation rather than to
+  a shared checkout. Every registered task must have that conversation as its
+  requester, and the route pins the conversation's own folder at registration,
+  so lead channels kept in another checkout can register. A conversation that
+  later moves fails closed until `wake rebind NAME --confirm-folder-change`
+  re-pins it. Result notifications are limited to the conversation's own tasks.
+- When Codex's sandbox hides the app server, `delegate --async` now exits
+  non-zero with the escalation and `wake register` commands to use, instead of
+  a bare permission error. It does not fall back silently to polling.
+- Keep delivering to a bound Claude worker after a restart or rename changes
+  its session name. Senders still require the exact session UUID and checkout,
+  and now address the session's current name, which must be unique. The task
+  keeps the requester's original binding; the hook notice, relay prompt and
+  delivery diagnostics report both names. Previously every send failed with
+  `bound worker name changed or became ambiguous` until the name was restored.
+
 ## 1.2.3 — 2026-09-29
 
 - Let Codex own its local app server. The installer now runs
