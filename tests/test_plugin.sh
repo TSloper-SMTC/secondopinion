@@ -28,9 +28,9 @@ assert_eq "$(json "$ROOT/.claude-plugin/marketplace.json" "['plugins'][0]['sourc
 assert_eq "$(json "$ROOT/.agents/plugins/marketplace.json" "['plugins'][0]['source']['path']")" "./plugins/secondopinion"
 assert_eq "$(json "$ROOT/.agents/plugins/marketplace.json" "['plugins'][0]['name']")" "secondopinion"
 
-t "changelogs: the top entry of BOTH CHANGELOG.md files matches the tool version"
+t "changelogs: the top versioned entry of BOTH CHANGELOG.md files matches the tool version (after any Unreleased)"
 for c in "$ROOT/CHANGELOG.md" "$PLUGIN/CHANGELOG.md"; do
-  top="$(sed -n 's/^## \([^ ]*\).*/\1/p' "$c" | head -1)"
+  top="$(sed -n 's/^## \([^ ]*\).*/\1/p' "$c" | grep -vx Unreleased | head -1)"
   assert_eq "$top" "$TOOL_VERSION" "(top entry of $c)"
 done
 
