@@ -112,7 +112,13 @@ target and file contents; changing any of them is rejected. Message files must
 be nonempty UTF-8, at most 16 KiB. The mailbox snapshots them immediately.
 
 Lead messages use a listening worker hook or a bounded relay to the same existing worker. The plugin
-rechecks its UUID, unique name and checkout on every attempt. Worker messages
+rechecks its UUID and checkout on every attempt and sends to its current, unique
+name, so a worker renamed by a restart keeps its tasks. If Claude resumes the
+worker's conversation under a new session ID (`--fork-session`, as background
+sessions do), the new session's hook continues its tasks once the old session has
+exited; without that launch evidence, run `secondopinion task worker-continue
+--from OLD --to NEW` in the checkout. The worker keeps its original session ID for
+task commands. Worker messages
 are stored immediately and automatically notify the registered lead, including
 when idle, as `secondopinion_message`. Workers waiting for answers can end their
 turn; the lead's reply notifies that same worker through its hook or native relay.
@@ -306,6 +312,16 @@ Other clients, disabled services and legacy skill installations use foreground
 collection. If fallback times out while monitoring remains authorized, keep
 collecting the same task IDs; do not yield and leave the user to discover reports.
 Neither mode grants execution authority or bypasses a worker's approval blocker.
+
+Registration is the only step that needs the Codex server socket, which Codex's
+sandbox hides on purpose. If `delegate --async` reports that it cannot reach the
+server from inside the sandbox, rerun that same command once with escalation, or
+ask the user to run the `wake register` command it prints; never widen the sandbox.
+A registration binds tasks to this conversation by requester and pins the
+conversation's folder at that moment, so tasks in another checkout are fine. If
+the conversation later moves to another folder, deliveries stop fail-closed until
+the user confirms with `secondopinion wake rebind codex-CODEX_THREAD_ID
+--confirm-folder-change`.
 
 For diagnostics, use `secondopinion wake status codex-CODEX_THREAD_ID`. The outbox
 distinguishes prepared, accepted, recorded and ambiguous delivery; recorded means

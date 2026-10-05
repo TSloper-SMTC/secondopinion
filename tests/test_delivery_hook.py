@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sqlite3
 import sys
@@ -22,7 +23,7 @@ sys.path.insert(0, str(SCRIPTS))
 from task_mailbox import Mailbox, delegate, parser
 from task_conversation import Conversation, deliver
 from relay_diagnostics import observe, record
-from worker_directory import Directory
+from worker_directory import Directory, host_session
 import worker_hook as hook
 
 
@@ -202,10 +203,47 @@ class DeliveryTests(unittest.TestCase):
 
     def test_public_binding_refuses_replacement_and_duplicate_name(self):
         row = dict(sessionId=self.worker,name='peer',cwd=str(self.root))
+        renamed = dict(row,name='changed')
         for rows in ([dict(row,sessionId=str(uuid.uuid4()))], [row,dict(row,sessionId=str(uuid.uuid4()))],
-                     [dict(row,cwd=str(self.root/'other'))], [dict(row,name='changed')]):
+                     [dict(row,cwd=str(self.root/'other'))], [renamed,dict(renamed,sessionId=str(uuid.uuid4()))],
+                     [dict(renamed,cwd=str(self.root/'other'))]):
             with mock.patch.object(Directory,'rows',return_value=rows), self.assertRaises(ValueError):
                 Directory(self.box).bound(self.task)
+
+    def test_public_binding_follows_a_rename_of_the_same_session(self):
+        # Same UUID and checkout; a restart gave it a new unique name, even with the old name reused.
+        row = dict(sessionId=self.worker,name='peer',cwd=str(self.root))
+        for rows in ([dict(row,name='peer-2')], [dict(row,name='peer-2'),dict(row,sessionId=str(uuid.uuid4()))]):
+            with mock.patch.object(Directory,'rows',return_value=rows):
+                current = Directory(self.box).bound(self.task)
+            self.assertEqual((current['name'],current['renamed_from']),('peer-2','peer'))
+        with mock.patch.object(Directory,'rows',return_value=[row]):
+            self.assertNotIn('renamed_from',Directory(self.box).bound(self.task))
+        self.assertEqual(self.box.get('task')['worker_name'],'peer')
+
+    def test_delegate_retry_relays_to_the_current_name_after_rename(self):
+        rows = [dict(sessionId=self.worker,name='peer-2',cwd=str(self.root))]
+        prompts = []
+
+        def relay(cli, request, *args):
+            prompts.append(Path(request).read_text())
+            return None, 1
+        with mock.patch('task_mailbox.Path.cwd',return_value=self.root), \
+             mock.patch('relay_diagnostics.run_relay',side_effect=relay), \
+             mock.patch.object(Directory,'rows',return_value=rows), \
+             mock.patch.object(hook,'notify',return_value=dict(transport='worker_hook',state='not_listening')), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            delegate(self.box,self.args())
+        self.assertIn('now named "peer-2"',prompts[0])
+        self.assertIn('peer name "peer"',prompts[0])
+        details = self.box.status('task')['delivery_diagnostics']
+        self.assertEqual((details['worker_name'],details['worker_renamed_from']),('peer-2','peer'))
+
+    def test_hook_notice_after_rename_is_queued_and_reports_both_names(self):
+        rows = [dict(sessionId=self.worker,name='peer-2',cwd=str(self.root))]
+        with mock.patch.object(hook,'ready',return_value=True), mock.patch.object(Directory,'rows',return_value=rows):
+            notice = hook.notify(self.box,self.task)
+        self.assertEqual((notice['state'],notice['worker_name'],notice['worker_renamed_from']),('queued','peer-2','peer'))
 
     def test_draft_task_never_notifies_before_requester_gates(self):
         with contextlib.redirect_stderr(io.StringIO()) as output:
@@ -311,6 +349,99 @@ class DeliveryTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as output:
             self.assertEqual(hook.watch(self.box,self.worker,str(self.root),self.cli,lifetime=.01),0)
         self.assertEqual(output.getvalue(),'')
+
+
+class ContinuationTests(unittest.TestCase):
+    """Claude resumed the bound worker's conversation under a new session ID."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='secondopinion-continue-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.box = Mailbox(self.root / 'store')
+        self.addCleanup(self.box.db.close)
+        self.old, self.new = str(uuid.uuid4()), str(uuid.uuid4())
+        self.box.create('chan', self.old, 'lead', str(self.root), 'standing channel', 'peer')
+        self.box.claim('chan', self.old)
+        Conversation(self.box).post('chan', 'q', 'lead', 'Which test first?')
+        self.listing = [dict(sessionId=self.new, name='peer', cwd=str(self.root), kind='background')]
+        self.cli = ROOT / 'plugins/secondopinion/bin/secondopinion'
+
+    def proc(self, *chain):
+        """Fake /proc: chain[0] is the hook's parent, each next entry its parent."""
+        proc = self.root / 'proc'
+        for i, args in enumerate(chain):
+            entry = proc / str(100 + i)
+            entry.mkdir(parents=True)
+            (entry / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in args) + b'\0')
+            (entry / 'stat').write_text(f'{100 + i} (x) S {101 + i} 0 0')
+        return proc
+
+    def resumed(self, *chain):
+        with mock.patch.object(hook.os, 'getppid', return_value=100):
+            return hook.resumed_from(self.new, self.proc(*chain))
+
+    def test_launch_evidence_names_the_forked_from_session(self):
+        transcript = f'/home/u/.claude/projects/p/{self.old}.jsonl'
+        claude = '/home/u/.local/share/claude/versions/2.1.289'
+        self.assertEqual(self.resumed([claude, '--session-id', self.new, '--fork-session', '--resume', transcript]), self.old)
+        shutil.rmtree(self.root / 'proc')
+        self.assertEqual(self.resumed(['/bin/sh', '-c', 'hook'], ['claude', '--fork-session', '-r', self.old]), self.old)
+        for chain in ([[claude, '--resume', transcript]],                                        # plain resume keeps its ID
+                      [[claude, '--session-id', str(uuid.uuid4()), '--fork-session', '--resume', transcript]],
+                      [['claude', 'bg-spare'], ['claude', '--fork-session', '--resume', self.old]],  # never an outer session
+                      [[claude, '--fork-session', f'--resume={self.new}']], [[claude, '--fork-session', '--resume']]):
+            shutil.rmtree(self.root / 'proc')
+            with self.subTest(chain=chain):
+                self.assertIsNone(self.resumed(*chain))
+
+    def watch(self):
+        with mock.patch.object(Directory,'rows',return_value=self.listing), \
+             mock.patch.object(hook,'resumed_from',return_value=self.old), \
+             contextlib.redirect_stderr(io.StringIO()) as output:
+            code = hook.watch(self.box,self.new,str(self.root),self.cli,lifetime=.3)
+        return code, output.getvalue()
+
+    def test_hook_adopts_the_exited_session_and_reminds_with_its_task_session(self):
+        code, output = self.watch()
+        self.assertEqual(code, 2)
+        self.assertIn(f'continues worker session(s) {self.old}', output)
+        self.assertIn(f'messages chan --session {self.old} --unread', output)
+        self.assertEqual(self.box.db.execute('SELECT host FROM worker_continuations WHERE worker=?', (self.old,)).fetchone()[0], self.new)
+        self.assertEqual(self.box.get('chan')['worker'], self.old)
+
+    def test_hook_leaves_tasks_with_a_session_that_is_still_running(self):
+        self.listing.append(dict(sessionId=self.old, name='original', cwd=str(self.root), kind='interactive'))
+        code, output = self.watch()
+        self.assertEqual((code, output), (0, ''))
+        self.assertEqual(host_session(self.box, self.box.get('chan')), self.old)
+
+    def test_senders_follow_the_continuation_to_the_new_session(self):
+        with mock.patch.object(Directory,'rows',return_value=self.listing):
+            Directory(self.box).continue_session(self.old, self.new, self.root, 'test')
+            task = self.box.get('chan')
+            self.box.db.execute('CREATE TABLE IF NOT EXISTS worker_hooks (session TEXT PRIMARY KEY, repo TEXT NOT NULL, '
+                                'heartbeat REAL NOT NULL, protocol INTEGER NOT NULL)')
+            self.box.db.execute('INSERT INTO worker_hooks VALUES (?,?,?,?)', (self.new, str(self.root), time.time(), hook.HOOK_PROTOCOL))
+            with open(hook.lock_path(self.box, self.new), 'a') as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                self.assertTrue(hook.ready(self.box, task))
+                notice = hook.notify(self.box, task)
+        self.assertEqual((notice['state'], notice['worker_session'], notice['worker_continued_from']),
+                         ('queued', self.new, self.old))
+
+    def test_cli_worker_continue_uses_the_public_listing(self):
+        fake = self.root / 'bin'
+        fake.mkdir()
+        (self.root / 'listing.json').write_text(json.dumps(self.listing))
+        (fake / 'claude').write_text(f'#!/bin/sh\ncat {self.root / "listing.json"}\n')
+        (fake / 'claude').chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('SECONDOPINION_', 'AGENT_MAILBOX_', 'CODEX_'))}
+        env.update(PATH=f'{fake}:{os.environ["PATH"]}', SECONDOPINION_DIR=str(self.box.store))
+        result = subprocess.run([str(self.cli), 'task', 'worker-continue', '--from', self.old, '--to', self.new],
+                                cwd=self.root, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['tasks'], ['chan'])
 
 
 if __name__ == '__main__':
